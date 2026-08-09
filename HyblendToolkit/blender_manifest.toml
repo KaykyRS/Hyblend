@@ -2,7 +2,7 @@ schema_version = "1.0.0"
 
 id = "hyblend_toolkit"
 name = "Hyblend Toolkit"
-version = "0.3.7"
+version = "0.4.0"
 tagline = "Import Hytale .blockymodel rigs and export .blockyanim animations"
 maintainer = "Kaayky"
 type = "add-on"

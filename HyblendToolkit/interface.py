@@ -1,5 +1,5 @@
 """
-interface.py -- painel lateral (N-Panel) do HyblendToolkit.
+interface.py -- painel lateral (N-Panel) do HytaleBlockyToolkit.
 ==================================================================
 
 Este submódulo NÃO tem lógica de import/export nenhuma -- só desenha
@@ -29,7 +29,7 @@ from bpy.props import EnumProperty
 from bpy.types import Panel, WindowManager
 
 from .exporter import EXPORT_OT_hytale_blockyanim
-from .importer import IMPORT_OT_hytale_blockymodel, L, get_language
+from .importer import IMPORT_OT_hytale_blockymodel, IMPORT_OT_hytale_bbmodel, L, get_language
 from .anim_importer import IMPORT_OT_hytale_blockyanim
 from .common import HYTALE_OT_pick_bone_into_field
 from .rigger import (
@@ -52,7 +52,9 @@ TAB_ITEMS = [
 ]
 
 PANEL_LABELS = {
-    "btn_import_new": {"EN": "New Model", "PT_BR": "Novo Modelo"},
+    "new_model_header": {"EN": "New Model", "PT_BR": "Novo Modelo"},
+    "btn_new_blockymodel": {"EN": ".blockymodel", "PT_BR": ".blockymodel"},
+    "btn_new_bbmodel": {"EN": ".bbmodel", "PT_BR": ".bbmodel"},
     "btn_import_attach": {"EN": "Attach to Selected", "PT_BR": "Anexar ao Selecionado"},
     "hint_import_attach_none": {
         "EN": "Select the target Armature first",
@@ -107,6 +109,18 @@ PANEL_LABELS = {
     "load_preset": {"EN": "Load Preset...", "PT_BR": "Carregar Preset..."},
     "btn_create_rig": {"EN": "Create Rig", "PT_BR": "Criar Rig"},
     "btn_remove_generated": {"EN": "Remove Generated Bones", "PT_BR": "Remover Bones Gerados"},
+    "warn_anim_experimental": {
+        "EN": "Experimental",
+        "PT_BR": "Experimental",
+    },
+    "warn_mouth_wip_short": {
+        "EN": "WIP",
+        "PT_BR": "WIP",
+    },
+    "warn_rig_experimental": {
+        "EN": "Rig generation is experimental",
+        "PT_BR": "Geração de rig é experimental",
+    },
 }
 
 
@@ -121,7 +135,7 @@ class HYTALE_PT_main(Panel):
     'Hytale'). Só orquestra botões -- toda a lógica real mora nos
     operadores de importer.py / exporter.py."""
 
-    bl_label = "Hyblend Toolkit"
+    bl_label = "Hytale Blocky Toolkit"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "Hytale"
@@ -146,13 +160,25 @@ class HYTALE_PT_main(Panel):
     # ------------------------------------------------------------------
 
     def _draw_import(self, layout, context, lang):
-        col = layout.column(align=True)
-        col.scale_y = 1.4
-        col.operator(
+        # Duas fontes de "modelo novo" agora: IMPORT_OT_hytale_blockymodel
+        # (modo NEW_ARMATURE) e IMPORT_OT_hytale_bbmodel (só tem um modo,
+        # sempre cria Armature nova -- ver comentário em importer.py,
+        # seção "Suporte a .bbmodel"). Agrupados sob um cabeçalho comum
+        # "New Model" pra deixar claro que são duas portas de entrada
+        # pro mesmo resultado (Armature nova), não duas features
+        # diferentes.
+        new_model_box = layout.box()
+        new_model_box.label(text=PL("new_model_header", lang), icon="ARMATURE_DATA")
+        new_model_row = new_model_box.row(align=True)
+        new_model_row.scale_y = 1.4
+        new_model_row.operator(
             IMPORT_OT_hytale_blockymodel.bl_idname,
-            text=PL("btn_import_new", lang),
-            icon="ARMATURE_DATA",
+            text=PL("btn_new_blockymodel", lang),
         ).import_mode = "NEW_ARMATURE"
+        new_model_row.operator(
+            IMPORT_OT_hytale_bbmodel.bl_idname,
+            text=PL("btn_new_bbmodel", lang),
+        )
 
         layout.separator()
 
@@ -190,6 +216,7 @@ class HYTALE_PT_main(Panel):
         # aviso de Armature ativa (mesmo poll() que já existe no
         # operador, isso é só feedback visual antecipado).
         anim_box = layout.box()
+        anim_box.label(text=PL("warn_anim_experimental", lang), icon="ERROR")
         anim_col = anim_box.column(align=True)
         anim_col.scale_y = 1.4
         anim_col.operator(
@@ -231,7 +258,13 @@ class HYTALE_PT_main(Panel):
             settings_box = layout.box()
             settings_box.label(text=PL("export_settings_box", lang), icon="TOOL_SETTINGS")
             settings_box.prop(settings, "export_collection_name", text=PL("export_collection", lang))
-            settings_box.prop(settings, "export_uv_offset", text=PL("mouth_animation", lang))
+
+            mouth_row = settings_box.row(align=True)
+            mouth_row.prop(settings, "export_uv_offset", text=PL("mouth_animation", lang))
+            wip_sub = mouth_row.row()
+            wip_sub.alignment = "RIGHT"
+            wip_sub.label(text=PL("warn_mouth_wip_short", lang), icon="ERROR")
+
             if settings.export_uv_offset:
                 sub = settings_box.column(align=True)
 
@@ -266,6 +299,8 @@ class HYTALE_PT_main(Panel):
     # ------------------------------------------------------------------
 
     def _draw_rig(self, layout, context, lang):
+        layout.label(text=PL("warn_rig_experimental", lang), icon="ERROR")
+
         obj = context.active_object
         is_armature = obj is not None and obj.type == "ARMATURE"
 
@@ -294,6 +329,19 @@ class HYTALE_PT_main(Panel):
             text=PL("load_preset", lang),
             icon="IMPORT",
         )
+
+        # armature.hytale_apply_player_arm_ik_fix é BoolProperty
+        # (Armature.hytale_apply_player_arm_ik_fix, registrada em
+        # rigger.py) -- já tem name=/description= prontos lá, então
+        # col.prop() sozinho já mostra o tooltip certo, sem duplicar
+        # texto aqui. O "Load Preset > Player" liga ela automaticamente;
+        # fica aqui pra dar pra desligar/ligar na mão sem recarregar o
+        # preset inteiro.
+        # Só faz sentido mostrar isso se já existe alguma cadeia de IK na
+        # lista -- a opção afeta bones Arm_IK/Forearm_IK dessas cadeias,
+        # então com a lista vazia ela não tem o que fazer ainda.
+        if len(armature.hytale_ik_chains) > 0:
+            box.prop(armature, "hytale_apply_player_arm_ik_fix")
 
         index = armature.hytale_ik_chains_index
         if 0 <= index < len(armature.hytale_ik_chains):

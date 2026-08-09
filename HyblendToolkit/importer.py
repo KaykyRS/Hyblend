@@ -7,9 +7,11 @@
 # menos que a mudança exija subir a versão -- ver DEVELOPER_NOTES.md.
 # ---------------------------------------------------------------------------
 
+import base64
 import json
 import math
 import os
+import tempfile
 
 import bmesh
 import bpy
@@ -46,9 +48,17 @@ LABELS = {
         "PT_BR": "Gerar Malhas de Referência",
     },
     "generate_uvs": {"EN": "Generate UVs", "PT_BR": "Gerar UVs"},
+    "missing_face_mode": {
+        "EN": "Faces Missing Texture Data",
+        "PT_BR": "Faces Sem Dado de Textura",
+    },
     "create_material": {
         "EN": "Create Material",
         "PT_BR": "Criar Material",
+    },
+    "texture_mode": {
+        "EN": "Texture Mode",
+        "PT_BR": "Modo de Textura",
     },
     "texture_filepath": {
         "EN": "Texture Image",
@@ -668,10 +678,23 @@ def collect_visual_shape_nodes(node, out):
         collect_visual_shape_nodes(child, out)
 
 
-def make_box_mesh(name, size_scaled, size_raw, shape, atlas_w, atlas_h, generate_uvs):
+def make_box_mesh(name, size_scaled, size_raw, shape, atlas_w, atlas_h, generate_uvs, missing_face_mode="SKIP"):
     """Cria uma malha de caixa CENTRADA NA ORIGEM com as dimensões exatas
     de size_scaled (x,y,z). Se generate_uvs, também mapeia UVs por face a
-    partir do textureLayout da shape."""
+    partir do textureLayout da shape.
+
+    `missing_face_mode` decide o que fazer quando uma face NÃO tem entrada
+    no textureLayout. CONFIRMADO lendo o código-fonte do plugin oficial do
+    Hytale pro Blockbench (ver nota grande dentro do loop abaixo): isso
+    SEMPRE significa que a face não tinha textura no Blockbench -- não
+    existe caso de "encoberta por outra peça, mas com textura própria".
+      - "SKIP" (padrão): não cria a face. Fiel ao que o Blockbench mostraria
+        se você reabrisse o mesmo arquivo lá.
+      - "OPPOSITE_FALLBACK": cria a face e reaproveita a textura da face
+        OPOSTA da mesma caixa (comportamento antigo, anterior a esta
+        correção). NÃO reproduz o Blockbench de verdade -- é só um patch
+        cosmético pra quem prefere ver alguma textura a um buraco.
+    """
     hx, hy, hz = size_scaled.x / 2.0, size_scaled.y / 2.0, size_scaled.z / 2.0
     # IMPORTANTE: os vértices da malha (verts_co abaixo) são construídos em
     # unidades ESCALADAS (hx,hy,hz). O half_extents usado dentro de
@@ -702,30 +725,52 @@ def make_box_mesh(name, size_scaled, size_raw, shape, atlas_w, atlas_h, generate
     tex_layout = shape.get("textureLayout", {})
 
     for face_key, idxs in BOX_FACES_LOOP_ORDER:
+        # face_key ausente do textureLayout -- CONFIRMADO lendo o código-fonte
+        # do próprio plugin oficial do Hytale pro Blockbench
+        # (JannisX11/hytale-blockbench-plugin, src/blockymodel.ts):
+        #   - Na EXPORTAÇÃO (Blockbench -> .blockymodel): `if (face.texture
+        #     == null) continue;` -- só pula gravar a chave quando a face
+        #     não tinha textura NENHUMA no Blockbench.
+        #   - Na IMPORTAÇÃO (.blockymodel -> Blockbench): `if (!uv_source) {
+        #     resetFace(face_name); continue; }` -- ausência de chave vira
+        #     literalmente `texture: null` na hora de reconstruir o cubo no
+        #     Blockbench.
+        # Ou seja: NÃO existe um caso de "face implicitamente encoberta por
+        # outra peça, mas com textura própria escondida" -- ausência de
+        # chave SEMPRE significa "sem textura mesmo", ponto. SKIP é o
+        # comportamento FIEL ao que o Blockbench mostraria se você reabrisse
+        # o mesmo arquivo lá. Se uma face que parece precisar de textura
+        # (tipo o "top" do Jaw, visível quando a boca abre) ficar sem
+        # textura, isso é uma característica do .blockymodel de origem (o
+        # artista deixou aquela face sem pintar), não um bug do importer --
+        # nem um "buraco escondido por engano" pra tentar detectar
+        # geometricamente. OPPOSITE_FALLBACK continua existindo como
+        # escape hatch puramente cosmético (não reproduz o Blockbench de
+        # verdade) pra quem preferir ver alguma textura a um buraco.
+        lookup_key = face_key
+        if face_key not in tex_layout:
+            if missing_face_mode == "OPPOSITE_FALLBACK":
+                lookup_key = OPPOSITE_FACE.get(face_key)
+                if lookup_key not in tex_layout:
+                    continue
+            else:
+                continue
+
         face = bm.faces.new([bm_verts[i] for i in idxs])
         if uv_layer is not None:
-            # Algumas faces internas/escondidas (ex: Neck.top, R-Thigh.top --
-            # ficam encobertas por outra peça e nunca aparecem no jogo) não
-            # têm entrada em textureLayout. Sem isso, a UV ficava no canto
-            # (0,0) por padrão -- área quase sempre transparente do PNG,
-            # causando "buracos" visuais. Como fallback, reaproveita os
-            # dados da face OPOSTA da mesma caixa (ainda existe, só não é
-            # visível no jogo).
-            lookup_key = face_key if face_key in tex_layout else OPPOSITE_FACE.get(face_key)
-            info = tex_layout.get(lookup_key) if lookup_key else None
-            if info is not None:
-                fixed_axis = BOX_FACE_FIXED_AXIS[face_key]
-                axis_u, axis_v = FACE_AXES_BY_FIXED_AXIS[fixed_axis]
-                fw, fh = face_size_raw(size_raw, fixed_axis)
-                tex_offset = info.get("offset", {})
-                mirror = info.get("mirror", {})
-                angle = info.get("angle", 0)
-                for loop in face.loops:
-                    local_co = loop.vert.co
-                    u, v = compute_face_uv(
-                        local_co, half_extents, axis_u, axis_v, face_key, tex_offset, fw, fh, mirror, angle, atlas_w, atlas_h
-                    )
-                    loop[uv_layer].uv = (u, v)
+            info = tex_layout[lookup_key]
+            fixed_axis = BOX_FACE_FIXED_AXIS[face_key]
+            axis_u, axis_v = FACE_AXES_BY_FIXED_AXIS[fixed_axis]
+            fw, fh = face_size_raw(size_raw, fixed_axis)
+            tex_offset = info.get("offset", {})
+            mirror = info.get("mirror", {})
+            angle = info.get("angle", 0)
+            for loop in face.loops:
+                local_co = loop.vert.co
+                u, v = compute_face_uv(
+                    local_co, half_extents, axis_u, axis_v, face_key, tex_offset, fw, fh, mirror, angle, atlas_w, atlas_h
+                )
+                loop[uv_layer].uv = (u, v)
 
     bm.normal_update()
     bm.to_mesh(mesh)
@@ -814,6 +859,143 @@ def make_quad_mesh(name, shape, size_scaled_2d, size_raw_2d, atlas_w, atlas_h, g
     return mesh
 
 
+def discover_texture_paths(dirname, model_name):
+    """Espelha discoverTexturePaths() do plugin oficial do Hytale pro
+    Blockbench (src/blockymodel.ts) -- MESMA convenção, MESMA ordem de
+    busca, confirmada lendo o código-fonte de verdade (não é uma tentativa
+    nossa de adivinhar):
+      1) Mesma pasta do .blockymodel: qualquer .png cujo nome COMEÇA com
+         o nome do modelo (sem extensão), ou literalmente "Texture.png".
+      2) Uma subpasta "{NomeDoModelo}_Textures/" com PNGs dentro.
+    Devolve uma lista de caminhos absolutos (pode ter mais de um -- pastas
+    de textura da Hytale costumam ter VARIANTES do mesmo personagem;
+    carregamos TODAS as achadas, conectando só a preferida no material --
+    ver resolve_texture_filepaths, logo abaixo)."""
+    paths = []
+    if not dirname or not os.path.isdir(dirname):
+        return paths
+
+    try:
+        dir_entries = sorted(os.listdir(dirname))
+    except OSError:
+        dir_entries = []
+    for fname in dir_entries:
+        if fname.lower().endswith(".png") and (fname.startswith(model_name) or fname == "Texture.png"):
+            paths.append(os.path.join(dirname, fname))
+
+    textures_folder = os.path.join(dirname, f"{model_name}_Textures")
+    if os.path.isdir(textures_folder):
+        try:
+            folder_entries = sorted(os.listdir(textures_folder))
+        except OSError:
+            folder_entries = []
+        for fname in folder_entries:
+            if fname.lower().endswith(".png"):
+                paths.append(os.path.join(textures_folder, fname))
+
+    # Remove duplicatas mantendo a ordem (dict preserva ordem de inserção
+    # desde Python 3.7 -- mesmo efeito do "[...new Set(paths)]" do original).
+    return list(dict.fromkeys(paths))
+
+
+def discover_texture_paths_loose_fallback(dirname, model_name):
+    """EXTRA nossa -- NÃO existe no plugin oficial (esse só teria mostrado
+    o popup "No textures found" nesse caso). A convenção oficial exige que
+    o nome da pasta/arquivo COMECE com o nome exato do .blockymodel -- mas
+    isso falha em casos reais como "Player_With_Face.blockymodel" cuja
+    textura mora em "Player_Textures/" (a Hypixel usa uma pasta
+    compartilhada pra toda a família "Player", não por variante).
+
+    Fallback: se a busca estrita (discover_texture_paths) não achou nada,
+    procura qualquer pasta IRMÃ terminando em "_Textures" (nome ANTES do
+    sufixo, ignorado -- só o sufixo importa aqui) e só usa se achar
+    EXATAMENTE UMA -- múltiplas pastas candidatas é sinal de ambiguidade
+    real, e nesse caso preferimos não adivinhar (cai no placeholder, igual
+    sempre foi)."""
+    paths = []
+    if not dirname or not os.path.isdir(dirname):
+        return paths
+
+    try:
+        sibling_entries = os.listdir(dirname)
+    except OSError:
+        return paths
+
+    textures_folders = [
+        os.path.join(dirname, entry)
+        for entry in sibling_entries
+        if entry.endswith("_Textures") and os.path.isdir(os.path.join(dirname, entry))
+    ]
+    if len(textures_folders) != 1:
+        return paths
+
+    try:
+        folder_entries = sorted(os.listdir(textures_folders[0]))
+    except OSError:
+        folder_entries = []
+    for fname in folder_entries:
+        if fname.lower().endswith(".png"):
+            paths.append(os.path.join(textures_folders[0], fname))
+    return paths
+
+
+def resolve_texture_filepaths(blockymodel_filepath, texture_mode, manual_path):
+    """Decide QUAIS arquivos de textura carregar, de acordo com
+    `texture_mode` (property "Texture Mode" do operator -- "AUTO" ou
+    "MANUAL", explícito, não mais inferido de `manual_path` estar vazio
+    ou não):
+      - "MANUAL": usa `manual_path` (se vazio, não carrega textura nenhuma
+        -- cai no placeholder cinza -- e NÃO tenta auto-descoberta, mesmo
+        que ela achasse algo; é uma escolha explícita do usuário).
+      - "AUTO": ignora `manual_path` completamente, corre atrás da
+        descoberta automática (ver discover_texture_paths) e devolve
+        TODOS os candidatos achados na mesma pasta/subpasta -- não só um
+        -- porque pastas de textura da Hytale costumam ter VARIANTES do
+        mesmo personagem (ex: Player_Greyscale.png,
+        Player_Muscular_Greyscale.png, Outlander_1.png, todas na mesma
+        "Player_Textures/"). Quem chama (ver get_or_create_material)
+        carrega todas num bpy.data.images e empilha as extras como nodes
+        soltos no material -- só conecta a PRIMEIRA da lista no shader.
+
+    A lista devolvida vem com o candidato PREFERIDO (nome que começa com o
+    nome do MODELO -- mesma preferência de loadTexturesFromPaths() no
+    plugin oficial) na FRENTE, seguido dos outros na ordem que apareceram.
+    Se a busca ESTRITA (fiel ao plugin oficial) não achar nada, tenta o
+    fallback mais frouxo (ver discover_texture_paths_loose_fallback) antes
+    de desistir.
+
+    Devolve (lista_de_caminhos, camada), onde camada é "MANUAL", "STRICT"
+    (achou pela convenção oficial), "LOOSE" (só achou pelo fallback extra
+    nosso) ou "NONE" (nada encontrado -- cai no placeholder cinza, como
+    sempre)."""
+    if texture_mode == "MANUAL":
+        manual_path = clean_texture_path(manual_path)
+        if manual_path:
+            return [manual_path], "MANUAL"
+        return [], "NONE"
+
+    dirname = os.path.dirname(blockymodel_filepath)
+    model_name = derive_default_name(blockymodel_filepath)
+
+    candidates = discover_texture_paths(dirname, model_name)
+    tier = "STRICT"
+    if not candidates:
+        candidates = discover_texture_paths_loose_fallback(dirname, model_name)
+        tier = "LOOSE"
+    if not candidates:
+        return [], "NONE"
+
+    preferred = next(
+        (p for p in candidates if os.path.splitext(os.path.basename(p))[0].startswith(model_name)),
+        None,
+    )
+    if preferred and preferred in candidates:
+        ordered = [preferred] + [p for p in candidates if p != preferred]
+    else:
+        ordered = candidates
+    return ordered, tier
+
+
 def clean_texture_path(path):
     """Remove aspas (simples ou duplas) e espaços nas pontas do caminho.
     Colar um caminho copiado do Explorer do Windows (Shift+Copiar como
@@ -828,20 +1010,17 @@ def clean_texture_path(path):
     return path
 
 
-def get_or_create_material(atlas_w, atlas_h, texture_filepath=""):
-    """Cria um material único, com uma Image Texture -> Base Color + Alpha.
-    O Hytale/Blockbench só guarda UMA textura flat por modelo (sem PBR, sem
-    normal/roughness maps), então o material espelha isso: só Base Color +
-    Alpha (a maioria das peças -- cabelo, roupas, etc -- depende de
-    transparência real, não só de Base Color).
-
-    Se `texture_filepath` apontar pra um arquivo válido, carrega a textura
-    real (devolvida em `image`, pra quem chamar poder usar as dimensões
-    DELA -- mais precisas que qualquer heurística/valor manual -- no
-    cálculo de UV). Caso contrário, cria uma imagem em branco (cinza claro)
-    do tamanho de atlas_w/atlas_h, como placeholder até você conectar a
-    textura de verdade."""
-    mat = bpy.data.materials.new(name="Hytale_Material")
+def build_flat_material_from_image(image, material_name="Hytale_Material"):
+    """Monta o material "flat" (Image Texture -> Base Color + Alpha, sem
+    PBR) a partir de uma bpy.data.images já existente. Extraído de
+    get_or_create_material pra ser reaproveitado também pelo import de
+    .bbmodel (que decodifica a textura de um base64 embutido em vez de
+    carregar de um caminho de arquivo -- ver decode_bbmodel_texture) sem
+    duplicar a montagem do shader. Devolve (material, tex_node) -- o
+    tex_node é devolvido pra quem chama poder posicionar nodes extras
+    (ex: variantes de textura não conectadas) relativos a ele -- ver
+    get_or_create_material."""
+    mat = bpy.data.materials.new(name=material_name)
     mat.use_nodes = True
     nodes = mat.node_tree.nodes
     links = mat.node_tree.links
@@ -849,23 +1028,6 @@ def get_or_create_material(atlas_w, atlas_h, texture_filepath=""):
     bsdf = nodes.get("Principled BSDF")
     if bsdf is None:
         bsdf = next((n for n in nodes if n.type == "BSDF_PRINCIPLED"), None)
-
-    image = None
-    texture_filepath = clean_texture_path(texture_filepath)
-    if texture_filepath:
-        try:
-            image = bpy.data.images.load(texture_filepath, check_existing=True)
-        except RuntimeError:
-            image = None
-
-    if image is None:
-        image = bpy.data.images.new(
-            "Hytale_Placeholder_Texture",
-            width=max(int(atlas_w), 1),
-            height=max(int(atlas_h), 1),
-            alpha=True,
-        )
-        image.generated_color = (0.6, 0.6, 0.6, 1.0)
 
     tex_node = nodes.new("ShaderNodeTexImage")
     tex_node.image = image
@@ -888,7 +1050,519 @@ def get_or_create_material(atlas_w, atlas_h, texture_filepath=""):
     if hasattr(mat, "shadow_method"):
         mat.shadow_method = "HASHED"
 
-    return mat, image
+    return mat, tex_node
+
+
+def get_or_create_material(atlas_w, atlas_h, texture_filepaths=None):
+    """Cria um material único, com uma Image Texture -> Base Color + Alpha.
+    O Hytale/Blockbench só guarda UMA textura flat por modelo (sem PBR, sem
+    normal/roughness maps), então o material espelha isso: só Base Color +
+    Alpha (a maioria das peças -- cabelo, roupas, etc -- depende de
+    transparência real, não só de Base Color).
+
+    `texture_filepaths` é uma LISTA (pode ter mais de um -- pastas de
+    textura da Hytale costumam ter VARIANTES do mesmo personagem, ex:
+    Player_Greyscale.png, Player_Muscular_Greyscale.png, Outlander_1.png,
+    todas juntas na mesma pasta -- ver resolve_texture_filepaths). TODAS
+    são carregadas em bpy.data.images -- a PRIMEIRA da lista vira o node
+    de verdade, conectado no Base Color/Alpha; as outras entram como
+    nodes Image Texture ADICIONAIS no mesmo material, empilhados
+    visualmente ABAIXO do node principal, mas SEM NENHUMA conexão --
+    ficam ali só pra você arrastar um link na mão se quiser trocar,
+    sem precisar procurar o arquivo de novo nem sair do editor de shader.
+
+    Se nenhum caminho carregar (lista vazia ou todos falharem), cria uma
+    imagem em branco (cinza claro) do tamanho de atlas_w/atlas_h, como
+    placeholder até você conectar uma textura de verdade.
+
+    Devolve (material, imagem_principal, lista_de_todas_carregadas)."""
+    texture_filepaths = texture_filepaths or []
+    loaded_images = []
+    for filepath in texture_filepaths:
+        filepath = clean_texture_path(filepath)
+        if not filepath:
+            continue
+        try:
+            img = bpy.data.images.load(filepath, check_existing=True)
+        except RuntimeError:
+            continue
+        loaded_images.append(img)
+
+    if loaded_images:
+        primary_image = loaded_images[0]
+    else:
+        primary_image = bpy.data.images.new(
+            "Hytale_Placeholder_Texture",
+            width=max(int(atlas_w), 1),
+            height=max(int(atlas_h), 1),
+            alpha=True,
+        )
+        primary_image.generated_color = (0.6, 0.6, 0.6, 1.0)
+
+    mat, primary_tex_node = build_flat_material_from_image(primary_image)
+
+    # Nodes de textura têm ~230px de altura por padrão (com o preview de
+    # imagem aberto) -- 260 dá uma folguinha visual entre um e outro sem
+    # ficarem colados.
+    NODE_STACK_OFFSET_Y = 260
+    for i, extra_image in enumerate(loaded_images[1:], start=1):
+        extra_node = mat.node_tree.nodes.new("ShaderNodeTexImage")
+        extra_node.image = extra_image
+        extra_node.interpolation = "Closest"
+        extra_node.label = extra_image.name
+        extra_node.location = (
+            primary_tex_node.location.x,
+            primary_tex_node.location.y - NODE_STACK_OFFSET_Y * i,
+        )
+
+    return mat, primary_image, loaded_images
+
+
+# ---------------------------------------------------------------------------
+# Suporte a .bbmodel (projeto salvo do Blockbench)
+# ---------------------------------------------------------------------------
+#
+# Diferente do .blockymodel (um "node" por peça, position RELATIVA ao pai +
+# shape.offset, orientation em quaternion), o .bbmodel guarda a árvore em
+# TRÊS listas separadas que precisam ser religadas por uuid:
+#   - "elements": lista PLANA de cubos (from/to/origin, todos em coordenadas
+#     ABSOLUTAS/"de repouso" -- mesmo espaço pra raiz e pra folha).
+#   - "groups": lista PLANA de bones/pivôs (origin absoluto, rotation em
+#     Euler XYZ em GRAUS -- não quaternion).
+#   - "outliner": a árvore de verdade, um nó por group, cujos filhos podem
+#     ser outro nó de group (dict) OU o uuid de um element (string) direto.
+#
+# MATEMÁTICA DA POSIÇÃO/ROTAÇÃO -- CONFIRMADA NUMERICAMENTE (não é chute):
+# comparando a posição mundial de R-Forearm/R-Hand calculada a partir de um
+# .blockymodel do MESMO personagem (via node_local_matrix, já validado)
+# contra a calculada a partir do .bbmodel equivalente, erro < 4e-4 (a
+# diferença esperada só do arredondamento de 3 casas decimais que o
+# Blockbench grava no "rotation"). Isso confirma duas coisas que NÃO dá
+# pra advinhar só olhando o formato (chegaram a existir fontes não-oficiais
+# divergentes sobre a ordem dos eixos):
+#
+# 1) Cada group representa uma transformação "rotacionar ao redor do
+#    próprio origin": M(group) = Translate(origin) @ Euler(rotation, 'XYZ')
+#    @ Translate(-origin). A ordem 'XYZ' aqui é a ordem nativa do
+#    mathutils.Euler do Blender (aplica X primeiro, Y depois, Z por último
+#    -- equivale a multiplicar as matrizes Rz @ Ry @ Rx). O quaternion do
+#    R-Arm no .blockymodel ({0.00266,-0.06099,-0.04354,w=0.99719})
+#    convertido pra Euler nessa MESMA ordem bate com o rotation gravado no
+#    .bbmodel ([0.613,-6.973,-5.037]).
+#
+# 2) A POSIÇÃO de um group/element é o `origin` do próprio arquivo
+#    transformado pela cadeia de M(ancestral) de TODOS os ancestrais, SEM
+#    incluir a própria rotação do nó (rotacionar um pivô ao redor dele
+#    mesmo não move o pivô, só afeta os FILHOS). Por isso mantemos DOIS
+#    acumuladores separados ao percorrer a árvore -- ver
+#    build_bbmodel_recursive:
+#      - `ancestor_pivot_matrix`: a cadeia completa
+#        Translate(origin)@Rotate@Translate(-origin) de cada ancestral,
+#        multiplicada em sequência -- usada só pra achar a POSIÇÃO de um
+#        filho a partir do origin bruto dele (a translação resultante NÃO
+#        é uma soma simples por causa do Translate(-origin) no meio).
+#      - `ancestor_rotation_matrix`: só a composição das ROTAÇÕES em si
+#        (sem a parte de pivô/translação) -- é o equivalente direto da
+#        variável "world" (rotação acumulada) em build_bones_recursive, e
+#        é o que vira a orientação de verdade do bone (importa pra
+#        IK/torção na hora de animar).
+#
+# 3) is_piece (equivalente ao isPiece do .blockymodel) já vem, no .bbmodel,
+#    como um GROUP NORMAL dentro da árvore -- o Blockbench já materializa
+#    o bone "wrapper" (ex: "Eyes:R-Eye-Attachment") como um nó de verdade
+#    no outliner na hora de salvar o projeto. Ou seja: um .bbmodel salvo já
+#    É o personagem com os attachments FUNDIDOS -- diferente do fluxo de
+#    vários .blockymodel separados (corpo + Eyes.blockymodel + ...) que o
+#    modo "Attach to Existing" existe pra reconstruir. Por isso o import de
+#    .bbmodel abaixo só tem um modo (sempre cria um Armature novo do
+#    zero) -- não reaproveita bones de um Armature já existente. Se algum
+#    dia isso for necessário (ex: anexar um .bbmodel de attachment feito à
+#    parte num personagem já importado), é uma extensão futura -- avise se
+#    precisar.
+#
+# 4) Cada element (cubo) também carrega um "stretch" [sx,sy,sz] -- fator de
+#    escala ao redor do próprio origin, igual ao shape.stretch do
+#    .blockymodel (comparar: R-Arm stretch.x=0.98 / L-Arm stretch.x=-0.98
+#    em AMBOS os formatos -- literalmente os mesmos valores). É onde vive
+#    o mecanismo de espelhamento de verdade: um stretch negativo produz
+#    uma reflexão, não só uma translação -- SEM isso, uma peça do lado L
+#    (mesmo com from/to já espelhados no arquivo) ainda fica com a
+#    "lateralidade" da UV errada, porque só a posição espelha, a
+#    geometria/UV local não. Ver make_bbmodel_cube_mesh pra os detalhes.
+#
+# MATEMÁTICA DO UV: reaproveita a MESMA lógica de BOX_FACE_BASE_SIGN
+# (ancoragem de canto) e a MESMA permutação de rotação já usada em
+# compute_face_uv (ver a nota grande lá, citando
+# Preview_controller.updateUV do Blockbench -- é código genérico do app
+# principal, não específico do .blockymodel, então vale igual aqui). A
+# diferença é que o .bbmodel já grava o retângulo final em PIXELS direto
+# em cada face ("uv": [x1,y1,x2,y2]), sem precisar derivar de
+# offset/mirror/angle como o _blockbench_uv_rect faz pro .blockymodel --
+# só falta plugar esse retângulo já pronto no lugar certo.
+#
+# AVISO: a parte de POSIÇÃO/ROTAÇÃO dos bones foi validada numericamente
+# (ver acima). A parte de UV reaproveita lógica já validada (mesmo
+# BOX_FACE_BASE_SIGN e mesma permutação de rotation), mas o CAMINHO
+# específico "pegar o retângulo pixel do .bbmodel e jogar direto nesses
+# mesmos cantos" não tem uma segunda fonte pra cross-check (o .blockymodel
+# de comparação não tem textureLayout pra comparar 1:1). Se alguma face
+# aparecer espelhada/rotacionada errado depois de importar, é aqui
+# (bbmodel_compute_face_uv, logo abaixo) que precisa ajustar.
+#
+# HISTÓRICO: já apareceu um bug real disso -- não na fórmula de UV em si,
+# mas no fato de eu ter esquecido de ler o campo "stretch" de cada element
+# (ver nota 4, acima). Sem aplicar o stretch, peças do lado L apareciam com
+# a UV "invertida" (confirmado visualmente comparando o mesmo .bbmodel
+# aberto no Blockbench vs importado no Blender) porque a reflexão de
+# verdade só acontece via o stretch negativo, não só pela posição já vir
+# espelhada no from/to. Corrigido em make_bbmodel_cube_mesh.
+
+BB_FACE_TO_HYTALE_FACE_KEY = {
+    # Convenção de bússola do Minecraft/Blockbench (norte = -Z, sul = +Z,
+    # leste = +X, oeste = -X, cima = +Y, baixo = -Y) mapeada pras mesmas
+    # chaves de face que o resto do módulo já usa (BOX_FACES_LOOP_ORDER,
+    # BOX_FACE_BASE_SIGN etc, vindas do .blockymodel) -- ver
+    # NORMAL_TO_HYTALE_FACE_KEY, acima, pra a mesma correspondência de eixo.
+    "north": "back",
+    "south": "front",
+    "west": "left",
+    "east": "right",
+    "up": "top",
+    "down": "bottom",
+}
+
+
+def bb_euler_matrix(rotation_deg):
+    """Matriz de rotação 4x4 a partir de [rx,ry,rz] em GRAUS, na mesma
+    ordem 'XYZ' do mathutils.Euler (aplica X, depois Y, depois Z -- ver
+    nota grande no topo desta seção pra a validação numérica dessa
+    ordem)."""
+    rx, ry, rz = rotation_deg
+    return Euler((math.radians(rx), math.radians(ry), math.radians(rz)), "XYZ").to_matrix().to_4x4()
+
+
+def bb_rotate_around_pivot(origin, rotation_deg):
+    """Translate(origin) @ Rotate(rotation_deg) @ Translate(-origin) --
+    a transformação que UM group/element do .bbmodel representa (ver nota
+    grande acima). `origin` já deve vir escalado (unit_scale aplicado)."""
+    R = bb_euler_matrix(rotation_deg)
+    return Matrix.Translation(origin) @ R @ Matrix.Translation(-origin)
+
+
+def bbmodel_compute_face_uv(local_co, neg_extent, pos_extent, axis_u, axis_v, hytale_face_key, rect, rotation_deg, atlas_w, atlas_h):
+    """Equivalente a compute_face_uv, mas pro .bbmodel: `rect` já é o
+    retângulo final em pixels (x1,y1,x2,y2) direto do arquivo (sem
+    precisar de _blockbench_uv_rect), e a caixa pode ser ASSIMÉTRICA em
+    relação à origem (neg_extent/pos_extent por eixo, em vez de um único
+    half_extents -- ver make_bbmodel_cube_mesh)."""
+    nu, pu = neg_extent[axis_u], pos_extent[axis_u]
+    nv, pv = neg_extent[axis_v], pos_extent[axis_v]
+    span_u = (pu - nu) or 1.0
+    span_v = (pv - nv) or 1.0
+    s = (local_co[axis_u] - nu) / span_u
+    t = (local_co[axis_v] - nv) / span_v
+
+    bs, bt = BOX_FACE_BASE_SIGN.get(hytale_face_key, (1, -1))
+    s_bb = s if bs > 0 else 1.0 - s
+    t_bb = t if bt > 0 else 1.0 - t
+
+    # Mesma permutação de compute_face_uv, ver a nota grande lá.
+    k = int(round((rotation_deg or 0) / 90.0)) % 4
+    for _ in range(k):
+        s_bb, t_bb = t_bb, 1.0 - s_bb
+
+    x1, y1, x2, y2 = rect
+    px = x1 + (x2 - x1) * s_bb
+    py = y1 + (y2 - y1) * t_bb
+
+    u = px / atlas_w
+    v = 1.0 - (py / atlas_h)
+    return u, v
+
+
+def make_bbmodel_cube_mesh(name, from_scaled, to_scaled, origin_scaled, stretch, faces, atlas_by_texture_index, generate_uvs):
+    """Cria a malha de um element 'cube' do .bbmodel. Diferente de
+    make_box_mesh (caixa sempre CENTRADA na origem, pro .blockymodel),
+    aqui a caixa pode ser ASSIMÉTRICA em relação ao pivô (`origin_scaled`
+    não é necessariamente o centro geométrico de from/to -- ex: o pivô de
+    um pé costuma ficar no tornozelo, não no meio da caixa do pé).
+
+    `stretch`: [sx,sy,sz] -- fator de escala por eixo, ao redor do próprio
+    origin. Existe em CADA element do .bbmodel (não só o que aparece
+    selecionado no painel do Blockbench -- ficou fácil de não perceber
+    porque o painel só mostra o elemento selecionado no momento). Faz
+    duas coisas ao mesmo tempo, igual o "shape.stretch" já faz no
+    .blockymodel (ver local_offset_scale em add_reference_visuals):
+      1) Redimensiona a caixa de verdade (ex: L-Eyelid stretch=[1,0.1,1]
+         -- achata a pálpebra a 10% no Y).
+      2) Quando NEGATIVO num eixo (ex: R-Arm stretch=[0.98,1,1] vs
+         L-Arm stretch=[-0.98,1,1] -- os MESMOS valores de magnitude do
+         par R/L no .blockymodel!), produz uma reflexão de verdade --
+         mesmo mecanismo do .blockymodel pro espelhamento do lado L, só
+         que aqui aplicado direto nos vértices locais em vez de via
+         transform do objeto. Aplicar em `neg`/`pos` ANTES de montar
+         verts_co (abaixo) já garante isso -- ao multiplicar por um
+         stretch negativo, `pos` fica NUMERICAMENTE MENOR que `neg`
+         (a ordem inverte), e como AS MESMAS variáveis (já invertidas)
+         são usadas tanto pros vértices quanto pra normalizar a UV (ver
+         bbmodel_compute_face_uv abaixo), o espelhamento se propaga
+         automaticamente pros dois -- geometria E UV -- sem precisar de
+         nenhum caso especial pro lado L/R.
+
+    `atlas_by_texture_index`: dict {índice da texture no .bbmodel: (atlas_w,
+    atlas_h)} -- resolvido pelo chamador a partir das texturas já
+    carregadas (ver decode_bbmodel_texture), pra saber contra qual tamanho
+    de atlas normalizar a UV de cada face (uma mesma malha só referencia
+    UM índice de texture nas suas faces definidas -- confirmado no
+    arquivo de teste: faces sem texture ficam com valor None e são só
+    faces internas/escondidas, sem UV pra gerar mesmo)."""
+    sx, sy, sz = stretch
+    neg = ((min(from_scaled.x, to_scaled.x) - origin_scaled.x) * sx,
+           (min(from_scaled.y, to_scaled.y) - origin_scaled.y) * sy,
+           (min(from_scaled.z, to_scaled.z) - origin_scaled.z) * sz)
+    pos = ((max(from_scaled.x, to_scaled.x) - origin_scaled.x) * sx,
+           (max(from_scaled.y, to_scaled.y) - origin_scaled.y) * sy,
+           (max(from_scaled.z, to_scaled.z) - origin_scaled.z) * sz)
+
+    verts_co = [
+        (neg[0], neg[1], neg[2]),
+        (pos[0], neg[1], neg[2]),
+        (pos[0], pos[1], neg[2]),
+        (neg[0], pos[1], neg[2]),
+        (neg[0], neg[1], pos[2]),
+        (pos[0], neg[1], pos[2]),
+        (pos[0], pos[1], pos[2]),
+        (neg[0], pos[1], pos[2]),
+    ]
+
+    mesh = bpy.data.meshes.new(name + "_mesh")
+    bm = bmesh.new()
+    bm_verts = [bm.verts.new(co) for co in verts_co]
+
+    uv_layer = bm.loops.layers.uv.new() if generate_uvs else None
+
+    for bb_key, idxs in BOX_FACES_LOOP_ORDER:
+        # bb_key já é a chave "hytale" (front/back/...) -- BOX_FACES_LOOP_ORDER
+        # é compartilhada com o .blockymodel. Achar a chave do .bbmodel
+        # (north/south/...) equivalente pra ler o dict "faces" do arquivo.
+        bb_face_name = next((k for k, v in BB_FACE_TO_HYTALE_FACE_KEY.items() if v == bb_key), None)
+        info = faces.get(bb_face_name) if bb_face_name else None
+        tex_index = info.get("texture") if info else None
+
+        # IMPORTANTE: o Blockbench SEMPRE grava a chave "uv" pra toda face,
+        # mesmo quando ela não existe de verdade (ex: os 5 lados "de
+        # dentro" de um quad achatado, tipo R-Ear2/R-Ear3 -- só que com
+        # "uv": [0,0,0,0]). O sinal de "essa face não existe" é
+        # texture=None, NÃO a ausência da chave "uv". Se não checar isso
+        # AQUI (antes de criar a face) em vez de só pular a atribuição de
+        # UV, sobra uma face sem UV sobreposta à face de verdade -- que no
+        # Blender aparece preta (sem UV válida) exatamente onde deveria
+        # ser invisível. bug real encontrado com R-Ear2/R-Ear3 do arquivo
+        # de teste -- ver DEVELOPER_NOTES/histórico da conversa.
+        if tex_index is None:
+            continue
+
+        face = bm.faces.new([bm_verts[i] for i in idxs])
+        if uv_layer is None:
+            continue
+        atlas = atlas_by_texture_index.get(tex_index)
+        if atlas is None:
+            # Texture referenciada de verdade, mas não foi carregada (ex:
+            # usuário desmarcou "Create Materials") -- a face É real,
+            # só fica sem UV atribuída.
+            continue
+        atlas_w, atlas_h = atlas
+        rect = info["uv"]
+        rotation_deg = info.get("rotation", 0)
+
+        fixed_axis = BOX_FACE_FIXED_AXIS[bb_key]
+        axis_u, axis_v = FACE_AXES_BY_FIXED_AXIS[fixed_axis]
+        for loop in face.loops:
+            local_co = loop.vert.co
+            u, v = bbmodel_compute_face_uv(local_co, neg, pos, axis_u, axis_v, bb_key, rect, rotation_deg, atlas_w, atlas_h)
+            loop[uv_layer].uv = (u, v)
+
+    bm.normal_update()
+    bm.to_mesh(mesh)
+    bm.free()
+    return mesh
+
+
+def decode_bbmodel_texture(texture_entry):
+    """Decodifica o PNG embutido em base64 (`texture_entry["source"]`,
+    formato "data:image/png;base64,...") pra uma bpy.data.images, e a
+    empacota (pack) no .blend -- assim não fica dependendo de um arquivo
+    temporário que pode não existir mais depois. Devolve None se a
+    texture não tiver source embutido (não deveria acontecer com
+    .bbmodel, que sempre embute, mas fica defensivo)."""
+    source = texture_entry.get("source", "")
+    if not source.startswith("data:image"):
+        return None
+    header, _, b64data = source.partition(",")
+    try:
+        raw_bytes = base64.b64decode(b64data)
+    except Exception:
+        return None
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".png")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw_bytes)
+        image = bpy.data.images.load(tmp_path, check_existing=False)
+        image.name = texture_entry.get("name", "Hytale_Texture")
+        image.pack()  # embute os pixels no .blend -- não depende mais do tmp_path
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+    return image
+
+
+def build_bbmodel_recursive(
+    armature_data,
+    outliner_children,
+    parent_bone_name,
+    ancestor_pivot_matrix,
+    ancestor_rotation_matrix,
+    groups_by_uuid,
+    elements_by_uuid,
+    unit_scale,
+    stats,
+    mesh_build_context,
+):
+    """Percorre uma lista de filhos do outliner (mistura de dict = group e
+    string = uuid de element) e constrói bones (groups) + meshes
+    (elements), recursivamente. `ancestor_pivot_matrix` e
+    `ancestor_rotation_matrix` -- ver a nota grande no topo desta seção
+    pra o que cada um representa e por que são acumuladores SEPARADOS."""
+    edit_bones = armature_data.edit_bones
+
+    for child in outliner_children:
+        if isinstance(child, str):
+            # Leaf: uuid de um element (cube) -- vira uma mesh, parentada
+            # no bone ATUAL (parent_bone_name), não um bone novo.
+            if not mesh_build_context["generate_meshes"]:
+                continue
+            elem = elements_by_uuid.get(child)
+            if elem is None:
+                continue
+            elem_origin = Vector(elem.get("origin", [0, 0, 0])) * unit_scale
+            elem_rotation = elem.get("rotation", [0, 0, 0])
+            world_pos = ancestor_pivot_matrix @ elem_origin
+            own_rotation = ancestor_rotation_matrix @ bb_euler_matrix(elem_rotation)
+            obj_matrix = Matrix.Translation(world_pos) @ own_rotation
+
+            from_scaled = Vector(elem.get("from", [0, 0, 0])) * unit_scale
+            to_scaled = Vector(elem.get("to", [0, 0, 0])) * unit_scale
+            stretch = elem.get("stretch", [1, 1, 1])
+            faces = elem.get("faces", {}) or {}
+            mesh = make_bbmodel_cube_mesh(
+                elem.get("name", "Element"),
+                from_scaled,
+                to_scaled,
+                elem_origin,
+                stretch,
+                faces,
+                mesh_build_context["atlas_by_texture_index"],
+                mesh_build_context["generate_uvs"],
+            )
+            obj = bpy.data.objects.new(elem.get("name", "Element") + "_ref", mesh)
+            mesh_build_context["target_collection"].objects.link(obj)
+
+            tex_index = next((f.get("texture") for f in faces.values() if f.get("texture") is not None), None)
+            material = mesh_build_context["material_by_texture_index"].get(tex_index)
+            if material is not None:
+                obj.data.materials.append(material)
+
+            armature_obj = mesh_build_context["armature_obj"]
+            if parent_bone_name is not None:
+                obj.parent = armature_obj
+                obj.matrix_world = armature_obj.matrix_world @ obj_matrix
+
+                vgroup = obj.vertex_groups.new(name=parent_bone_name)
+                vgroup.add(range(len(mesh.vertices)), 1.0, "REPLACE")
+
+                armature_mod = obj.modifiers.new(name="Armature", type="ARMATURE")
+                armature_mod.object = armature_obj
+            else:
+                # Caso raro: element sem NENHUM group ancestral (a raiz do
+                # outliner é, no arquivo real que validamos, sempre um
+                # group -- "Origin"). Sem bone pra parentar/pintar peso,
+                # só posiciona a malha (sem deform, objeto solto).
+                obj.matrix_world = armature_obj.matrix_world @ obj_matrix
+                mesh_build_context["settings"].report(
+                    {"WARNING"},
+                    f"'{elem.get('name', 'Element')}' is a root-level element with no "
+                    f"owning bone -- imported as a static mesh (not skinned).",
+                )
+
+            stats["meshes"] += 1
+            continue
+
+        # Não-string: nó de group de verdade, com seus próprios filhos.
+        group = groups_by_uuid.get(child["uuid"])
+        if group is None:
+            continue
+
+        name = group.get("name", "Bone")
+        origin = Vector(group.get("origin", [0, 0, 0])) * unit_scale
+        rotation_deg = group.get("rotation", [0, 0, 0])
+
+        world_pos = ancestor_pivot_matrix @ origin
+        own_rotation = ancestor_rotation_matrix @ bb_euler_matrix(rotation_deg)
+
+        final_name = unique_bone_name(name, edit_bones)
+        if final_name != name:
+            mesh_build_context["settings"].report(
+                {"WARNING"},
+                f"Duplicate bone name '{name}' inside this .bbmodel -- renamed to "
+                f"'{final_name}' in Blender. Original name preserved in the "
+                f"'{BONE_ORIGINAL_NAME_PROP}' custom property for the exporter to use.",
+            )
+
+        bone = edit_bones.new(final_name)
+        bone.head = (0, 0, 0)
+        bone.tail = (0, BONE_DISPLAY_LENGTH_GAME_UNITS * unit_scale, 0)
+        bone.matrix = Matrix.Translation(world_pos) @ own_rotation
+        if final_name != name:
+            bone[BONE_ORIGINAL_NAME_PROP] = name
+
+        if parent_bone_name is not None and parent_bone_name in edit_bones:
+            bone.parent = edit_bones[parent_bone_name]
+            bone.use_connect = False
+
+        stats["bones"] += 1
+
+        child_ancestor_pivot = ancestor_pivot_matrix @ bb_rotate_around_pivot(origin, rotation_deg)
+        build_bbmodel_recursive(
+            armature_data,
+            child.get("children", []),
+            bone.name,
+            child_ancestor_pivot,
+            own_rotation,
+            groups_by_uuid,
+            elements_by_uuid,
+            unit_scale,
+            stats,
+            mesh_build_context,
+        )
+
+
+def derive_default_bbmodel_name(filepath, data):
+    """Nome padrão pra Armature/Collection: o campo "name" do próprio
+    arquivo (Blockbench sempre preenche isso com o nome do projeto), com
+    fallback pro nome do arquivo sem extensão -- mesma lógica de
+    derive_default_name, abaixo, mas o .bbmodel tem essa informação
+    melhor que o .blockymodel (que não guarda nome de personagem
+    nenhum)."""
+    name = (data.get("name") or "").strip()
+    if name:
+        return name
+    base = os.path.basename(filepath)
+    if base.lower().endswith(".bbmodel"):
+        base = base[: -len(".bbmodel")]
+    return base or "Hytale_Rig"
 
 
 def get_or_create_child_collection(parent_collection, name):
@@ -963,16 +1637,29 @@ def find_attachments_collection(context, armature_obj):
 
 
 def add_reference_visuals(
-    armature_obj, root_nodes, world_matrices, node_id_to_bone_name, settings, atlas_w, atlas_h, target_collection
+    armature_obj, root_nodes, world_matrices, node_id_to_bone_name, settings, atlas_w, atlas_h, target_collection,
+    texture_filepaths=None,
 ):
-    """Cria malhas de referência visual (box/quad), rigidamente presas ao
-    bone correspondente via constraint Child Of. `root_nodes` é uma LISTA
+    """Cria malhas de referência visual (box/quad), presas ao bone
+    correspondente via parenting real + modifier Armature + Vertex Group
+    com peso 1.0 (equivalente, na bind pose, ao antigo esquema de
+    constraint Child Of, mas agora com weight painting de verdade
+    disponível pro usuário -- ver nota grande dentro do loop, abaixo).
+    `root_nodes` é uma LISTA
     (um .blockymodel pode ter mais de uma raiz -- ex: attachments como
     Eyes.blockymodel, que trazem R-Eye-Attachment e L-Eye-Attachment como
     dois nós de topo independentes). `target_collection` já vem resolvida
     pelo chamador (execute()) -- 'Main - X' pra NEW_ARMATURE, 'Mesh
     Attachments - X' pra ATTACH_EXISTING (ver build_character_collections/
-    find_attachments_collection)."""
+    find_attachments_collection). `texture_filepaths` já vem RESOLVIDA
+    pelo chamador (ver resolve_texture_filepaths, em execute()) -- prioriza
+    o que o usuário digitou manualmente (um único caminho, nesse caso) e
+    só recorre à auto-descoberta (discover_texture_paths, mesma convenção
+    do plugin oficial) se ele tiver deixado em branco -- podendo trazer
+    MAIS de um caminho (variantes de textura da mesma pasta, ex:
+    Player_Greyscale.png + Player_Muscular_Greyscale.png + Outlander_1.png).
+    Não lemos settings.texture_filepath diretamente aqui pra não confundir
+    "o que o usuário digitou" com "o que o import decidiu usar de fato"."""
     shape_nodes = []
     for root_node in root_nodes:
         collect_visual_shape_nodes(root_node, shape_nodes)
@@ -981,12 +1668,21 @@ def add_reference_visuals(
 
     material = None
     if settings.create_material:
-        material, loaded_image = get_or_create_material(atlas_w, atlas_h, settings.texture_filepath)
+        material, loaded_image, all_loaded_images = get_or_create_material(atlas_w, atlas_h, texture_filepaths)
         if loaded_image is not None and loaded_image.size[0] > 0 and loaded_image.size[1] > 0:
             # Textura real carregada -- usa as dimensões DELA pro cálculo de
             # UV em vez do valor inferido/manual (é a fonte mais confiável
             # que existe: o arquivo de pixels de verdade).
             atlas_w, atlas_h = loaded_image.size[0], loaded_image.size[1]
+        if len(all_loaded_images) > 1:
+            other_names = ", ".join(img.name for img in all_loaded_images[1:])
+            settings.report(
+                {"INFO"},
+                f"{len(all_loaded_images) - 1} additional texture variant(s) loaded (not "
+                f"connected, available for quick swap in the Image Texture node's browser): "
+                f"{other_names}.",
+            )
+
 
     # Snapshot dos nomes que JÁ existiam na collection ANTES desta chamada
     # de import -- só esses contam como "importado numa passada anterior" e
@@ -1016,7 +1712,9 @@ def add_reference_visuals(
         stretch = vec3(shape.get("stretch", {"x": 1, "y": 1, "z": 1}), default=1.0)
 
         if shape_type == "box":
-            mesh = make_box_mesh(name, size_scaled, size_raw, shape, atlas_w, atlas_h, settings.generate_uvs)
+            mesh = make_box_mesh(
+                name, size_scaled, size_raw, shape, atlas_w, atlas_h, settings.generate_uvs, settings.missing_face_mode
+            )
         else:  # "quad"
             mesh = make_quad_mesh(name, shape, size_scaled, size_raw, atlas_w, atlas_h, settings.generate_uvs)
 
@@ -1044,13 +1742,37 @@ def add_reference_visuals(
         # mas objetos de malha avulsos como esse não).
         desired_world = armature_obj.matrix_world @ node_world @ local_offset_scale
 
+        # Antes: a mesh ficava presa RIGIDAMENTE a um único bone via
+        # constraint "Child Of" -- simples e correto pra visual estático,
+        # mas não permite pintura de peso (weight painting) nem deform
+        # suave entre bones, o que é necessário pra animar de verdade
+        # (torções, blends de cotovelo/joelho etc.) fora do Blockbench.
+        #
+        # Agora: parent real no objeto Armature + modifier "Armature" +
+        # um Vertex Group nomeado EXATAMENTE como o bone (bone_name -- já
+        # é o nome FINAL do bone no Blender, pós-dedup, o mesmo usado
+        # antes como subtarget da constraint), com peso 1.0 em TODOS os
+        # vértices da mesh. O .blockymodel não descreve nenhum peso por
+        # vértice -- então "100% nesse bone" é o único valor que faz
+        # sentido inferir, e reproduz exatamente o mesmo visual rígido de
+        # antes na bind pose. A diferença é que agora o usuário pode
+        # repintar manualmente os pesos depois (ex: fazer uma manga
+        # deformar suavemente entre Shoulder e Elbow), sem precisar
+        # desfazer/trocar o esquema de anexo.
+        #
+        # obj.parent (em vez de só o modifier) garante que a mesh também
+        # acompanhe transformações do OBJETO Armature como um todo (ex: a
+        # rotação "Orient to Z-up", aplicada depois, mais abaixo em
+        # execute()) -- mesmo comportamento que a constraint Child Of já
+        # dava antes, mas agora via parenting de verdade.
+        obj.parent = armature_obj
         obj.matrix_world = desired_world
 
-        con = obj.constraints.new("CHILD_OF")
-        con.target = armature_obj
-        con.subtarget = bone_name
-        target_matrix = armature_obj.matrix_world @ node_world
-        con.inverse_matrix = target_matrix.inverted()
+        vgroup = obj.vertex_groups.new(name=bone_name)
+        vgroup.add(range(len(mesh.vertices)), 1.0, "REPLACE")
+
+        armature_mod = obj.modifiers.new(name="Armature", type="ARMATURE")
+        armature_mod.object = armature_obj
 
 
 def derive_default_name(filepath):
@@ -1134,8 +1856,9 @@ class IMPORT_OT_hytale_blockymodel(Operator, ImportHelper):
         name="Generate Reference Meshes",
         description=(
             "Creates a simple mesh (box or quad) for each visual shape in the "
-            "model, rigidly parented to its bone via a Child Of constraint. "
-            "Useful as a visual reference while animating"
+            "model, parented to the Armature and skinned (100% weight) to its "
+            "bone via a Vertex Group + Armature modifier. Useful as a visual "
+            "reference while animating, and already deformable/paintable"
         ),
         default=True,
     )
@@ -1153,6 +1876,40 @@ class IMPORT_OT_hytale_blockymodel(Operator, ImportHelper):
             "texture's pixel dimensions, set them manually for an exact match"
         ),
         default=True,
+    )
+
+    missing_face_mode: EnumProperty(
+        name="Faces Missing Texture Data",
+        description=(
+            "What to do with a box face that has no entry in the model's "
+            "texture layout. CONFIRMED against the official Hytale "
+            "Blockbench plugin's own source (blockymodel.ts): a missing "
+            "entry ALWAYS means that face had no texture assigned in "
+            "Blockbench -- there's no 'implicitly hidden by another piece' "
+            "case. So 'Skip' below is the behavior that faithfully matches "
+            "Blockbench itself (reloading the file there shows the same "
+            "empty face). 'Reuse Opposite Face' is a cosmetic-only override "
+            "for when you'd rather see some texture than a hole, even "
+            "knowing it doesn't match the source file"
+        ),
+        items=[
+            (
+                "SKIP",
+                "Skip (leave empty) -- matches Blockbench",
+                "Don't create geometry for that face. Faithful to what "
+                "Blockbench itself would show -- a missing texture layout "
+                "entry always means the face was genuinely untextured",
+            ),
+            (
+                "OPPOSITE_FALLBACK",
+                "Reuse Opposite Face's Texture (cosmetic)",
+                "Create the face and reuse the texture from the opposite "
+                "side of the same box. Does NOT match what Blockbench "
+                "itself would show -- purely a visual patch to avoid holes, "
+                "can paste the wrong-looking texture onto a visible face",
+            ),
+        ],
+        default="SKIP",
     )
 
     override_atlas_size: BoolProperty(
@@ -1194,14 +1951,40 @@ class IMPORT_OT_hytale_blockymodel(Operator, ImportHelper):
         default=True,
     )
 
+    texture_mode: EnumProperty(
+        name="Texture Mode",
+        description=(
+            "'Automatic' finds the texture PNG on disk using the same "
+            "convention as the official Hytale Blockbench plugin (same "
+            "folder as the model, or a '<ModelName>_Textures' subfolder). "
+            "'Manual' lets you point to a specific file instead, ignoring "
+            "auto-detection entirely"
+        ),
+        items=[
+            (
+                "AUTO",
+                "Automatic",
+                "Auto-detect the texture PNG next to the model (same "
+                "convention as the official Hytale plugin)",
+            ),
+            (
+                "MANUAL",
+                "Manual",
+                "Pick the texture PNG yourself -- auto-detection is skipped entirely",
+            ),
+        ],
+        default="AUTO",
+    )
+
     texture_filepath: StringProperty(
         name="Texture Image",
         description=(
-            "Optional: the model's texture PNG. The .blockymodel file only "
-            "stores per-face pixel offsets, not the texture itself or its "
-            "canvas size -- pointing this at the real file gives exact UVs "
-            "using its actual dimensions (takes priority over 'Set Atlas "
-            "Size Manually' above). Leave empty to use a blank placeholder"
+            "The model's texture PNG. The .blockymodel file only stores "
+            "per-face pixel offsets, not the texture itself or its canvas "
+            "size -- pointing this at the real file gives exact UVs using "
+            "its actual dimensions (takes priority over 'Set Atlas Size "
+            "Manually' above). Only used when 'Texture Mode' above is set "
+            "to 'Manual'"
         ),
         default="",
         subtype="FILE_PATH",
@@ -1263,6 +2046,7 @@ class IMPORT_OT_hytale_blockymodel(Operator, ImportHelper):
 
         atlas_sub = sub.column()
         atlas_sub.enabled = self.generate_uvs
+        atlas_sub.prop(self, "missing_face_mode", text=L("missing_face_mode", lang))
         atlas_sub.prop(self, "override_atlas_size", text=L("override_atlas_size", lang))
         atlas_row = atlas_sub.row()
         atlas_row.enabled = self.override_atlas_size
@@ -1271,7 +2055,10 @@ class IMPORT_OT_hytale_blockymodel(Operator, ImportHelper):
 
         tex_row = sub.column()
         tex_row.enabled = self.generate_reference_boxes and self.create_material
-        tex_row.prop(self, "texture_filepath", text=L("texture_filepath", lang))
+        tex_row.prop(self, "texture_mode", text=L("texture_mode", lang))
+        manual_row = tex_row.column()
+        manual_row.enabled = self.texture_mode == "MANUAL"
+        manual_row.prop(self, "texture_filepath", text=L("texture_filepath", lang))
 
     def execute(self, context):
         with open(self.filepath, "r", encoding="utf-8") as f:
@@ -1373,6 +2160,30 @@ class IMPORT_OT_hytale_blockymodel(Operator, ImportHelper):
                 atlas_w, atlas_h = self.atlas_width, self.atlas_height
             else:
                 atlas_w, atlas_h = compute_atlas_size(root_nodes)
+
+            resolved_texture_filepaths = []
+            if self.create_material:
+                resolved_texture_filepaths, tier = resolve_texture_filepaths(
+                    self.filepath, self.texture_mode, self.texture_filepath
+                )
+                if resolved_texture_filepaths:
+                    primary_name = os.path.basename(resolved_texture_filepaths[0])
+                    if tier == "STRICT":
+                        self.report(
+                            {"INFO"},
+                            f"Texture auto-detected: '{primary_name}' (same folder/naming "
+                            f"convention as the official Hytale plugin). Set 'Texture Image' "
+                            f"manually to override.",
+                        )
+                    elif tier == "LOOSE":
+                        self.report(
+                            {"INFO"},
+                            f"Texture auto-detected: '{primary_name}' (found via a single "
+                            f"sibling '*_Textures' folder that didn't match the model's exact "
+                            f"name -- NOT the official plugin's own convention, just a looser "
+                            f"fallback we added). Set 'Texture Image' manually to override.",
+                        )
+
             add_reference_visuals(
                 armature_obj,
                 root_nodes,
@@ -1382,6 +2193,7 @@ class IMPORT_OT_hytale_blockymodel(Operator, ImportHelper):
                 atlas_w,
                 atlas_h,
                 target_collection,
+                resolved_texture_filepaths,
             )
 
         if self.import_mode == "NEW_ARMATURE" and self.orient_z_up:
@@ -1400,16 +2212,212 @@ class IMPORT_OT_hytale_blockymodel(Operator, ImportHelper):
 
 def menu_func_import(self, context):
     self.layout.operator(IMPORT_OT_hytale_blockymodel.bl_idname, text="Hytale Model (.blockymodel)")
+    self.layout.operator(IMPORT_OT_hytale_bbmodel.bl_idname, text="Hytale Model (Blockbench .bbmodel)")
+
+
+# ---------------------------------------------------------------------------
+# Operator: import de .bbmodel
+# ---------------------------------------------------------------------------
+#
+# Só tem modo "criar Armature novo" -- ver a nota grande no topo da seção
+# "Suporte a .bbmodel" pra o motivo (um .bbmodel salvo já vem com os
+# attachments fundidos na árvore, não precisa reconstruir isso na
+# importação como o modo "Attach to Existing" do .blockymodel faz).
+
+
+class IMPORT_OT_hytale_bbmodel(Operator, ImportHelper):
+    """Import a Hytale character/creature from a Blockbench project (.bbmodel)"""
+
+    bl_idname = "import_scene.hytale_bbmodel"
+    bl_label = "Import Hytale Model (.bbmodel)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    filename_ext = ".bbmodel"
+    filter_glob: StringProperty(default="*.bbmodel", options={"HIDDEN"})
+
+    armature_name: StringProperty(
+        name="Armature Name",
+        description=(
+            "Name for the new Armature and its collection. Leave empty to "
+            "fall back to the project's own name (stored inside the "
+            ".bbmodel), or to the filename if that's also empty"
+        ),
+        default="",
+    )
+
+    orient_z_up: BoolProperty(
+        name="Orient to Z-up (visual only)",
+        description=(
+            "Rotate the Armature object 90 degrees so it displays upright "
+            "in Blender's Z-up viewport. Purely a display rotation on the "
+            "Armature object itself -- bone data underneath is untouched"
+        ),
+        default=True,
+    )
+
+    unit_scale: FloatProperty(
+        name="Scale (Blender units per game unit)",
+        description="Same meaning as in the .blockymodel importer -- see UNIT_SCALE_DEFAULT in common.py",
+        default=UNIT_SCALE_DEFAULT,
+        min=0.0001,
+    )
+
+    generate_reference_boxes: BoolProperty(
+        name="Generate Reference Meshes",
+        description=(
+            "Creates a mesh for each cube element in the project, parented "
+            "to the Armature and skinned (100% weight) to its owning bone "
+            "via a Vertex Group + Armature modifier"
+        ),
+        default=True,
+    )
+
+    generate_uvs: BoolProperty(
+        name="Generate UVs",
+        description=(
+            "Generates UV coordinates for the reference meshes from each "
+            "face's pixel rectangle, already stored directly in the "
+            ".bbmodel (no inference needed, unlike the .blockymodel path)"
+        ),
+        default=True,
+    )
+
+    create_material: BoolProperty(
+        name="Create Materials",
+        description=(
+            "Decodes the texture(s) embedded in the .bbmodel itself "
+            "(base64 PNG data) and creates one material per texture used, "
+            "wired into Base Color/Alpha through the generated UVs -- no "
+            "external texture file needed, everything is self-contained "
+            "in the .bbmodel"
+        ),
+        default=True,
+    )
+
+    def draw(self, context):
+        layout = self.layout
+        lang = get_language(context)
+
+        target_box = layout.box()
+        target_box.label(text=L("section_target", lang))
+        target_box.prop(self, "armature_name", text=L("armature_name", lang))
+
+        rig_box = layout.box()
+        rig_box.label(text=L("section_rig", lang))
+        rig_box.prop(self, "orient_z_up", text=L("orient_z_up", lang))
+        rig_box.prop(self, "unit_scale", text=L("unit_scale", lang))
+
+        vis_box = layout.box()
+        vis_box.label(text=L("section_visuals", lang))
+        vis_box.prop(self, "generate_reference_boxes", text=L("generate_reference_boxes", lang))
+
+        sub = vis_box.column()
+        sub.enabled = self.generate_reference_boxes
+        sub.prop(self, "generate_uvs", text=L("generate_uvs", lang))
+        sub.prop(self, "create_material", text=L("create_material", lang))
+
+    def execute(self, context):
+        with open(self.filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        outliner_roots = data.get("outliner", [])
+        if not outliner_roots:
+            self.report({"ERROR"}, "No outliner data found in the file (.bbmodel is empty or invalid).")
+            return {"CANCELLED"}
+
+        groups_by_uuid = {g["uuid"]: g for g in data.get("groups", [])}
+        elements_by_uuid = {e["uuid"]: e for e in data.get("elements", [])}
+
+        resolved_name = self.armature_name.strip() or derive_default_bbmodel_name(self.filepath, data)
+        armature_data = bpy.data.armatures.new(resolved_name)
+        armature_obj = bpy.data.objects.new(resolved_name, armature_data)
+        rig_collection, main_collection, attachments_collection = build_character_collections(
+            context, armature_obj.name
+        )
+        rig_collection.objects.link(armature_obj)
+        armature_obj["hytale_meshes_main_collection"] = main_collection.name
+        armature_obj["hytale_meshes_attachments_collection"] = attachments_collection.name
+
+        context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+
+        # Decodifica as texturas embutidas (base64) ANTES de entrar em Edit
+        # Mode -- criação de imagem/material não depende do modo do
+        # Armature, e assim já temos os tamanhos de atlas prontos pra
+        # passar pra build_bbmodel_recursive (que roda dentro do Edit Mode
+        # junto com a criação dos bones).
+        atlas_by_texture_index = {}
+        material_by_texture_index = {}
+        if self.generate_reference_boxes and self.create_material:
+            for idx, tex_entry in enumerate(data.get("textures", [])):
+                image = decode_bbmodel_texture(tex_entry)
+                if image is None:
+                    continue
+                atlas_by_texture_index[idx] = (image.size[0], image.size[1])
+                material, _tex_node = build_flat_material_from_image(
+                    image, material_name=tex_entry.get("name", "Hytale_Material")
+                )
+                material_by_texture_index[idx] = material
+
+        mesh_build_context = {
+            "target_collection": main_collection,
+            "armature_obj": armature_obj,
+            "atlas_by_texture_index": atlas_by_texture_index,
+            "material_by_texture_index": material_by_texture_index,
+            "generate_meshes": self.generate_reference_boxes,
+            "generate_uvs": self.generate_reference_boxes and self.generate_uvs,
+            "settings": self,
+        }
+
+        # Mesma cautela do import de .blockymodel -- ver a nota grande em
+        # IMPORT_OT_hytale_blockymodel.execute() sobre X-Axis Mirror.
+        original_use_mirror_x = armature_data.use_mirror_x
+        if original_use_mirror_x:
+            armature_data.use_mirror_x = False
+
+        stats = {"bones": 0, "meshes": 0}
+        bpy.ops.object.mode_set(mode="EDIT")
+        try:
+            build_bbmodel_recursive(
+                armature_data,
+                outliner_roots,
+                None,
+                Matrix.Identity(4),
+                Matrix.Identity(4),
+                groups_by_uuid,
+                elements_by_uuid,
+                self.unit_scale,
+                stats,
+                mesh_build_context,
+            )
+        finally:
+            bpy.ops.object.mode_set(mode="OBJECT")
+            if original_use_mirror_x:
+                armature_data.use_mirror_x = original_use_mirror_x
+
+        if self.orient_z_up:
+            armature_obj.rotation_euler = Euler((math.radians(90.0), 0.0, 0.0), "XYZ")
+
+        context.view_layer.update()
+
+        self.report(
+            {"INFO"},
+            f"Imported {stats['bones']} bone(s) and {stats['meshes']} mesh(es) from '{resolved_name}' "
+            f"(scale={self.unit_scale:.5f}).",
+        )
+        return {"FINISHED"}
 
 
 def register():
     bpy.utils.register_class(HytaleImporterPreferences)
     bpy.utils.register_class(IMPORT_OT_hytale_blockymodel)
+    bpy.utils.register_class(IMPORT_OT_hytale_bbmodel)
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
 
 
 def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
+    bpy.utils.unregister_class(IMPORT_OT_hytale_bbmodel)
     bpy.utils.unregister_class(IMPORT_OT_hytale_blockymodel)
     bpy.utils.unregister_class(HytaleImporterPreferences)
 
