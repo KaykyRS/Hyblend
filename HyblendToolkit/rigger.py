@@ -38,7 +38,7 @@
 bl_info = {
     "name": "Hytale Blocky Rigger",
     "author": "Kaayky",
-    "version": (0, 6, 0),
+    "version": (0, 5, 2),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Hytale Rigger",
     "description": "Auto-generate the ORG/MCH/CTRL/CTRL-IK/MCH-IK bone layers, constraints, "
@@ -233,6 +233,15 @@ CHILD_OF_GLOBAL_TARGET = ROOT_MASTER_PARENT
 # bone ORG que já existe (ex.: "Pelvis") e isso resolve pro bone final.
 PARENT_OVERRIDE_ALIASES = {
     "Pelvis": BONE_ROOT_PELVIS,
+    # v0.5.1: sem isso, digitar "L-Shoulder" (nome ORG literal, sem
+    # sufixo -- o padrão natural de se escrever aqui, igual "Pelvis")
+    # resolvia pro bone ORG cru em vez do "L-Shoulder_CTRL" gerado --
+    # a cadeia de braço ficava parentada no lugar errado e nunca
+    # aparecia em Main/Arm L/R (só em CTRL-IK), porque
+    # _resolve_main_limb_roots/ARM_COLLECTION_ROOTS caminha a partir de
+    # "L-Shoulder_CTRL" esperando achar o braço como descendente dele.
+    "L-Shoulder": "L-Shoulder" + SUFFIX_CTRL,
+    "R-Shoulder": "R-Shoulder" + SUFFIX_CTRL,
 }
 
 # ---------------------------------------------------------------------------
