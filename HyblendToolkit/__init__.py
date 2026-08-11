@@ -12,9 +12,9 @@ Não existe `bl_info` aqui porque este é um addon no formato "Extension"
 (Blender 4.2+) -- os metadados equivalentes vivem em blender_manifest.toml.
 """
 
-from . import common, exporter, importer, anim_importer, interface, rigger
+from . import common, translations, templates, exporter, importer, anim_importer, interface, rigger
 
-_MODULES = (common, importer, anim_importer, exporter, interface, rigger)
+_MODULES = (common, translations, templates, importer, anim_importer, exporter, interface, rigger)
 
 
 def register():

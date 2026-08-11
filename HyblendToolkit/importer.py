@@ -28,67 +28,24 @@ from .common import (
     quat_xyzw,
     vec3,
 )
+from .translations import get_language, get_language_items, tr
 
 # ---------------------------------------------------------------------------
-# i18n: this addon's options can be shown in English or Portuguese.
+# i18n
 # ---------------------------------------------------------------------------
 #
-# Blender's bpy.props "description" (the tooltip) is fixed at class
-# registration time, so it can't be swapped at runtime without the full
-# bpy.app.translations machinery. To keep this simple, tooltips stay in
-# English always. What DOES switch language is the label text shown in the
-# import panel, via the operator's custom draw() method below, driven by
-# the "language" preference in this addon's AddonPreferences.
-
-LABELS = {
-    "section_rig": {"EN": "Rig", "PT_BR": "Rig"},
-    "section_visuals": {"EN": "Reference Visuals", "PT_BR": "Visuais de Referência"},
-    "generate_reference_boxes": {
-        "EN": "Generate Reference Meshes",
-        "PT_BR": "Gerar Malhas de Referência",
-    },
-    "generate_uvs": {"EN": "Generate UVs", "PT_BR": "Gerar UVs"},
-    "missing_face_mode": {
-        "EN": "Faces Missing Texture Data",
-        "PT_BR": "Faces Sem Dado de Textura",
-    },
-    "create_material": {
-        "EN": "Create Material",
-        "PT_BR": "Criar Material",
-    },
-    "texture_mode": {
-        "EN": "Texture Mode",
-        "PT_BR": "Modo de Textura",
-    },
-    "texture_filepath": {
-        "EN": "Texture Image",
-        "PT_BR": "Imagem da Textura",
-    },
-    "orient_z_up": {"EN": "Orient to Z-up (visual only)", "PT_BR": "Orientar para Z-up (só visual)"},
-    "unit_scale": {"EN": "Scale (Blender units per game unit)", "PT_BR": "Escala (unidade Blender por unidade do jogo)"},
-    "override_atlas_size": {
-        "EN": "Set Atlas Size Manually",
-        "PT_BR": "Definir Tamanho do Atlas Manualmente",
-    },
-    "atlas_width": {"EN": "Atlas Width (px)", "PT_BR": "Largura do Atlas (px)"},
-    "atlas_height": {"EN": "Atlas Height (px)", "PT_BR": "Altura do Atlas (px)"},
-    "section_target": {"EN": "Target", "PT_BR": "Destino"},
-    "import_mode": {"EN": "Import Mode", "PT_BR": "Modo de Import"},
-    "target_armature": {"EN": "Target Armature", "PT_BR": "Armature Alvo"},
-    "armature_name": {"EN": "Armature Name", "PT_BR": "Nome da Armature"},
-}
-
-
-def get_language(context):
-    try:
-        prefs = context.preferences.addons[ADDON_PACKAGE].preferences
-        return prefs.language
-    except Exception:
-        return "EN"
-
-
-def L(key, lang):
-    return LABELS.get(key, {}).get(lang, key)
+# O dicionário de textos (LABELS/L) e o get_language() que moravam aqui
+# viraram o pacote translations/ (idiomas plugáveis, um arquivo .py por
+# idioma -- ver translations/__init__.py e translations/en.py pra
+# detalhes). Este arquivo só chama tr("importer.<key>", lang) agora, do
+# mesmo jeito que antes chamava L("<key>", lang) -- só o prefixo
+# "importer." nas keys mudou, pra não colidir com as keys de
+# interface.py (prefixo "panel.") dentro do mesmo dicionário compartilhado.
+#
+# Continua valendo a limitação de antes: o tooltip (hover) de um
+# bpy.props.*Property (parâmetro description=) fica fixo em Inglês,
+# porque o Blender resolve esse texto no registro da classe, não a cada
+# redraw -- ver a nota grande sobre isso em translations/__init__.py.
 
 
 class HytaleImporterPreferences(AddonPreferences):
@@ -97,18 +54,28 @@ class HytaleImporterPreferences(AddonPreferences):
     # preferences em context.preferences.addons[...].
     bl_idname = ADDON_PACKAGE
 
+    # items=get_language_items é uma FUNÇÃO (callback), não uma lista fixa
+    # -- é o que permite qualquer arquivo novo dentro de translations/
+    # aparecer aqui sem precisar editar este arquivo. Efeito colateral:
+    # EnumProperty com items dinâmico não aceita default= (o Blender não
+    # tem como saber o valor default antes de rodar o callback) -- por
+    # isso não tem default= aqui; get_language() (translations/__init__.py)
+    # já cai pro Inglês sozinho caso o valor salvo seja inválido/vazio.
     language: EnumProperty(
         name="Language / Idioma",
-        description="Language used for labels in the import panel (tooltips stay in English)",
-        items=[
-            ("EN", "English", ""),
-            ("PT_BR", "Português (Brasil)", ""),
-        ],
-        default="EN",
+        description="Language used for labels in the panel and import dialogs (tooltips stay in English)",
+        items=get_language_items,
     )
 
     def draw(self, context):
-        self.layout.prop(self, "language")
+        lang = get_language(context)
+        row = self.layout.row(align=True)
+        row.prop(self, "language", text=tr("importer.prefs_language", lang))
+        row.operator(
+            "hytale.reload_translations",
+            text=tr("importer.prefs_reload_translations", lang),
+            icon="FILE_REFRESH",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2019,46 +1986,46 @@ class IMPORT_OT_hytale_blockymodel(Operator, ImportHelper):
         layout = self.layout
 
         target_box = layout.box()
-        target_box.label(text=L("section_target", lang))
-        target_box.prop(self, "import_mode", text=L("import_mode", lang))
+        target_box.label(text=tr("importer.section_target", lang))
+        target_box.prop(self, "import_mode", text=tr("importer.import_mode", lang))
         if self.import_mode == "ATTACH_EXISTING":
             target_box.prop_search(
-                self, "target_armature_name", bpy.data, "objects", text=L("target_armature", lang)
+                self, "target_armature_name", bpy.data, "objects", text=tr("importer.target_armature", lang)
             )
         else:
-            target_box.prop(self, "armature_name", text=L("armature_name", lang))
+            target_box.prop(self, "armature_name", text=tr("importer.armature_name", lang))
 
         rig_box = layout.box()
-        rig_box.label(text=L("section_rig", lang))
+        rig_box.label(text=tr("importer.section_rig", lang))
         rig_row = rig_box.column()
         rig_row.enabled = self.import_mode == "NEW_ARMATURE"
-        rig_row.prop(self, "orient_z_up", text=L("orient_z_up", lang))
-        rig_box.prop(self, "unit_scale", text=L("unit_scale", lang))
+        rig_row.prop(self, "orient_z_up", text=tr("importer.orient_z_up", lang))
+        rig_box.prop(self, "unit_scale", text=tr("importer.unit_scale", lang))
 
         vis_box = layout.box()
-        vis_box.label(text=L("section_visuals", lang))
-        vis_box.prop(self, "generate_reference_boxes", text=L("generate_reference_boxes", lang))
+        vis_box.label(text=tr("importer.section_visuals", lang))
+        vis_box.prop(self, "generate_reference_boxes", text=tr("importer.generate_reference_boxes", lang))
 
         sub = vis_box.column()
         sub.enabled = self.generate_reference_boxes
-        sub.prop(self, "generate_uvs", text=L("generate_uvs", lang))
-        sub.prop(self, "create_material", text=L("create_material", lang))
+        sub.prop(self, "generate_uvs", text=tr("importer.generate_uvs", lang))
+        sub.prop(self, "create_material", text=tr("importer.create_material", lang))
 
         atlas_sub = sub.column()
         atlas_sub.enabled = self.generate_uvs
-        atlas_sub.prop(self, "missing_face_mode", text=L("missing_face_mode", lang))
-        atlas_sub.prop(self, "override_atlas_size", text=L("override_atlas_size", lang))
+        atlas_sub.prop(self, "missing_face_mode", text=tr("importer.missing_face_mode", lang))
+        atlas_sub.prop(self, "override_atlas_size", text=tr("importer.override_atlas_size", lang))
         atlas_row = atlas_sub.row()
         atlas_row.enabled = self.override_atlas_size
-        atlas_row.prop(self, "atlas_width", text=L("atlas_width", lang))
-        atlas_row.prop(self, "atlas_height", text=L("atlas_height", lang))
+        atlas_row.prop(self, "atlas_width", text=tr("importer.atlas_width", lang))
+        atlas_row.prop(self, "atlas_height", text=tr("importer.atlas_height", lang))
 
         tex_row = sub.column()
         tex_row.enabled = self.generate_reference_boxes and self.create_material
-        tex_row.prop(self, "texture_mode", text=L("texture_mode", lang))
+        tex_row.prop(self, "texture_mode", text=tr("importer.texture_mode", lang))
         manual_row = tex_row.column()
         manual_row.enabled = self.texture_mode == "MANUAL"
-        manual_row.prop(self, "texture_filepath", text=L("texture_filepath", lang))
+        manual_row.prop(self, "texture_filepath", text=tr("importer.texture_filepath", lang))
 
     def execute(self, context):
         with open(self.filepath, "r", encoding="utf-8") as f:
@@ -2299,22 +2266,22 @@ class IMPORT_OT_hytale_bbmodel(Operator, ImportHelper):
         lang = get_language(context)
 
         target_box = layout.box()
-        target_box.label(text=L("section_target", lang))
-        target_box.prop(self, "armature_name", text=L("armature_name", lang))
+        target_box.label(text=tr("importer.section_target", lang))
+        target_box.prop(self, "armature_name", text=tr("importer.armature_name", lang))
 
         rig_box = layout.box()
-        rig_box.label(text=L("section_rig", lang))
-        rig_box.prop(self, "orient_z_up", text=L("orient_z_up", lang))
-        rig_box.prop(self, "unit_scale", text=L("unit_scale", lang))
+        rig_box.label(text=tr("importer.section_rig", lang))
+        rig_box.prop(self, "orient_z_up", text=tr("importer.orient_z_up", lang))
+        rig_box.prop(self, "unit_scale", text=tr("importer.unit_scale", lang))
 
         vis_box = layout.box()
-        vis_box.label(text=L("section_visuals", lang))
-        vis_box.prop(self, "generate_reference_boxes", text=L("generate_reference_boxes", lang))
+        vis_box.label(text=tr("importer.section_visuals", lang))
+        vis_box.prop(self, "generate_reference_boxes", text=tr("importer.generate_reference_boxes", lang))
 
         sub = vis_box.column()
         sub.enabled = self.generate_reference_boxes
-        sub.prop(self, "generate_uvs", text=L("generate_uvs", lang))
-        sub.prop(self, "create_material", text=L("create_material", lang))
+        sub.prop(self, "generate_uvs", text=tr("importer.generate_uvs", lang))
+        sub.prop(self, "create_material", text=tr("importer.create_material", lang))
 
     def execute(self, context):
         with open(self.filepath, "r", encoding="utf-8") as f:
