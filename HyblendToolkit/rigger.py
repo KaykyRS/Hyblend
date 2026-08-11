@@ -2207,6 +2207,16 @@ class RIG_OT_hytale_generate_rig(Operator):
 
             tip_index = len(chain) - 1
             tip_org = chain[tip_index]
+            # Attachments/dedos precisam seguir o resultado FINAL da
+            # ponta (FK ou IK, conforme o switch) -- não o ORG puro:
+            # reparentar neles funciona ao vivo (ORG == MCH em World
+            # Space, sempre, via CONSTRAINT_ORG_TO_MCH), mas o
+            # anim_importer.py só sabe projetar corretamente parents
+            # terminados em "_CTRL" ou "_MCH" -- um parent ORG cru cai
+            # no caso genérico "bone não animado" e a importação de
+            # animação desses bones sai errada (v0.5.1). _MCH dá o
+            # mesmo resultado visual E é reconhecido pelo importer.
+            tip_mch = edit_bones.get(tip_org.name + SUFFIX_MCH) or tip_org
             reparented_ctrl_roots = []
             attachment_org = find_attachment_child(tip_org)
             attachment_ctrl = edit_bones.get(attachment_org.name + SUFFIX_CTRL) if attachment_org else None
@@ -2215,11 +2225,11 @@ class RIG_OT_hytale_generate_rig(Operator):
                 # criado pelo loop padrão com parent = tip_org_CTRL (ex.:
                 # Hand_CTRL) -- mas Hand_CTRL é só o controle FK, que NÃO
                 # se move quando o braço está em modo IK. O attachment
-                # precisa seguir o resultado FINAL (ORG, que já é
+                # precisa seguir o resultado FINAL (_MCH, que já é
                 # constrained pra seguir FK OU IK conforme o switch), não
                 # só o FK. Roda TODA VEZ (não só "if is_new"): corrige
                 # também attachments já existentes de execuções antigas.
-                attachment_ctrl.parent = tip_org
+                attachment_ctrl.parent = tip_mch
                 attachment_ctrl.use_connect = False
                 reparented_ctrl_roots.append(attachment_ctrl.name)
 
@@ -2230,16 +2240,17 @@ class RIG_OT_hytale_generate_rig(Operator):
             # Hand_CTRL) pelo pipeline padrão de _build_edit_bones, mas
             # esse _CTRL é só a versão FK -- não se move quando a cadeia
             # está em modo IK, então o dedo "descola" do pé/mão nesse
-            # modo. Reparenta pro ORG da ponta (tip_org), que já é
-            # constrained pra seguir FK OU IK (CONSTRAINT_ORG_TO_MCH),
-            # do mesmo jeito que o attachment. Roda toda vez (não só
-            # "if is_new"), corrigindo também rigs já gerados antes
-            # dessa mudança.
+            # modo. Reparenta pro _MCH da ponta (tip_mch), que já é
+            # constrained pra seguir FK OU IK (CONSTRAINT_ORG_TO_MCH em
+            # ORG, mesmo valor em World Space que o MCH), do mesmo jeito
+            # que o attachment. Roda toda vez (não só "if is_new"),
+            # corrigindo também rigs já gerados antes dessa mudança
+            # (inclusive os que reparentavam no ORG cru, v0.5).
             for extra_child in find_non_attachment_children(tip_org):
                 extra_ctrl = edit_bones.get(extra_child.name + SUFFIX_CTRL)
                 if extra_ctrl is None:
                     continue
-                extra_ctrl.parent = tip_org
+                extra_ctrl.parent = tip_mch
                 extra_ctrl.use_connect = False
                 reparented_ctrl_roots.append(extra_ctrl.name)
 
@@ -2374,7 +2385,7 @@ class RIG_OT_hytale_generate_rig(Operator):
                     # dentro do bone PROPERTIES (não mais uma property por
                     # bone _IK) -- ver switch_property_name.
                     "switch_property": switch_property_name(chain[tip_index].name, item.side),
-                    # Bones _CTRL reparentados pro ORG da ponta (ver acima:
+                    # Bones _CTRL reparentados pro _MCH da ponta (ver acima:
                     # attachment_ctrl + find_non_attachment_children) --
                     # ficam FORA da árvore de parent que assign_descendants
                     # caminha em _build_main_collections, então precisam
@@ -2483,7 +2494,7 @@ class RIG_OT_hytale_generate_rig(Operator):
         walk de descendentes que monta Arm L/R e Leg L/R. Aqui, pra cada
         cadeia, descobre em qual sub-collection de Main o resto da cadeia
         (o "_IK" raiz) já caiu, e replica pro pole, pro tip e pra todo
-        _CTRL reparentado pro ORG da ponta (attachment_ctrl/dedos -- ver
+        _CTRL reparentado pro _MCH da ponta (attachment_ctrl/dedos -- ver
         reparented_ctrl_roots em _build_ik_layer -- esses também ficam
         fora da árvore de parent normal do walk, do mesmo jeito que o
         pole/tip, só que por reparenting em vez de nascerem sem parent)."""

@@ -77,7 +77,7 @@ from bpy_extras.io_utils import ImportHelper
 from mathutils import Matrix, Quaternion, Vector
 
 from .common import FPS_HYTALE, UNIT_SCALE_DEFAULT, quat_xyzw, vec3
-from .rigger import PROP_FK_IK_SWITCH, PROP_RIG_LAYER, SUFFIX_CTRL, SUFFIX_IK, SUFFIX_POLE
+from .rigger import PROP_FK_IK_SWITCH, PROP_RIG_LAYER, SUFFIX_CTRL, SUFFIX_IK, SUFFIX_MCH, SUFFIX_POLE
 
 # ---------------------------------------------------------------------------
 # Matemática de import -- espelho EXATO (invertido) de compute_deltas() /
@@ -758,9 +758,19 @@ def _apply_ctrl_fk_mode(
                 ctrl_parent_world = Matrix.Identity(4)
             elif ctrl_parent.name.endswith(SUFFIX_CTRL) and ctrl_parent.name[: -len(SUFFIX_CTRL)] in world_target:
                 ctrl_parent_world = world_target[ctrl_parent.name[: -len(SUFFIX_CTRL)]]
+            elif ctrl_parent.name.endswith(SUFFIX_MCH) and ctrl_parent.name[: -len(SUFFIX_MCH)] in world_target:
+                # Caso de attachments/filhos "de ponta" (dedos, sockets de
+                # arma etc.) que o rigger.py reparenta pro "_MCH" da ponta
+                # (ex: Hand_MCH) em vez do "_CTRL" (ex: Hand_CTRL) -- _MCH
+                # reflete o resultado final tanto em FK quanto em IK,
+                # diferente do _CTRL da ponta (só se move em FK). Sem este
+                # caso, um parent "_MCH" caía no "else" abaixo e usava a
+                # pose ESTÁTICA atual como referência, quebrando a
+                # importação desses bones (v0.5.1 -- ver rigger.py).
+                ctrl_parent_world = world_target[ctrl_parent.name[: -len(SUFFIX_MCH)]]
             else:
-                # Bone utilitário (ex: root.pelvis_CTRL) ou _CTRL de um
-                # bone ORG que não está neste arquivo -- assumimos que
+                # Bone utilitário (ex: root.pelvis_CTRL) ou _CTRL/_MCH de
+                # um bone ORG que não está neste arquivo -- assumimos que
                 # não está sendo animado por NADA neste import, então a
                 # pose ATUAL dele no Blender serve como referência fixa
                 # (ver nota grande acima do bloco CTRL_FK).
@@ -985,6 +995,11 @@ def _apply_ik_mode(
             parent_world = Matrix.Identity(4)
         elif parent.name.endswith(SUFFIX_CTRL) and parent.name[: -len(SUFFIX_CTRL)] in world_target:
             parent_world = world_target[parent.name[: -len(SUFFIX_CTRL)]]
+        elif parent.name.endswith(SUFFIX_MCH) and parent.name[: -len(SUFFIX_MCH)] in world_target:
+            # Caso de attachments/dedos reparentados pro "_MCH" da ponta
+            # pelo rigger.py (ver o mesmo caso em _apply_ctrl_fk_mode,
+            # comentário completo lá) -- v0.5.1.
+            parent_world = world_target[parent.name[: -len(SUFFIX_MCH)]]
         else:
             parent_world = parent.matrix.copy()
         local = parent_world.inverted() @ world_matrix
@@ -1245,6 +1260,11 @@ def _apply_both_mode(
             parent_world = Matrix.Identity(4)
         elif parent.name.endswith(SUFFIX_CTRL) and parent.name[: -len(SUFFIX_CTRL)] in world_target:
             parent_world = world_target[parent.name[: -len(SUFFIX_CTRL)]]
+        elif parent.name.endswith(SUFFIX_MCH) and parent.name[: -len(SUFFIX_MCH)] in world_target:
+            # Caso de attachments/dedos reparentados pro "_MCH" da ponta
+            # pelo rigger.py (ver o mesmo caso em _apply_ctrl_fk_mode,
+            # comentário completo lá) -- v0.5.1.
+            parent_world = world_target[parent.name[: -len(SUFFIX_MCH)]]
         else:
             parent_world = parent.matrix.copy()
         local = parent_world.inverted() @ world_matrix
