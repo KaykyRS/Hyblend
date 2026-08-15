@@ -4,6 +4,7 @@
   "shape_template": "Player",
   "ik_chains": [
     {
+      "chain_type": "ARM",
       "label": "Arm L",
       "root_bone": "L-Arm",
       "tip_bone": "L-Hand",
@@ -19,6 +20,7 @@
       "extra_ik_location": false
     },
     {
+      "chain_type": "ARM",
       "label": "Arm R",
       "root_bone": "R-Arm",
       "tip_bone": "R-Hand",
@@ -34,6 +36,7 @@
       "extra_ik_location": false
     },
     {
+      "chain_type": "LEG",
       "label": "Leg L",
       "root_bone": "L-Thigh",
       "tip_bone": "L-Foot",
@@ -43,12 +46,13 @@
       "pole_invert": true,
       "pole_distance": 0.35,
       "pole_angle_mode": "AUTO",
-      "pole_angle_preset_name": "ARM",
+      "pole_angle_preset_name": "LEG",
       "pole_angle_manual": 90.0,
       "pole_angle_fine_tune": 0.0,
       "extra_ik_location": true
     },
     {
+      "chain_type": "LEG",
       "label": "Leg R",
       "root_bone": "R-Thigh",
       "tip_bone": "R-Foot",
@@ -58,14 +62,17 @@
       "pole_invert": true,
       "pole_distance": 0.35,
       "pole_angle_mode": "AUTO",
-      "pole_angle_preset_name": "ARM",
+      "pole_angle_preset_name": "LEG",
       "pole_angle_manual": 90.0,
       "pole_angle_fine_tune": 0.0,
       "extra_ik_location": true
     }
   ],
   "pole_angle_presets": {
-    "ARM": { "LEFT": -91.25, "RIGHT": -88.76 }
+    "ARM": {
+      "LEFT": -91.25,
+      "RIGHT": -88.76
+    }
   },
   "apply_ik_joint_fix": true,
   "ik_joint_x_overrides": {

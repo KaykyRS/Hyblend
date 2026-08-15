@@ -25,6 +25,18 @@
 # racional. rigger.py agora só sabe COMO montar um rig a partir de um
 # template; QUAL personagem virou dado externo, não código.
 #
+# v0.8: Shape Edit Mode -- dois operadores novos, RIG_OT_hytale_
+# shape_edit_mode_enter/_finish (ver seção própria, logo antes de
+# RIG_OT_hytale_generate_rig), pra deixar o usuário redimensionar o
+# custom shape de qualquer bone CTRL/CTRL-IK em Pose Mode sem o driver
+# de troca FK/IK (add_custom_shape_scale_switch_driver) sobrescrever o
+# valor a cada frame -- "Enter" muta os drivers (deixando cada eixo no
+# tamanho cheio antes de mutar), "Finish" lê o que o usuário deixou e
+# grava como o novo tamanho cheio na expressão do driver, desmutando.
+# Novo bool armature.hytale_shape_edit_mode rastreia o estado; "Create
+# Rig" e "Remove Generated Hytale Rig Bones" passam a recusar rodar
+# (poll com poll_message_set) enquanto ele estiver ativo.
+#
 # Arquitetura de constraints/camadas ORG-MCH-CTRL-IK segue validada contra
 # os 4 scripts de referência do usuário (ver histórico do chat) -- não é
 # invenção deste arquivo.
@@ -38,7 +50,7 @@
 bl_info = {
     "name": "Hytale Blocky Rigger",
     "author": "Kaayky",
-    "version": (0, 5, 2),
+    "version": (0, 6, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Hytale Rigger",
     "description": "Auto-generate the ORG/MCH/CTRL/CTRL-IK/MCH-IK bone layers, constraints, "
@@ -53,6 +65,7 @@ import re
 from collections import deque
 
 import bpy
+import gpu
 from bpy.props import (
     BoolProperty,
     CollectionProperty,
@@ -61,7 +74,8 @@ from bpy.props import (
     IntProperty,
     StringProperty,
 )
-from bpy.types import Armature, Operator, PropertyGroup, UIList, WindowManager
+from bpy.types import Armature, Menu, Operator, PropertyGroup, UIList, WindowManager
+from gpu_extras.batch import batch_for_shader
 from mathutils import Euler, Matrix, Vector
 
 from .templates import (
@@ -91,7 +105,17 @@ COLL_HYTALE_EXPORT = "Hytale Export"
 COLL_INTERNAL = "Internal"
 COLL_ORG = "ORG"
 COLL_MCH = "MCH"
-COLL_MCH_IK = "MCH-IK"
+# v0.7: renomeada de "MCH-IK" pra "Specials" -- deixou de guardar só os
+# bridges _IK_MCH da cadeia de IK, também guarda os bridges _Tail da
+# cadeia de Tail (ver _build_tail_layer) -- os dois são o mesmo tipo de
+# coisa (bone "de mecanismo", só existe pra dar uma rest orientation
+# "limpa" pra outro bone copiar, nunca selecionado/posado por quem
+# anima), então dividem a MESMA bone collection interna/oculta em vez de
+# cada cadeia ganhar uma própria. O valor da custom property
+# PROP_RIG_LAYER continua "MCH-IK" pros bridges de IK (não mexi nisso --
+# é dado interno, independente do nome de exibição da collection) e
+# "TAIL" pros bridges de Tail (ver is_excluded_from_main_collections).
+COLL_MCH_IK = "Specials"
 COLL_CTRL = "CTRL"
 COLL_CTRL_IK = "CTRL-IK"
 
@@ -119,6 +143,7 @@ COLL_MAIN_ARM_R = "Arm R"
 COLL_MAIN_LEG_L = "Leg L"
 COLL_MAIN_LEG_R = "Leg R"
 COLL_MAIN_ROOT = "Root"
+COLL_MAIN_TAIL = "Tail"  # v0.7 -- bones _Tail (ver SUFFIX_TAIL), sempre visível (mesmo espírito de Arm/Leg/etc.)
 
 # Todo nome de bone collection que o PRÓPRIO "Create Rig" já cria/
 # gerencia sozinho -- usado por RIG_OT_hytale_collection_template_save
@@ -131,6 +156,7 @@ RESERVED_MAIN_COLLECTION_NAMES = {
     COLL_HYTALE_EXPORT, COLL_INTERNAL, COLL_ORG, COLL_MCH, COLL_MCH_IK, COLL_CTRL, COLL_CTRL_IK,
     COLL_ATTACHMENTS_IMPORTED, COLL_FACE, COLL_MAIN, COLL_ATTACHMENTS, COLL_MAIN_HEAD, COLL_MAIN_SPINE,
     COLL_MAIN_BODY, COLL_MAIN_ARM_L, COLL_MAIN_ARM_R, COLL_MAIN_LEG_L, COLL_MAIN_LEG_R, COLL_MAIN_ROOT,
+    COLL_MAIN_TAIL,
 }
 
 SUFFIX_MCH = "_MCH"
@@ -138,6 +164,30 @@ SUFFIX_CTRL = "_CTRL"
 SUFFIX_IK = "_IK"          # bone por segmento (raiz/meio: hierarquia real; ponta: solto + switch)
 SUFFIX_IK_MCH = "_IK_MCH"  # bone-ponte por segmento, parentado ao _IK do mesmo segmento
 SUFFIX_POLE = "_Pole_CTRL"
+
+# v0.8: bone puramente visual (nunca posável -- hide_select=True),
+# parentado DIRETO no bone de referência do pole (pole_ref, o mesmo
+# usado por _pole_position pra calcular onde o pole target fica -- ver
+# HytaleIKChainItem.pole_bone) -- não faz parte da árvore ORG/MCH/CTRL/
+# IK "de verdade" (por isso _propagate_pole_and_tip_to_main_collections
+# propaga ele manualmente pra Main/Arm-Leg, do mesmo jeito que pole/tip
+# -- ver ali). Só existe pra dar feedback visual de pra onde o pole
+# target está apontando (widget dedicado, WGT_hytale_pole_line -- ver
+# WGT_POLE_LINE) -- o Stretch To (ver CONSTRAINT_POLE_LINE_STRETCH)
+# faz o resto sozinho, sem nenhuma custom property nem driver.
+SUFFIX_POLE_LINE = "_Pole_Line"
+
+# v0.7: bone-ponte por segmento de uma cadeia TAIL (ver HytaleIKChainItem.
+# chain_type e _build_tail_layer) -- MESMO princípio do bridge _IK_MCH:
+# mantém a rest orientation "real" (a do ORG original, intocada) separada
+# do bone que o usuário efetivamente anima (aqui, o próprio _CTRL -- não
+# um bone à parte). É o _CTRL da cauda que recebe o redirect de tail
+# (aponta pro head do próximo segmento) pra formar a cadeia sempre
+# conectada (use_connect=True) que addons de física esperam; o `_Tail`
+# só existe pra dar ao MCH uma fonte de rotação/escala/posição com rest
+# "limpa" (sem o redirect), do mesmo jeito que o `_IK_MCH` existe pro MCH
+# de uma cadeia de IK (ver _build_tail_pose_constraints).
+SUFFIX_TAIL = "_Tail"
 
 # Marca todo bone criado por este script (independente da camada). É isso
 # -- não o nome -- que diferencia um bone ORG (original) de um gerado, e é
@@ -161,6 +211,13 @@ CONSTRAINT_ORG_TO_MCH = "Hytale_ORG_to_MCH"  # trio Location/Rotation/Scale -- c
 CONSTRAINT_SPINE_FOLLOW = "Hytale_SpineFollow"
 CONSTRAINT_CHILD_OF_LOCAL = "Child Of_local"
 CONSTRAINT_CHILD_OF_GLOBAL = "Child Of_global"
+# v0.8: Stretch To do bone "_Pole_Line" (ver SUFFIX_POLE_LINE), mirando
+# sempre no "_Pole_CTRL" do mesmo lado/cadeia -- ver ensure_stretch_to_constraint.
+CONSTRAINT_POLE_LINE_STRETCH = "PoleLine_StretchTo"
+# Tail (v0.7) NÃO cria constraints com nome próprio -- reaproveita/
+# retargeta FK_CopyRotation/FK_CopyScale/FK_CopyLocation (as constantes
+# acima) que o loop genérico de _build_pose_constraints já cria no MCH,
+# só trocando o subtarget pro bridge _Tail (ver _build_tail_pose_constraints).
 
 _COPY_CONSTRAINT_TYPES = {
     "LOCATION": "COPY_LOCATION",
@@ -192,8 +249,10 @@ BONE_ROOT_MASTER = "root.master_CTRL"
 BONE_ROOT_SPINE = "root.spine_CTRL"
 BONE_ROOT_PELVIS = "root.pelvis_CTRL"
 ROOT_MASTER_SOURCE = "Belly"        # bone ORG usado como referência de posição do master/spine
-ROOT_MASTER_PARENT = "Origin_CTRL"  # bone já existente (fora deste script) usado como parent do master
+ORIGIN_ORG_NAME = "Origin"          # bone ORG esperado no modelo importado -- ver _ensure_origin_bone (v0.8)
+ROOT_MASTER_PARENT = ORIGIN_ORG_NAME + SUFFIX_CTRL  # "Origin_CTRL" -- parent do master, gerado do ORG acima
 ROOT_SPINE_LENGTH = 0.5             # comprimento (head->tail) do root.spine_CTRL
+ORIGIN_FALLBACK_LENGTH = 0.3        # comprimento do ORG "Origin" quando precisa ser criado -- ver _ensure_origin_bone
 
 # Bone utilitário que guarda TODAS as custom properties de FK/IK switch
 # (uma por cadeia -- ver _switch_property_name) -- fica acima da cabeça,
@@ -233,13 +292,13 @@ CHILD_OF_GLOBAL_TARGET = ROOT_MASTER_PARENT
 # bone ORG que já existe (ex.: "Pelvis") e isso resolve pro bone final.
 PARENT_OVERRIDE_ALIASES = {
     "Pelvis": BONE_ROOT_PELVIS,
-    # v0.5.1: sem isso, digitar "L-Shoulder" (nome ORG literal, sem
-    # sufixo -- o padrão natural de se escrever aqui, igual "Pelvis")
-    # resolvia pro bone ORG cru em vez do "L-Shoulder_CTRL" gerado --
-    # a cadeia de braço ficava parentada no lugar errado e nunca
-    # aparecia em Main/Arm L/R (só em CTRL-IK), porque
-    # _resolve_main_limb_roots/ARM_COLLECTION_ROOTS caminha a partir de
-    # "L-Shoulder_CTRL" esperando achar o braço como descendente dele.
+    # v0.6: sem isso, digitar "L-Shoulder" (nome ORG literal, sem sufixo
+    # -- o padrão natural de se escrever aqui, igual "Pelvis") resolvia
+    # pro bone ORG cru em vez do "L-Shoulder_CTRL" gerado -- a cadeia de
+    # braço ficava parentada no lugar errado e nunca aparecia em
+    # Main/Arm L/R (só em CTRL-IK), porque ARM_COLLECTION_ROOTS caminha
+    # a partir de "L-Shoulder_CTRL" esperando achar o braço como
+    # descendente dele.
     "L-Shoulder": "L-Shoulder" + SUFFIX_CTRL,
     "R-Shoulder": "R-Shoulder" + SUFFIX_CTRL,
 }
@@ -281,6 +340,7 @@ ATTACHMENT_SHAPE_SCALE = 0.3  # scale genérico pra QUALQUER attachment sem over
 WGT_FK_RING = "WGT_hytale_fk_ring"          # bones _CTRL genéricos (FK)
 WGT_IK_BOX = "WGT_hytale_ik_box"            # ponta de cadeia IK (mão/pé -- o _IK que tem o switch)
 WGT_POLE = "WGT_hytale_pole"                # *_Pole_CTRL
+WGT_POLE_LINE = "WGT_hytale_pole_line"      # *_Pole_Line (v0.8 -- bone visual, ver SUFFIX_POLE_LINE)
 WGT_ROOT_MASTER = "WGT_hytale_root_master"  # root.master_CTRL
 WGT_ROOT_SPINE = "WGT_hytale_root_spine"    # root.spine_CTRL
 WGT_ROOT_PELVIS = "WGT_hytale_root_pelvis"  # root.pelvis_CTRL
@@ -440,31 +500,53 @@ LEG_COLLECTION_ROOTS = {
 # nenhum texto digitado em lugar nenhum; (2) usando a cadeia de IK REAL
 # já configurada em armature.hytale_ik_chains pra cobrir nomes de bone
 # totalmente customizados (nem Shoulder nem Arm) -- essa segunda parte
-# ainda tenta classificar a cadeia como braço/perna pelo texto livre do
-# campo `label` (_classify_chain_limb), o que é só um best-effort
-# complementar -- NUNCA é o único mecanismo pro caso comum (Player-like
-# sem Shoulder), que já é resolvido de forma confiável pelo item (1)
-# acima. Ver histórico do chat: a versão anterior dependia só do label
-# pra isso, e falhava silenciosamente quando o label vinha vazio ou
-# escrito diferente.
-_LIMB_LABEL_KEYWORDS = {
-    "ARM": ("arm", "braco"),   # "braço" comparado sem acento -- ver _classify_chain_limb
-    "LEG": ("leg", "perna"),
-}
+# olha item.chain_type ("ARM"/"LEG") + item.side ("LEFT"/"RIGHT")
+# diretamente (v0.6 -- antes disso existir, tentava adivinhar pelo texto
+# livre do campo `label`, um dicionário de palavras-chave tipo
+# "arm"/"braço" -- removido: chain_type é um campo estruturado de
+# verdade agora, não precisa mais adivinhar por texto, e o método antigo
+# falhava silenciosamente sempre que o label ficava com o nome padrão
+# tipo "Chain 1" em vez de conter "arm"/"braço" -- ver histórico do
+# chat). Nunca remove nada do que já foi resolvido no item (1).
+
+
+def _resolve_parent_override(edit_bones, override_name):
+    """Resolve o texto de item.parent_override pro edit bone final:
+    tenta PARENT_OVERRIDE_ALIASES primeiro (bones utilitários que só
+    existem depois de gerados, ex. 'Pelvis' -> 'root.pelvis_CTRL' --
+    tem que vir ANTES do nome literal, senão um ORG chamado igual ao
+    alias -- ex. o próprio 'Pelvis' -- rouba a resolução, ver comentário
+    histórico em _build_ik_layer sobre esse bug), senão tenta o nome
+    literal. Retorna None se não encontrar nada -- o chamador decide se
+    avisa. Usado por _build_ik_layer (cadeias Arm/Leg) e _build_tail_layer
+    (cadeias Tail) -- mesmo campo (`parent_override`), mesma regra.
+
+    v0.6: se o texto digitado já vier com o sufixo "_CTRL" (ex.:
+    'L-Shoulder_CTRL', copiado de algum lugar ou digitado por hábito),
+    o sufixo é removido ANTES de qualquer resolução -- não existe mais
+    reconhecimento "por acaso" de um nome de bone _CTRL literal (que só
+    funcionava porque, na hora em que isso roda, o _CTRL já foi criado
+    nesta mesma execução -- mas não é algo que devesse ser digitado,
+    já que não existe no momento em que o usuário está configurando a
+    cadeia). Com isso, 'L-Shoulder' e 'L-Shoulder_CTRL' sempre resolvem
+    pro MESMO lugar, através do MESMO alias -- um único caminho de
+    resolução, sem comportamento diferente por coincidência de nome."""
+    if not override_name:
+        return None
+    if override_name.endswith(SUFFIX_CTRL):
+        override_name = override_name[: -len(SUFFIX_CTRL)]
+    alias = PARENT_OVERRIDE_ALIASES.get(override_name)
+    if alias:
+        return edit_bones.get(alias)
+    return edit_bones.get(override_name)
 
 
 def _classify_chain_limb(item):
-    """Tenta classificar uma HytaleIKChainItem (rigger.py) como braço ou
-    perna, só pelo texto livre do campo `label` (ex.: 'Arm L', 'Leg R',
-    'Perna R' -- o próprio tooltip do campo já sugere esse padrão,
-    'e.g. Arm L'). Case-insensitive, sem acento. Retorna 'ARM'/'LEG'/None
-    (label não reconhecido -- ex.: uma cadeia de cauda/orelha custom,
-    que não deve ser forçada em nenhuma das duas)."""
-    label = (item.label or "").lower().replace("ç", "c").replace("ã", "a")
-    for limb, keywords in _LIMB_LABEL_KEYWORDS.items():
-        if any(keyword in label for keyword in keywords):
-            return limb
-    return None
+    """Classifica uma HytaleIKChainItem (rigger.py) como braço ou perna
+    (v0.6: direto de item.chain_type, campo estruturado -- ver
+    HytaleIKChainItem). Retorna 'ARM'/'LEG'/None (qualquer outro tipo,
+    ex. 'TAIL', não deve ser forçado em nenhuma das duas)."""
+    return item.chain_type if item.chain_type in ("ARM", "LEG") else None
 
 
 _LIMB_SIDE_TO_COLLECTION = {
@@ -486,15 +568,14 @@ def _resolve_main_limb_roots(armature, edit_bones):
        começa direto no Arm), troca a raiz fixa pelas duas de
        ARM_COLLECTION_ROOTS_NO_SHOULDER ("<L/R>-Arm_CTRL" +
        "<L/R>-Arm_IK"). Checagem determinística no esqueleto de
-       verdade -- não depende de nenhum texto digitado em lugar nenhum,
-       então funciona mesmo se a cadeia de IK correspondente não tiver
-       `label` nenhum preenchido.
+       verdade -- não depende de nenhum texto digitado em lugar nenhum.
     3. ACRESCENTA a raiz real (root_bone + _CTRL, root_bone + _IK) de
-       toda cadeia em armature.hytale_ik_chains cujo label dê pra
-       classificar como braço/perna (ver _classify_chain_limb) -- só
-       best-effort complementar, pra cobrir nome de bone totalmente
-       customizado (nem Shoulder nem Arm/Thigh). Nunca remove nada do
-       que já foi resolvido nos passos 1-2."""
+       toda cadeia em armature.hytale_ik_chains cujo item.chain_type seja
+       ARM ou LEG (ver _classify_chain_limb) -- cobre nome de bone
+       totalmente customizado (nem Shoulder nem Arm/Thigh), automático,
+       sem precisar digitar nada em lugar nenhum: Arm + Left -> Main/Arm
+       L, Leg + Right -> Main/Leg R, direto de chain_type + side. Nunca
+       remove nada do que já foi resolvido nos passos 1-2."""
     roots = {name: list(bones) for name, bones in {**ARM_COLLECTION_ROOTS, **LEG_COLLECTION_ROOTS}.items()}
 
     for coll_name, shoulder_roots in ARM_COLLECTION_ROOTS.items():
@@ -579,6 +660,24 @@ def ensure_bone_collection(armature, name, parent=None):
     return armature.collections.new(name=name, parent=parent)
 
 
+def _redraw_all_areas(context):
+    """Força o redraw de TODA área de TODA janela aberta -- usado pelos
+    operadores que mexem em armature.hytale_ik_chains (add/remove/
+    set_count, ver seção "Operadores: gerenciar a lista de cadeias IK"
+    logo abaixo). Sem isso, um operador chamado a partir de um POPUP
+    MENU (o menu "+" -> Arm/Leg/Tail, ver RIG_MT_hytale_ik_chain_add_menu)
+    executa normalmente (o item já foi criado de verdade, undo/redo
+    funcionam certinho) mas o Blender não redesenha sozinho a UIList da
+    aba Rig na hora -- só quando QUALQUER outro evento (mover o mouse pra
+    dentro da viewport, por exemplo) força um redraw geral por outro
+    motivo. É uma limitação conhecida do Blender com popups (não tem a
+    ver com a lógica do operador em si) -- forçar o redraw explicitamente
+    aqui é o jeito padrão de contornar."""
+    for window in context.window_manager.windows:
+        for area in window.screen.areas:
+            area.tag_redraw()
+
+
 def create_bone_like(edit_bones, source, new_name):
     """Cria (ou reaproveita, se já existir) um edit bone chamado `new_name`
     com a mesma transform (head/tail/roll) de `source`. Retorna
@@ -596,6 +695,36 @@ def create_bone_like(edit_bones, source, new_name):
     return new_bone, True
 
 
+def rotate_edit_bone_local_axis(edit_bone, axis_letter, degrees):
+    """Rotaciona um edit bone em torno de um dos próprios eixos LOCAIS
+    (X, Y ou Z do bone -- não do Armature) por `degrees` graus -- head e
+    comprimento preservados, só a direção do tail (e o roll, recalculado
+    junto pra acompanhar a rotação) mudam. Usado pelo ajuste manual da
+    ponta de uma cadeia Tail (ver HytaleIKChainItem.tail_tip_rotation_*/
+    _build_tail_layer): o último bone de uma cauda não tem próximo
+    segmento pra apontar, então fica com a direção ORIGINAL do ORG (eixo
+    Y do Hytale, pra cima) -- este helper deixa corrigir manualmente,
+    tipo dobrar uma dobradiça num dos 3 eixos do próprio bone (qual eixo
+    resolve o problema depende de como o bone específico ficou orientado
+    -- por isso é escolhível, não fixo em X)."""
+    if abs(degrees) < 1e-6:
+        return
+    axis = {"X": edit_bone.x_axis, "Y": edit_bone.y_axis, "Z": edit_bone.z_axis}.get(axis_letter)
+    if axis is None or axis.length < 1e-9:
+        return
+    axis = axis.normalized()
+    old_z = edit_bone.z_axis
+    rot = Matrix.Rotation(math.radians(degrees), 4, axis)
+    direction = edit_bone.tail - edit_bone.head
+    edit_bone.tail = edit_bone.head + (rot @ direction)
+    # X e Z são perpendiculares à direção do bone (Y) -- girar em torno
+    # de qualquer um dos dois "dobra" o tail (o caso comum, pra corrigir
+    # a ponta que não tem próximo segmento pra apontar). Y é a própria
+    # direção do bone -- girar em torno dele só muda o roll (spin),
+    # tail fica no lugar; align_roll(rot @ old_z) cobre os 3 casos.
+    edit_bone.align_roll(rot @ old_z)
+
+
 def find_layer_bone(edit_bones, org_name, suffix):
     if org_name is None:
         return None
@@ -609,11 +738,12 @@ def is_attachment_bone(bone):
 def is_excluded_from_main_collections(bone):
     """Bones que NÃO devem entrar nas collections Head/Spine/Body/Arm/
     Leg/Root (dentro de Main): bones de attachment (vão só pra
-    Attachments) e bones das camadas MCH/MCH-IK (Main só quer CTRL e
-    CTRL-IK, FK ou IK -- os bones "internos" de mecanismo ficam de fora)."""
+    Attachments) e bones das camadas MCH/MCH-IK/TAIL (Main só quer CTRL e
+    CTRL-IK, FK ou IK -- os bones "internos" de mecanismo, incluindo os
+    bridges _Tail (ver COLL_MCH_IK/"Specials"), ficam de fora)."""
     if is_attachment_bone(bone):
         return True
-    return bone.get(PROP_RIG_LAYER) in ("MCH", "MCH-IK")
+    return bone.get(PROP_RIG_LAYER) in ("MCH", "MCH-IK", "TAIL")
 
 
 def find_attachment_child(org_bone):
@@ -730,6 +860,23 @@ def ensure_child_of_constraint(pose_bone, armature_obj, subtarget_name, name, in
     return con
 
 
+def ensure_stretch_to_constraint(pose_bone, armature_obj, subtarget_name, name):
+    """Stretch To simples, sempre esticando pro subtarget -- usado só
+    pelo bone "_Pole_Line" (ver SUFFIX_POLE_LINE), mirando no
+    "_Pole_CTRL" do mesmo lado/cadeia. rest_length=0 deixa o Blender
+    usar o comprimento de rest do próprio bone (o que ele já tinha ao
+    ser criado, apontando pro pole -- ver _build_ik_layer) como
+    referência, sem precisar recalcular nada aqui."""
+    con = pose_bone.constraints.get(name)
+    if con is None:
+        con = pose_bone.constraints.new("STRETCH_TO")
+        con.name = name
+    con.target = armature_obj
+    con.subtarget = subtarget_name
+    con.rest_length = 0.0
+    return con
+
+
 def switch_property_name(tip_org_name, side):
     """Nome da custom property de FK/IK switch pra uma cadeia, agora TODA
     guardada no bone PROPERTIES (ver BONE_PROPERTIES) em vez de uma
@@ -818,6 +965,17 @@ def add_custom_shape_scale_switch_driver(pose_bone, armature_obj, switch_bone_na
 _SHAPE_SCALE_DRIVER_VALUE_RE = re.compile(r"^\s*([+-]?\d+(?:\.\d+)?)\s*\*")
 
 
+def _format_shape_scale_literal(value):
+    """Formata um float como o literal decimal simples que
+    _SHAPE_SCALE_DRIVER_VALUE_RE sabe reler depois (sem notação
+    científica -- repr()/str() caem pra "1e-05" em valores bem pequenos,
+    o que a regex acima NÃO reconhece). Usado só por
+    RIG_OT_hytale_shape_edit_mode_finish, pra regravar a expressão do
+    driver com o tamanho novo que o usuário deixou."""
+    text = f"{value:.6f}".rstrip("0").rstrip(".")
+    return text if text and text != "-" else "0"
+
+
 def resolve_custom_shape_scale(pose_bone):
     """Valor "real" (tamanho cheio, sem o driver de troca FK/IK) do
     custom_shape_scale_xyz de um pose bone -- pra usar ao SALVAR um
@@ -850,6 +1008,42 @@ def resolve_custom_shape_scale(pose_bone):
         if match:
             scale[i] = float(match.group(1))
     return tuple(scale)
+
+
+def armature_has_generated_bones(armature):
+    """True se "Create Rig" já rodou pelo menos uma vez neste armature
+    (algum bone carrega PROP_RIG_LAYER). Usado pelo poll() dos operadores
+    de Shape Edit Mode abaixo -- entrar no modo não faz sentido antes de
+    existir nenhum CTRL gerado pra editar -- e também é o que
+    interface.py deve chamar pra apagar o botão (ver aviso no fim da
+    resposta sobre o que fazer em interface.py). `armature.bones` (não
+    `edit_bones`) funciona em qualquer modo -- IDs de bone custom
+    property setadas em Edit Mode continuam visíveis em Object/Pose
+    Mode."""
+    return any(PROP_RIG_LAYER in b.keys() for b in armature.bones)
+
+
+def _iter_shape_scale_drivers(obj):
+    """Gera (pose_bone, axis_index, fcurve) pra cada driver de
+    custom_shape_scale_xyz que hoje existe nos pose bones de `obj` --
+    ou seja, só os bones/eixos que passaram por
+    add_custom_shape_scale_switch_driver (bones dentro de uma cadeia
+    IK/FK -- ver _build_ik_fk_shape_visibility). Bones fora de cadeia
+    IK (ex.: root.master_CTRL, Spine_CTRL) não aparecem aqui -- o scale
+    deles já é um valor estático, sem driver, já livremente editável a
+    qualquer momento; Shape Edit Mode não tem nada a fazer com eles.
+
+    Base pros dois operadores de Shape Edit Mode abaixo (Enter muta cada
+    driver encontrado aqui, Finish só reativa os que encontrar mutados)."""
+    anim_data = getattr(obj, "animation_data", None)
+    if anim_data is None:
+        return
+    for pb in obj.pose.bones:
+        data_path = f'pose.bones["{pb.name}"].custom_shape_scale_xyz'
+        for i in range(3):
+            fcurve = anim_data.drivers.find(data_path, index=i)
+            if fcurve is not None and fcurve.driver is not None:
+                yield pb, i, fcurve
 
 
 def _widgets_library_path():
@@ -923,6 +1117,8 @@ def _widget_name_for_bone(bone_name, layer, ik_tip_names, shape_overrides=None):
         return override
     if layer is None:
         return None
+    if bone_name.endswith(SUFFIX_POLE_LINE):
+        return WGT_POLE_LINE
     if bone_name.endswith(SUFFIX_POLE):
         return WGT_POLE
     if ATTACHMENT_NAME_HINT in bone_name.lower():
@@ -1066,34 +1262,79 @@ def compute_pole_angle(armature_obj, base_bone_name, pole_bone_name):
 
 
 class HytaleIKChainItem(PropertyGroup):
+    # v0.7: cada item da lista agora descreve um "tipo" de bone/estrutura,
+    # não só uma cadeia de IK genérica -- ARM e LEG usam EXATAMENTE a
+    # mesma lógica de geração que a antiga "IK Chain" única (mesmos
+    # campos root_bone/tip_bone/pole_bone/parent_override, mesmo
+    # _build_ik_layer/_build_pose_constraints); a única diferença hoje é
+    # o RÓTULO desses campos na UI, por tipo (ver interface.py). TAIL é
+    # o primeiro tipo genuinamente diferente: sem IK, sem pole/lado --
+    # ver _build_tail_layer/_build_tail_pose_constraints. Novos tipos
+    # (orelha, asa, etc.) entram aqui no futuro do mesmo jeito.
+    chain_type: EnumProperty(
+        name="Type",
+        description="What this entry configures. 'Arm'/'Leg' behave exactly like the old generic IK chain "
+        "(root/tip/pole path -> switchable FK/IK chain) -- only the field labels differ today. 'Tail' has "
+        "no IK: it builds a continuous '_Tail' bridge chain (always connected, no gap between segments) "
+        "meant to be hooked into physics add-ons",
+        items=[
+            ("ARM", "Arm", "Two-segment limb (shoulder-arm-forearm-hand pattern) -- IK/FK-switchable chain"),
+            ("LEG", "Leg", "Two-segment limb (pelvis-thigh-calf-foot pattern) -- IK/FK-switchable chain"),
+            ("TAIL", "Tail", "Chain of bones from root to tip, no IK -- continuous bridge chain for physics"),
+        ],
+        default="ARM",
+    )
     label: StringProperty(
         name="Label",
-        description="Free-form name just to identify this chain in the list (e.g. Arm L)",
+        description="Free-form name just to identify this entry in the list (e.g. Arm L)",
         default="",
     )
     root_bone: StringProperty(
         name="Root Bone",
-        description="First bone of the chain (e.g. L-Arm, L-Thigh)",
+        description="First bone of the chain (e.g. L-Arm, L-Thigh, or the first tail bone). For a chain with "
+        "more than 2 segments in between (e.g. a 4-bone leg: Thigh/Calf/Heel/Foot), just point Root/Tip at "
+        "the two ends -- the bones in between are resolved automatically by walking the skeleton",
         default="",
     )
     tip_bone: StringProperty(
         name="Tip Bone",
-        description="Last bone of the chain -- the target/effector (e.g. L-Hand, L-Foot)",
+        description="Last bone of the chain -- the target/effector for Arm/Leg (e.g. L-Hand, L-Foot), or "
+        "the last tail bone for Tail",
         default="",
     )
     pole_bone: StringProperty(
         name="Pole Reference",
-        description="Bone used as the position/orientation reference for the pole target (e.g. L-Forearm). "
-        "Empty = automatically uses the middle bone of the root->tip path",
+        description="Arm/Leg only. Bone used as the position/orientation reference for the pole target "
+        "(e.g. L-Forearm). Empty = automatically uses the middle bone of the root->tip path",
         default="",
     )
     parent_override: StringProperty(
         name="Root Parent",
-        description="Optional bone that becomes the parent of this chain's root _IK (e.g. L-Shoulder_CTRL, "
-        "Pelvis). Empty = left unparented. Some names are automatically resolved to utility bones that only "
-        "exist after generation (see PARENT_OVERRIDE_ALIASES) -- e.g. typing 'Pelvis' resolves to "
-        "'root.pelvis_CTRL'.",
+        description="Optional bone that becomes the parent of this chain's root (e.g. L-Shoulder_CTRL, "
+        "Pelvis -- also used by Tail, to attach it to the body). Empty = left unparented. Some names are "
+        "automatically resolved to utility bones that only exist after generation (see "
+        "PARENT_OVERRIDE_ALIASES) -- e.g. typing 'Pelvis' resolves to 'root.pelvis_CTRL'.",
         default="",
+    )
+    tail_tip_rotation_axis: EnumProperty(
+        name="Tip Rotation Axis",
+        description="Tail only. Which LOCAL axis of the last bone the Tip Rotation angle rotates around -- "
+        "X and Z bend the tail direction (perpendicular to the bone itself), Y just spins the roll in place. "
+        "Which one lines up with the correction you want depends on how this specific bone's roll came out",
+        items=[
+            ("X", "X (Local)", "Local X axis"),
+            ("Y", "Y (Local)", "Local Y axis (the bone's own direction -- spins roll only, doesn't bend it)"),
+            ("Z", "Z (Local)", "Local Z axis"),
+        ],
+        default="Z",
+    )
+    tail_tip_rotation_deg: FloatProperty(
+        name="Tip Rotation (deg)",
+        description="Tail only. Extra rotation (degrees, around Tip Rotation Axis, LOCAL to the last bone) "
+        "applied to its rest pose. The tip has no next segment to point its tail at, so by default it keeps "
+        "the ORG's original (untouched) direction -- use this to manually angle it so it lines up visually "
+        "with the rest of the chain",
+        default=0.0,
     )
     side: EnumProperty(
         name="Side",
@@ -1164,13 +1405,18 @@ class HytaleIKChainItem(PropertyGroup):
 
 
 class RIG_OT_hytale_ik_chain_add(Operator):
-    """Adiciona uma cadeia de IK vazia à lista (preencha os nomes dos
-    bones depois -- ou via um picker, quando a UI real estiver pronta)."""
+    """Adiciona uma entrada vazia à lista (preencha os nomes dos bones
+    depois -- ou via um picker). v0.7: recebe `chain_type` (ARM/LEG/
+    TAIL) -- quem decide QUAL tipo adicionar é o menu popup
+    RIG_MT_hytale_ik_chain_add_menu (clicado a partir do botão "+" em
+    interface.py), não mais um clique direto neste operador."""
 
     bl_idname = "armature.hytale_ik_chain_add"
-    bl_label = "Add Hytale IK Chain"
-    bl_description = "Add an empty IK chain to the list"
+    bl_label = "Add Hytale Bone Setting"
+    bl_description = "Add an empty entry (Arm/Leg/Tail) to the list"
     bl_options = {"REGISTER", "UNDO"}
+
+    chain_type: StringProperty(default="ARM")
 
     @classmethod
     def poll(cls, context):
@@ -1181,9 +1427,57 @@ class RIG_OT_hytale_ik_chain_add(Operator):
         armature = context.active_object.data
         chains = armature.hytale_ik_chains
         item = chains.add()
-        item.label = f"Chain {len(chains)}"
+        # String crua (não EnumProperty) no operador -- vem do menu popup
+        # como texto fixo; valida contra os valores conhecidos do Enum
+        # real (item.chain_type) antes de atribuir, pra nunca deixar a
+        # entrada num estado inválido se o menu mandar algo inesperado.
+        item.chain_type = self.chain_type if self.chain_type in {"ARM", "LEG", "TAIL"} else "ARM"
+        prefix = {"ARM": "Arm", "LEG": "Leg", "TAIL": "Tail"}.get(item.chain_type, "Chain")
+        item.label = f"{prefix} {len(chains)}"
+        # v0.8: pole_angle_preset_name (StringProperty) nasce com default=
+        # "ARM" fixo na PROPRIA definição do campo (ver HytaleIKChainItem)
+        # -- sem esta linha, TODO item novo (mesmo um Leg ou um Tail)
+        # herdava literalmente o texto "ARM" no painel, mesmo sem nenhum
+        # template carregado, e sem nenhuma relação com pole_angle_presets
+        # de verdade nenhum -- só o valor cru do Enum/StringProperty. Seta
+        # explícito pro nome do PRÓPRIO chain_type (mesma convenção usada
+        # em templates/rig/rig_player.json -- ver _warn_shared_pole_angle_presets
+        # acima) -- ainda é só um NOME (não precisa existir de verdade em
+        # nenhum pole_angle_presets até o usuário realmente usar modo
+        # Preset), mas pelo menos já nasce coerente com o tipo da cadeia,
+        # em vez de sempre "ARM" nas pernas/caudas.
+        item.pole_angle_preset_name = item.chain_type
         armature.hytale_ik_chains_index = len(chains) - 1
+        _redraw_all_areas(context)
         return {"FINISHED"}
+
+
+class RIG_MT_hytale_ik_chain_add_menu(Menu):
+    """Menu popup mostrado ao clicar o "+" da lista (ver interface.py) --
+    pergunta QUE TIPO adicionar antes de criar o item, em vez de
+    adicionar uma cadeia genérica direto (comportamento anterior a esta
+    feature, v0.7). Cada opção só chama armature.hytale_ik_chain_add com
+    um chain_type diferente -- nenhuma lógica própria, mesmo espírito de
+    "interface.py só desenha" só que este menu mora aqui (não lá) porque
+    é o rigger.py que sabe quais tipos existem hoje (ver
+    HytaleIKChainItem.chain_type) -- adicionar um tipo novo no futuro é
+    só acrescentar uma linha aqui, no Enum, e no dict de labels de
+    interface.py."""
+
+    bl_idname = "RIG_MT_hytale_ik_chain_add_menu"
+    bl_label = "Add Bone Setting"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.operator(
+            RIG_OT_hytale_ik_chain_add.bl_idname, text="Arm", icon="CON_KINEMATIC"
+        ).chain_type = "ARM"
+        layout.operator(
+            RIG_OT_hytale_ik_chain_add.bl_idname, text="Leg", icon="CON_KINEMATIC"
+        ).chain_type = "LEG"
+        layout.operator(
+            RIG_OT_hytale_ik_chain_add.bl_idname, text="Tail", icon="PHYSICS"
+        ).chain_type = "TAIL"
 
 
 class RIG_OT_hytale_ik_chain_remove(Operator):
@@ -1208,12 +1502,23 @@ class RIG_OT_hytale_ik_chain_remove(Operator):
         if 0 <= index < len(chains):
             chains.remove(index)
             armature.hytale_ik_chains_index = max(0, min(armature.hytale_ik_chains_index, len(chains) - 1))
+        _redraw_all_areas(context)
         return {"FINISHED"}
 
 
 class RIG_OT_hytale_ik_chain_set_count(Operator):
     """Ajusta a lista de cadeias de IK pra ter exatamente `count` itens --
-    adiciona vazias no fim ou remove do fim, sem tocar nas do meio."""
+    adiciona vazias no fim ou remove do fim, sem tocar nas do meio. Não é
+    chamado de lugar nenhum em interface.py hoje (a lista lá usa só Add/
+    Remove, um item de cada vez, via RIG_OT_hytale_ik_chain_add/_remove) --
+    existe pra uso via script/console externo, quando é mais prático setar
+    a quantidade de uma vez. `chain_type` (v0.8) alinha o que este
+    operador cria com RIG_MT_hytale_ik_chain_add_menu/RIG_OT_hytale_ik_chain_add
+    acima: mesma validação (cai pra "ARM" se vier algo fora de ARM/LEG/
+    TAIL) e mesmo prefixo de label ("Arm N"/"Leg N"/"Tail N", não mais o
+    "Chain N" genérico de antes, que também nunca setava chain_type
+    nenhum -- item novo ficava com o default ARM do Enum, mas rotulado
+    "Chain", inconsistente com o próprio tipo que acabou de receber)."""
 
     bl_idname = "armature.hytale_ik_chain_set_count"
     bl_label = "Set Hytale IK Chain Count"
@@ -1221,6 +1526,7 @@ class RIG_OT_hytale_ik_chain_set_count(Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     count: IntProperty(name="Amount", default=1, min=0)
+    chain_type: StringProperty(default="ARM")
 
     @classmethod
     def poll(cls, context):
@@ -1230,11 +1536,16 @@ class RIG_OT_hytale_ik_chain_set_count(Operator):
     def execute(self, context):
         armature = context.active_object.data
         chains = armature.hytale_ik_chains
+        chain_type = self.chain_type if self.chain_type in {"ARM", "LEG", "TAIL"} else "ARM"
+        prefix = {"ARM": "Arm", "LEG": "Leg", "TAIL": "Tail"}.get(chain_type, "Chain")
         while len(chains) < self.count:
             item = chains.add()
-            item.label = f"Chain {len(chains)}"
+            item.chain_type = chain_type
+            item.label = f"{prefix} {len(chains)}"
+            item.pole_angle_preset_name = chain_type  # v0.8 -- mesmo fix de RIG_OT_hytale_ik_chain_add acima
         while len(chains) > self.count:
             chains.remove(len(chains) - 1)
+        _redraw_all_areas(context)
         return {"FINISHED"}
 
 
@@ -1331,9 +1642,9 @@ class RIG_OT_hytale_ik_chain_load_defaults(Operator):
         chains = armature.hytale_ik_chains
         chains.clear()
         chain_fields = {
-            "label", "root_bone", "tip_bone", "pole_bone", "parent_override", "side",
+            "chain_type", "label", "root_bone", "tip_bone", "pole_bone", "parent_override", "side",
             "pole_invert", "pole_distance", "pole_angle_mode", "pole_angle_preset_name",
-            "pole_angle_manual", "pole_angle_fine_tune", "extra_ik_location",
+            "pole_angle_manual", "pole_angle_fine_tune", "extra_ik_location", "tail_tip_rotation_axis", "tail_tip_rotation_deg",
         }
         for entry in entries:
             item = chains.add()
@@ -1346,6 +1657,27 @@ class RIG_OT_hytale_ik_chain_load_defaults(Operator):
                 if key == "pole_angle_mode" and value == "ARM":
                     value = "PRESET"
                 setattr(item, key, value)
+            if "chain_type" not in entry:
+                # Migração pra templates salvos ANTES do chain_type existir
+                # (ex.: templates/rig/rig_player.json, a versão que ainda
+                # está no addon) -- sem isso, TODA cadeia carrega como
+                # "ARM" (default do Enum), e uma perna salva numa versão
+                # anterior passa a cair em Main/Arm em vez de Main/Leg (ver
+                # _classify_chain_limb, que agora usa chain_type direto em
+                # vez de adivinhar pelo label). Só best-effort no texto do
+                # label/root_bone (mesma ideia da heurística antiga que
+                # classificava por texto) -- daqui pra frente, todo save
+                # novo já grava chain_type de verdade (ver
+                # _IK_CHAIN_JSON_FIELDS), então isso só entra em ação pra
+                # templates legados que nunca mais forem re-salvos.
+                guess = (item.label or item.root_bone or "").lower().replace("ç", "c").replace("ã", "a")
+                if "leg" in guess or "perna" in guess or "thigh" in guess:
+                    item.chain_type = "LEG"
+                elif "tail" in guess or "cauda" in guess:
+                    item.chain_type = "TAIL"
+                # senão fica em "ARM" (default do Enum) -- mesmo
+                # comportamento de sempre pra cadeias que já eram braço
+                # ou que não dá pra classificar por texto nenhum.
 
         # Amarra o toggle da correção de junta ao que o TEMPLATE pede (ver
         # rig_template["apply_ik_joint_fix"] -- ANTES isso era hardcoded
@@ -1450,7 +1782,14 @@ class RIG_OT_hytale_clear_generated(Operator):
     @classmethod
     def poll(cls, context):
         obj = context.active_object
-        return obj is not None and obj.type == "ARMATURE"
+        if obj is None or obj.type != "ARMATURE":
+            return False
+        if getattr(obj.data, "hytale_shape_edit_mode", False):
+            cls.poll_message_set(
+                "Finish Shape Edit Mode first -- removing the generated bones now would discard it.",
+            )
+            return False
+        return True
 
     def execute(self, context):
         obj = context.active_object
@@ -1489,6 +1828,241 @@ class RIG_OT_hytale_clear_generated(Operator):
 
 
 # ---------------------------------------------------------------------------
+# Operadores: Shape Edit Mode (v0.8)
+#
+# Pedido explícito: depois de "Create Rig", o usuário quer poder
+# redimensionar o custom shape de cada bone CTRL/CTRL-IK à mão (o
+# tamanho "de olho" que fica bom pro personagem), SEM que o driver de
+# troca FK/IK (add_custom_shape_scale_switch_driver, ver acima) fique
+# reescrevendo esse valor a cada avaliação de frame -- e, ao terminar,
+# quer que o valor que ele deixou vire o novo "tamanho cheio" (o
+# número embutido na expressão do driver), não só uma edição temporária
+# que se perde na próxima troca de FK/IK.
+#
+# Fluxo:
+#   Enter  -- pra cada driver encontrado por _iter_shape_scale_drivers:
+#             lê o alvo ATUAL da expressão (mesmo truque de
+#             resolve_custom_shape_scale), escreve esse valor direto no
+#             pose_bone (baseline "tamanho cheio", não o que estava
+#             avaliado on-screen no momento -- se o FK/IK switch dessa
+#             cadeia estivesse do lado oposto, o valor ao vivo seria 0,
+#             o que tornaria a edição visual impossível) e MUTA a
+#             fcurve (fcurve.mute = True -- mute é atributo da FCurve,
+#             não do Driver). Muted != removido: a expressão inteira
+#             continua guardada na fcurve, só não é mais avaliada --
+#             Finish só precisa trocar o número e desmutar, não
+#             reconstruir o driver do zero.
+#   Finish -- pra cada driver mutado encontrado (ver o `if not
+#             fcurve.mute: continue` abaixo -- só mexe no que ESTE
+#             Enter mutou), lê o valor atual (o que o usuário deixou
+#             depois de editar), monta a expressão nova com esse número
+#             no lugar do antigo (mantendo o resto do template --
+#             "*switch" ou "*(1 - switch)" -- intocado, então não
+#             precisa saber "é FK ou é IK" explicitamente) e desmuta.
+#
+# armature.hytale_shape_edit_mode (BoolProperty, registrado no fim do
+# arquivo) é o estado que interface.py lê pra decidir qual dos dois
+# botões mostrar (ver aviso no fim da resposta sobre o que adicionar em
+# interface.py) -- e também é o que os poll() de "Create Rig" e "Remove
+# Generated Hytale Rig Bones" abaixo passam a checar, pra não deixar o
+# usuário rodar um deles (e destruir/reconstruir os drivers por baixo,
+# sem passar pelo Finish) no meio de uma sessão de Shape Edit Mode.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Borda no viewport enquanto Shape Edit Mode está ativo (v0.8)
+#
+# Mesma ideia do AniMatePro pro Auto Keying (borda vermelha) -- aqui em
+# amarelo por padrão, só pra distinguir visualmente "Auto Keying" de
+# "Shape Edit Mode" caso os dois addons estejam ativos ao mesmo tempo.
+# Troque SHAPE_EDIT_BORDER_COLOR abaixo se preferir verde (ex.: (0.25,
+# 0.95, 0.35, 0.9)) ou qualquer outra cor -- é só essa constante.
+#
+# draw_handler_add/_remove são globais da SESSÃO do Blender, não do
+# Object/Armature -- por isso só registra/remove UMA VEZ, em
+# register()/unregister() deste módulo (ver fim do arquivo), igual
+# qualquer outro draw handler de addon. O callback (_draw_shape_edit_
+# border) roda em TODA SpaceView3D aberta, a cada redraw -- por isso
+# ele mesmo decide, a cada chamada, se desenha ou não (olhando
+# context.active_object.data.hytale_shape_edit_mode), em vez de só
+# registrar/desregistrar o handler toda vez que o modo liga/desliga
+# (mais simples e mais robusto -- não depende de nenhum operador
+# lembrar de limpar o handler certinho).
+# ---------------------------------------------------------------------------
+
+SHAPE_EDIT_BORDER_COLOR = (1.0, 0.85, 0.1, 0.9)  # amarelo -- ver comentário acima pra trocar
+SHAPE_EDIT_BORDER_THICKNESS = 2  # pixels -- v0.8: 4px ficou grosso demais (ver print do usuário), AniMatePro
+# (referência de estilo, borda vermelha do Auto Keying) usa uma linha bem mais fina que isso.
+
+_shape_edit_border_shader = None
+_shape_edit_border_handler = None
+
+
+def _draw_shape_edit_border():
+    context = bpy.context
+    obj = context.active_object
+    if obj is None or obj.type != "ARMATURE" or not getattr(obj.data, "hytale_shape_edit_mode", False):
+        return
+    region = context.region
+    if region is None or region.width <= 0 or region.height <= 0:
+        return
+
+    global _shape_edit_border_shader
+    if _shape_edit_border_shader is None:
+        _shape_edit_border_shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+
+    w, h = region.width, region.height
+    t = SHAPE_EDIT_BORDER_THICKNESS
+    # Quatro faixas (baixo/cima/esquerda/direita) formando uma moldura --
+    # evita GL_LINE com largura (não confiável em core profile/todo
+    # driver) em favor de quads preenchidos, cada um como 2 triângulos.
+    coords = [
+        (0, 0), (w, 0), (w, t), (0, t),                  # baixo
+        (0, h - t), (w, h - t), (w, h), (0, h),           # cima
+        (0, 0), (t, 0), (t, h), (0, h),                   # esquerda
+        (w - t, 0), (w, 0), (w, h), (w - t, h),           # direita
+    ]
+    indices = [
+        (0, 1, 2), (0, 2, 3),
+        (4, 5, 6), (4, 6, 7),
+        (8, 9, 10), (8, 10, 11),
+        (12, 13, 14), (12, 14, 15),
+    ]
+    batch = batch_for_shader(_shape_edit_border_shader, "TRIS", {"pos": coords}, indices=indices)
+
+    gpu.state.blend_set("ALPHA")
+    _shape_edit_border_shader.bind()
+    _shape_edit_border_shader.uniform_float("color", SHAPE_EDIT_BORDER_COLOR)
+    batch.draw(_shape_edit_border_shader)
+    gpu.state.blend_set("NONE")
+
+
+class RIG_OT_hytale_shape_edit_mode_enter(Operator):
+    """Muta todo driver de custom_shape_scale_xyz do armature ativo (ver
+    _iter_shape_scale_drivers) depois de resolver cada eixo mutado pro
+    "tamanho cheio" (o alvo hoje embutido na expressão, não o valor
+    avaliado no momento) -- deixa livre pro usuário redimensionar
+    qualquer custom shape em Pose Mode sem o driver de FK/IK
+    sobrescrevendo o valor. Troca pra Pose Mode automaticamente se o
+    armature não estiver nele ainda (é onde o Item/Bone panel expõe
+    Custom Shape > Scale pra edição)."""
+
+    bl_idname = "armature.hytale_shape_edit_mode_enter"
+    bl_label = "Shape Edit Mode"
+    bl_description = (
+        "Mute the FK/IK shape-scale drivers so you can freely resize each control's custom shape -- use "
+        "'Finish Shape Edit Mode' afterwards to lock in the new size as the driver's new max value"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        if obj is None or obj.type != "ARMATURE":
+            return False
+        armature = obj.data
+        if not armature_has_generated_bones(armature):
+            cls.poll_message_set("Run 'Create Rig' first -- there's no generated rig on this armature yet.")
+            return False
+        if getattr(armature, "hytale_shape_edit_mode", False):
+            cls.poll_message_set("Already in Shape Edit Mode.")
+            return False
+        return True
+
+    def execute(self, context):
+        obj = context.active_object
+        armature = obj.data
+
+        if obj.mode != "POSE":
+            bpy.ops.object.mode_set(mode="POSE")
+
+        muted = 0
+        for pb, i, fcurve in _iter_shape_scale_drivers(obj):
+            driver = fcurve.driver
+            match = _SHAPE_SCALE_DRIVER_VALUE_RE.match(driver.expression or "")
+            if match:
+                pb.custom_shape_scale_xyz[i] = float(match.group(1))
+            fcurve.mute = True
+            muted += 1
+
+        armature.hytale_shape_edit_mode = True
+        _redraw_all_areas(context)  # v0.8 -- pra borda amarela (ver _draw_shape_edit_border) aparecer na hora
+        if muted:
+            self.report(
+                {"INFO"},
+                f"Shape Edit Mode on -- {muted} shape-scale driver channel(s) muted at full size. Resize custom "
+                f"shapes freely, then use 'Finish Shape Edit Mode' to save.",
+            )
+        else:
+            self.report(
+                {"INFO"},
+                "Shape Edit Mode on -- this armature has no FK/IK shape-scale drivers, so every custom shape was "
+                "already freely editable. Use 'Finish Shape Edit Mode' when done.",
+            )
+        return {"FINISHED"}
+
+
+class RIG_OT_hytale_shape_edit_mode_finish(Operator):
+    """Contrário de RIG_OT_hytale_shape_edit_mode_enter: pra cada driver
+    de custom_shape_scale_xyz que ESTE armature tem hoje mutado (ver
+    _iter_shape_scale_drivers + o guard `if not fcurve.mute: continue`
+    -- nunca mexe num driver que não foi mutado por Enter), lê o valor
+    que o usuário deixou no pose bone e o grava como o novo "tamanho
+    cheio" na expressão (substitui só o número, mantém "*switch" ou
+    "*(1 - switch)" como estava), depois desmuta. Não força volta de
+    modo -- o usuário provavelmente ainda quer continuar em Pose Mode
+    depois de terminar."""
+
+    bl_idname = "armature.hytale_shape_edit_mode_finish"
+    bl_label = "Finish Shape Edit Mode"
+    bl_description = (
+        "Lock in the custom shape sizes set while in Shape Edit Mode as the new max size, and restore the "
+        "FK/IK shape-scale drivers"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        if obj is None or obj.type != "ARMATURE":
+            return False
+        if not getattr(obj.data, "hytale_shape_edit_mode", False):
+            cls.poll_message_set("Not currently in Shape Edit Mode.")
+            return False
+        return True
+
+    def execute(self, context):
+        obj = context.active_object
+        armature = obj.data
+
+        restored = 0
+        for pb, i, fcurve in _iter_shape_scale_drivers(obj):
+            driver = fcurve.driver
+            if not fcurve.mute:
+                # Não foi este Enter que mutou (ex.: "Create Rig" rodou de novo no meio do Shape Edit Mode e
+                # recriou o driver do zero, já desmutado -- ver aviso sobre o poll de RIG_OT_hytale_generate_rig
+                # logo abaixo; isso não deveria mais acontecer, mas o guard fica por segurança).
+                continue
+            new_value = _format_shape_scale_literal(float(pb.custom_shape_scale_xyz[i]))
+            if "(1 - switch)" in (driver.expression or ""):
+                driver.expression = f"{new_value}*(1 - switch)"
+            else:
+                driver.expression = f"{new_value}*switch"
+            fcurve.mute = False
+            restored += 1
+
+        armature.hytale_shape_edit_mode = False
+        _redraw_all_areas(context)  # v0.8 -- pra borda amarela (ver _draw_shape_edit_border) sumir na hora
+        self.report(
+            {"INFO"},
+            f"Shape Edit Mode off -- {restored} shape-scale driver channel(s) restored, new size(s) saved as "
+            f"the max value.",
+        )
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
 # Operador principal: gera/atualiza as camadas do rig
 # ---------------------------------------------------------------------------
 
@@ -1508,7 +2082,14 @@ class RIG_OT_hytale_generate_rig(Operator):
     @classmethod
     def poll(cls, context):
         obj = context.active_object
-        return obj is not None and obj.type == "ARMATURE"
+        if obj is None or obj.type != "ARMATURE":
+            return False
+        if getattr(obj.data, "hytale_shape_edit_mode", False):
+            cls.poll_message_set(
+                "Finish Shape Edit Mode first -- rebuilding the rig now would discard the sizes you're editing.",
+            )
+            return False
+        return True
 
     def execute(self, context):
         obj = context.active_object
@@ -1522,7 +2103,7 @@ class RIG_OT_hytale_generate_rig(Operator):
         prev_mode = obj.mode
         bpy.ops.object.mode_set(mode="EDIT")
         try:
-            stats, chains_data = self._build_edit_bones(armature, world_down_local)
+            stats, chains_data, tail_chains_data = self._build_edit_bones(armature, world_down_local)
             joint_fix_count = 0
             if getattr(armature, "hytale_apply_ik_joint_fix", False):
                 joint_fix_count = self._apply_ik_joint_fixes(obj, chains_data)
@@ -1530,11 +2111,12 @@ class RIG_OT_hytale_generate_rig(Operator):
             bpy.ops.object.mode_set(mode="OBJECT")
 
         self._build_pose_constraints(obj, chains_data)
+        tail_constraint_count = self._build_tail_pose_constraints(obj, tail_chains_data)
         self._build_spine_follow(obj)
         self._apply_pole_childof_inverses(obj, chains_data)
         widget_stats = self._build_custom_shapes(obj, chains_data)
         shape_switch_count = self._build_ik_fk_shape_visibility(obj, chains_data)
-        colored_count = self._build_bone_colors(obj)
+        colored_count = self._build_bone_colors(obj, tail_chains_data)
 
         if prev_mode != "OBJECT":
             bpy.ops.object.mode_set(mode=prev_mode)
@@ -1542,8 +2124,9 @@ class RIG_OT_hytale_generate_rig(Operator):
         self.report(
             {"INFO"},
             f"Rig ready: {stats['mch']} MCH, {stats['ctrl']} CTRL, {stats['ik']} CTRL-IK, "
-            f"{stats['ik_mch']} MCH-IK, {stats['root']} root control bone(s) created; "
-            f"{len(chains_data)} IK chain(s) processed; "
+            f"{stats['ik_mch']} MCH-IK, {stats['tail']} Tail, {stats['root']} root control bone(s) created; "
+            f"{len(chains_data)} IK chain(s) and {len(tail_chains_data)} tail chain(s) processed "
+            f"({tail_constraint_count} tail bridge bone(s) constrained); "
             f"{widget_stats['assigned']} custom shape(s) assigned"
             + (f" ({widget_stats['fallback']} via fallback)" if widget_stats["fallback"] else "")
             + (f", {widget_stats['missing']} widget(s) missing (see warnings))" if widget_stats["missing"] else "")
@@ -1852,7 +2435,12 @@ class RIG_OT_hytale_generate_rig(Operator):
         ativo, o outro encolhe pra 0 (some do viewport sem precisar mexer
         em visibilidade de collection, então continua selecionável só
         quando faz sentido). Cobre a cadeia inteira (raiz, meio, ponta),
-        não só a ponta.
+        não só a ponta. v0.8: Pole_CTRL e Pole_Line (ver data["pole"]/
+        data["pole_line"]) também -- mesmo driver que um bone "IK"
+        normal (mode="IK"), já que só fazem sentido existir quando a
+        cadeia está em modo IK; antes ficavam com o scale ESTÁTICO
+        (sempre no tamanho cheio, inclusive em FK, onde não tinham
+        motivo pra estar visíveis).
 
         O tamanho "cheio" de cada bone vem do TEMPLATE DE SHAPES ativo
         (self._shape_template_bones, chave "scale"); default (1,1,1) pros
@@ -1894,9 +2482,27 @@ class RIG_OT_hytale_generate_rig(Operator):
                     target = _scale_target(ik_name)
                     add_custom_shape_scale_switch_driver(ik_pb, obj, BONE_PROPERTIES, switch_prop, target, mode="IK")
                     applied += 1
+
+            # v0.8: Pole_CTRL e Pole_Line (ver SUFFIX_POLE/SUFFIX_POLE_LINE)
+            # nunca entram em data["org_names"] (não são ORG/CTRL/IK de
+            # nenhum segmento -- são bones à parte, ver _build_ik_layer)
+            # -- por isso ficavam de fora do loop acima e nunca ganhavam
+            # driver nenhum: continuavam com o custom_shape_scale_xyz
+            # ESTÁTICO (tamanho cheio o tempo todo), mesmo em modo FK,
+            # onde não fazem sentido nenhum (não existe pole target
+            # ativo fora de IK). Mesmo tratamento dos bones "IK" acima
+            # (mode="IK") -- somem (encolhem a 0) quando a cadeia está em
+            # FK, aparecem no tamanho cheio só quando em IK.
+            for key in ("pole", "pole_line"):
+                name = data.get(key)
+                pb = pose_bones.get(name) if name else None
+                if pb is not None:
+                    target = _scale_target(name)
+                    add_custom_shape_scale_switch_driver(pb, obj, BONE_PROPERTIES, switch_prop, target, mode="IK")
+                    applied += 1
         return applied
 
-    def _build_bone_colors(self, obj):
+    def _build_bone_colors(self, obj, tail_chains_data=None):
         """Pinta bone.color (Custom Color Set) por bone -- não tem nada a
         ver com custom shape, é a cor de exibição do bone em si (Bone
         Properties > Viewport Display > Color, ou o painel de Bone Color
@@ -1904,18 +2510,23 @@ class RIG_OT_hytale_generate_rig(Operator):
         assim vale em Edit Mode e Pose Mode igual, sem precisar de duas
         atribuições.
 
-        Regra: BONE_COLOR_OVERRIDES (nome exato) vence; senão, attachment
-        (is_attachment_bone) vence o prefixo L-/R- (BONE_COLOR_ATTACHMENT);
-        senão, prefixo L-/R- decide (BONE_COLOR_LEFT/BONE_COLOR_RIGHT);
-        bones que não se encaixam em nenhum caso ficam com a cor padrão
-        do Blender (não mexe).
+        Regra: BONE_COLOR_OVERRIDES (nome exato) vence; senão, os _CTRL
+        de uma cadeia TAIL (tail_chains_data, v0.7 -- pedido explícito
+        pra ficarem verdes, mesma cor da Spine) vencem também; senão,
+        attachment (is_attachment_bone) vence o prefixo L-/R-
+        (BONE_COLOR_ATTACHMENT); senão, prefixo L-/R- decide
+        (BONE_COLOR_LEFT/BONE_COLOR_RIGHT); bones que não se encaixam em
+        nenhum caso ficam com a cor padrão do Blender (não mexe).
 
         Bones ORG (sem PROP_RIG_LAYER -- nunca passaram por este script,
         são os nomes originais do modelo importado, ex.:
         L-Eyebrow-Attachment) NUNCA recebem cor, mesmo tendo prefixo
         L-/R-: eles ficam ocultos (collection ORG) e não fazem sentido
         coloridos -- só os bones gerados (MCH/CTRL/CTRL-IK/MCH-IK/
-        ROOT-CTRL) entram na regra."""
+        ROOT-CTRL/TAIL) entram na regra."""
+        tail_ctrl_names = {
+            name for data in (tail_chains_data or []) for name in data.get("ctrl_names", ())
+        }
         colored = 0
         for bone in obj.data.bones:
             if bone.get(PROP_RIG_LAYER) is None:
@@ -1926,6 +2537,8 @@ class RIG_OT_hytale_generate_rig(Operator):
                     bone.color.palette = "DEFAULT"
                 continue
             palette = BONE_COLOR_OVERRIDES.get(bone.name)
+            if palette is None and bone.name in tail_ctrl_names:
+                palette = BONE_COLOR_SPINE
             if palette is None and is_attachment_bone(bone):
                 # Attachment vence o prefixo L-/R- -- um bone tipo
                 # "L-Eyebrow-Attachment_CTRL" começa com "L-", mas deve
@@ -1994,6 +2607,50 @@ class RIG_OT_hytale_generate_rig(Operator):
     # Etapa 1 (Edit Mode): collections + bones duplicados
     # ------------------------------------------------------------------
 
+    def _ensure_origin_bone(self, edit_bones, world_down_local):
+        """v0.8 -- alguns modelos importados não trazem o ORG "Origin"
+        (ver ORIGIN_ORG_NAME). Sem ele, o loop padrão de ORG->CTRL logo
+        abaixo nem chega a gerar "Origin_CTRL" (ROOT_MASTER_PARENT/
+        CHILD_OF_GLOBAL_TARGET) -- e sem Origin_CTRL, root.master_CTRL
+        fica sem parent (ver o WARNING "'Origin_CTRL' not found" em
+        _build_root_controls) e todo pole target perde a opção de
+        Child Of global (ver "Child Of_global" em _build_pose_
+        constraints).
+
+        Se "Origin" não existir, cria um ORG novo, sem parent, no centro
+        do mundo -- (0, 0, 0) em espaço local do armature. Este arquivo
+        nunca converte POSIÇÃO entre espaço local e mundial em lugar
+        nenhum (só a DIREÇÃO "down", ver world_down_local, que é
+        rotação, não translação) -- assume, como o resto do arquivo já
+        assume implicitamente, que o Object do armature fica na origem
+        do mundo (convenção normal de importação de rig de personagem).
+        `tail` aponta pra CIMA (-world_down_local) a partir de head, só
+        pra ter uma direção/comprimento sensata (ORIGIN_FALLBACK_LENGTH)
+        -- não afeta nada funcionalmente, é só o rest da CTRL que sai
+        dele.
+
+        Criado ANTES do resto do loop (chamado no topo de
+        _build_edit_bones, antes de `org_bones` ser calculado) --
+        assim ele entra no set normal de ORG bones e ganha Origin_CTRL/
+        MCH/etc. pelo caminho padrão, com o mesmo widget/cor que
+        Origin_CTRL sempre teve (ver WGT_ORIGIN/BONE_COLOR_ROOT_HEAD nos
+        dicts de override, mais acima no arquivo) -- não precisa de
+        nenhum tratamento especial daqui pra frente."""
+        if ORIGIN_ORG_NAME in edit_bones:
+            return False
+        origin = edit_bones.new(ORIGIN_ORG_NAME)
+        origin.head = Vector((0.0, 0.0, 0.0))
+        down = world_down_local if world_down_local.length > 1e-9 else Vector((0.0, 0.0, -1.0))
+        origin.tail = origin.head - down.normalized() * ORIGIN_FALLBACK_LENGTH
+        origin.roll = 0.0
+        origin.parent = None
+        self.report(
+            {"INFO"},
+            f"No '{ORIGIN_ORG_NAME}' bone found on this armature -- created one at the world center so "
+            f"'{ROOT_MASTER_PARENT}' and the rest of the rig can still be generated normally.",
+        )
+        return True
+
     def _build_edit_bones(self, armature, world_down_local):
         coll_export = ensure_bone_collection(armature, COLL_HYTALE_EXPORT)
         coll_internal = ensure_bone_collection(armature, COLL_INTERNAL)
@@ -2005,12 +2662,13 @@ class RIG_OT_hytale_generate_rig(Operator):
         coll_attachments_imported = ensure_bone_collection(armature, COLL_ATTACHMENTS_IMPORTED, parent=coll_internal)
 
         edit_bones = armature.edit_bones
+        self._ensure_origin_bone(edit_bones, world_down_local)
 
         org_bones = [b for b in edit_bones if PROP_RIG_LAYER not in b.keys()]
         org_by_name = {b.name: b for b in org_bones}
         ordered = self._order_top_down(org_bones, org_by_name)
 
-        stats = {"mch": 0, "ctrl": 0, "ik": 0, "ik_mch": 0, "root": 0}
+        stats = {"mch": 0, "ctrl": 0, "ik": 0, "ik_mch": 0, "root": 0, "tail": 0}
 
         for org in ordered:
             coll_org.assign(org)
@@ -2047,17 +2705,25 @@ class RIG_OT_hytale_generate_rig(Operator):
             edit_bones, coll_ctrl_ik, coll_mch_ik, resolved_chains, stats, world_down_local
         )
 
+        resolved_tail_chains = self._resolve_tail_chains(edit_bones, armature)
+        tail_chains_data = self._build_tail_layer(armature, edit_bones, resolved_tail_chains, stats)
+
         self._build_main_collections(armature, edit_bones)
+        self._move_main_child_before(armature, COLL_MAIN_TAIL, COLL_MAIN_ROOT)
         self._propagate_pole_and_tip_to_main_collections(edit_bones, chains_data)
         self._apply_collection_visibility(armature)
 
-        return stats, chains_data
+        return stats, chains_data, tail_chains_data
 
     def _resolve_chains(self, edit_bones, armature):
-        """Lê armature.hytale_ik_chains e resolve cada item num caminho
-        real de edit bones ORG (root -> ... -> tip)."""
+        """Lê armature.hytale_ik_chains e resolve cada item ARM/LEG (v0.7:
+        item.chain_type != "TAIL") num caminho real de edit bones ORG
+        (root -> ... -> tip). Cadeias TAIL são resolvidas à parte, por
+        _resolve_tail_chains -- não usam IK/pole nenhum."""
         resolved = []
         for item in armature.hytale_ik_chains:
+            if item.chain_type == "TAIL":
+                continue
             label = item.label or item.root_bone or "(sem nome)"
             if not item.root_bone or not item.tip_bone:
                 self.report({"WARNING"}, f"IK chain '{label}': root/tip bone name is empty -- skipped.")
@@ -2087,6 +2753,207 @@ class RIG_OT_hytale_generate_rig(Operator):
                 pole_ref = path[len(path) // 2]
             resolved.append({"item": item, "path": path, "pole_ref": pole_ref})
         return resolved
+
+    def _resolve_tail_chains(self, edit_bones, armature):
+        """Irmã de _resolve_chains, só pras entradas TAIL (v0.7): mesmo
+        find_org_path (root -> ... -> tip andando pela hierarquia ORG),
+        mas sem pole/lado/mínimo-de-3-bones -- uma cauda não faz IK, não
+        tem "joelho" pra dobrar, então até um caminho de 2 bones (root
+        direto no tip) é válido."""
+        resolved = []
+        for item in armature.hytale_ik_chains:
+            if item.chain_type != "TAIL":
+                continue
+            label = item.label or item.root_bone or "(sem nome)"
+            if not item.root_bone or not item.tip_bone:
+                self.report({"WARNING"}, f"Tail '{label}': root/tip bone name is empty -- skipped.")
+                continue
+            root = edit_bones.get(item.root_bone)
+            if root is None:
+                self.report({"WARNING"}, f"Tail '{label}': root bone '{item.root_bone}' not found -- skipped.")
+                continue
+            if edit_bones.get(item.tip_bone) is None:
+                self.report({"WARNING"}, f"Tail '{label}': tip bone '{item.tip_bone}' not found -- skipped.")
+                continue
+            path = find_org_path(root, item.tip_bone)
+            if path is None:
+                self.report(
+                    {"WARNING"},
+                    f"Tail '{label}': no path from '{item.root_bone}' to '{item.tip_bone}' -- skipped.",
+                )
+                continue
+            resolved.append({"item": item, "path": path})
+        return resolved
+
+    def _build_tail_layer(self, armature, edit_bones, resolved_tail_chains, stats):
+        """Pra cada cadeia TAIL resolvida (v0.7, revisado): quem forma a
+        cadeia fisicamente contínua (posicionalmente -- não "connected"
+        no sentido do Blender, ver abaixo) são os próprios bones `_CTRL`
+        (já criados pelo loop genérico em _build_edit_bones, ANTES desta
+        etapa rodar) -- aqui só REDIRECIONA o tail de cada `_CTRL` da
+        cauda pro head do próximo segmento (mesmo truque de
+        _build_ik_layer: os ORG do Hytale vêm com o eixo Y apontando pra
+        cima, não pro filho). use_connect fica DESLIGADO de propósito --
+        a posição já bate (tail de um == head do próximo) sem precisar
+        da conexão "travada" do Blender, que prenderia o bone e
+        impediria reparent/offset (ex.: parent_override). É essa
+        continuidade posicional, no bone que o usuário efetivamente
+        anima (_CTRL), que deixa a cauda pronta pra um addon de física
+        (spring bone, rigid body constraint etc.) hookar de um segmento
+        pro próximo sem gap.
+
+        O bone `_Tail` (SUFFIX_TAIL) é um BRIDGE, mesmo princípio exato
+        do `_IK_MCH` da cadeia de IK: mesma rest orientation do MCH (ou
+        seja, a do ORG original, INTOCADA -- NÃO redirecionada, ao
+        contrário do CTRL acima), e filho REAL do `_CTRL` correspondente
+        (não do bridge anterior). O MCH normal (criado pelo pipeline
+        genérico, já com FK_CopyRotation/FK_CopyScale/FK_CopyLocation
+        mirando no CTRL) tem esses MESMOS constraints RETARGETADOS pro
+        bridge em vez do CTRL direto (ver _build_tail_pose_constraints)
+        -- exatamente por que o `_IK_MCH` existe: copiar rotação em World
+        Space de um bone cuja rest orientation foi alterada (o CTRL,
+        agora redirecionado) sai errado/invertido sem esse intermediário
+        de rest "limpa".
+
+        Hierarquia final por segmento:
+            ORG -> (constraint) -> MCH -> (constraint) -> _Tail (bridge)
+            _Tail (bridge) -- parent real -> _CTRL
+            _CTRL -- parent real -> _CTRL anterior da cauda
+
+        Collections: _CTRL (a cadeia real, editável) fica em Main/Tail,
+        visível -- é nela que o usuário seleciona/anima e onde um addon
+        de física deve prender os constraints. O bridge _Tail fica em
+        Internal/Specials (mesma collection do bridge _IK_MCH, ver
+        COLL_MCH_IK -- renomeada de "MCH-IK" pra "Specials" nesta
+        versão), oculta por padrão -- é só mecanismo interno, nunca
+        precisa ser selecionado."""
+        coll_internal = ensure_bone_collection(armature, COLL_INTERNAL)
+        coll_specials = ensure_bone_collection(armature, COLL_MCH_IK, parent=coll_internal)
+        coll_main = ensure_bone_collection(armature, COLL_MAIN)
+        coll_tail = ensure_bone_collection(armature, COLL_MAIN_TAIL, parent=coll_main)
+
+        tail_chains_data = []
+        for resolved in resolved_tail_chains:
+            chain = resolved["path"]
+            item = resolved["item"]
+            tip_index = len(chain) - 1
+
+            # 1) Bones _CTRL reais desta cadeia -- já existem (criados
+            # pelo loop genérico ANTES de _resolve_tail_chains/
+            # _build_tail_layer rodarem, ver _build_edit_bones). Se
+            # algum não existir (não deveria acontecer no fluxo normal),
+            # avisa e pula a cadeia inteira em vez de quebrar.
+            ctrl_bones = []
+            for org in chain:
+                ctrl = edit_bones.get(org.name + SUFFIX_CTRL)
+                if ctrl is None:
+                    self.report(
+                        {"WARNING"},
+                        f"Tail: CTRL bone '{org.name + SUFFIX_CTRL}' not found -- skipped.",
+                    )
+                    ctrl_bones = []
+                    break
+                ctrl_bones.append(ctrl)
+            if not ctrl_bones:
+                continue
+
+            # 2) Redireciona o tail de cada _CTRL pro head do próximo
+            # segmento -- toda vez (não só quando criados agora), pra
+            # corrigir também cadeias configuradas antes desta revisão
+            # ou depois de o usuário mexer nos bones à mão. use_connect
+            # fica DESLIGADO de propósito (pedido explícito): a posição
+            # já bate (tail de um == head do próximo, calculado abaixo)
+            # sem precisar da conexão "travada" do Blender -- os bones
+            # continuam livres pra ter parent/offset reparentado (ex.:
+            # parent_override) sem o comportamento de "connected bone".
+            # A PONTA (último bone, sem próximo segmento pra apontar) é
+            # tratada à parte: sempre reseta pro tail/roll ORIGINAL do
+            # ORG primeiro (idempotente -- nunca incrementa em cima do
+            # que já está no bone, senão rodar "Create Rig" de novo
+            # dobraria a rotação a cada vez) e só então aplica a rotação
+            # manual opcional (item.tail_tip_rotation_deg, em graus, no
+            # eixo LOCAL escolhido em item.tail_tip_rotation_axis -- ver
+            # rotate_edit_bone_local_axis).
+            for i, ctrl in enumerate(ctrl_bones):
+                if i < tip_index:
+                    ctrl.tail = chain[i + 1].head.copy()
+                    ctrl.align_roll(chain[i].z_axis)
+                else:
+                    ctrl.tail = chain[i].tail.copy()
+                    ctrl.roll = chain[i].roll
+                    rotate_edit_bone_local_axis(
+                        ctrl, item.tail_tip_rotation_axis, item.tail_tip_rotation_deg
+                    )
+                coll_tail.assign(ctrl)
+
+            # Parent override (campo "Attach To") -- aplica no _CTRL
+            # RAIZ da cauda, toda vez (mesmo princípio do fix de
+            # parent_override da cadeia de IK): sobrescreve o parent que
+            # o loop genérico já deu (o _CTRL do pai ORG real) só se o
+            # usuário pediu explicitamente.
+            if item.parent_override:
+                override_parent = _resolve_parent_override(edit_bones, item.parent_override)
+                if override_parent is not None:
+                    ctrl_bones[0].parent = override_parent
+                    ctrl_bones[0].use_connect = False
+                else:
+                    self.report(
+                        {"WARNING"},
+                        f"Parent override '{item.parent_override}' not found for '{ctrl_bones[0].name}' -- "
+                        f"left as-is.",
+                    )
+
+            # 3) Bridge _Tail por segmento -- rest = ORG original
+            # (create_bone_like não redireciona nada), filho REAL do
+            # _CTRL correspondente (não do bridge anterior). Vai pra
+            # Internal/Specials, não Main/Tail (ver docstring acima).
+            tail_bones = []
+            for i, org in enumerate(chain):
+                bridge, is_new = create_bone_like(edit_bones, org, org.name + SUFFIX_TAIL)
+                if is_new:
+                    bridge[PROP_RIG_LAYER] = "TAIL"
+                    stats["tail"] += 1
+                bridge.parent = ctrl_bones[i]  # toda vez -- corrige cadeias de uma revisão anterior também
+                bridge.use_connect = False
+                coll_specials.assign(bridge)
+                tail_bones.append(bridge)
+
+            tail_chains_data.append(
+                {
+                    "org_names": [b.name for b in chain],
+                    "tail_bones": [b.name for b in tail_bones],
+                    "ctrl_names": [b.name for b in ctrl_bones],
+                }
+            )
+
+        return tail_chains_data
+
+    def _build_tail_pose_constraints(self, obj, tail_chains_data):
+        """Pose Mode: retargeta, pro bridge `_Tail`, os MESMOS constraints
+        que o loop genérico de _build_pose_constraints já criou no MCH
+        mirando no CTRL (FK_CopyRotation/FK_CopyScale/FK_CopyLocation --
+        ensure_copy_constraint() só troca o `subtarget`, não recria
+        nada). Precisa rodar DEPOIS de _build_pose_constraints. Nenhum
+        driver de switch envolvido -- bones de cauda não entram em
+        chains_data (só Arm/Leg entram lá), então o loop genérico já os
+        deixa com influence=1.0 fixa (sem FK/IK, sempre "ligado"), exatamente
+        o que a cauda precisa."""
+        pose_bones = obj.pose.bones
+        count = 0
+        for data in tail_chains_data:
+            for i, org_name in enumerate(data["org_names"]):
+                bridge_name = data["tail_bones"][i]
+                mch_name = org_name + SUFFIX_MCH
+                if bridge_name not in pose_bones or mch_name not in pose_bones:
+                    continue
+                mch_pose = pose_bones[mch_name]
+                for con_name in (CONSTRAINT_FK_ROT, CONSTRAINT_FK_SCALE, CONSTRAINT_FK_LOC):
+                    con = mch_pose.constraints.get(con_name)
+                    if con is not None:
+                        con.target = obj
+                        con.subtarget = bridge_name
+                count += 1
+        return count
 
     def _build_root_controls(self, edit_bones, coll_ctrl):
         """Cria (se ainda não existirem) root.master_CTRL, root.spine_CTRL
@@ -2180,6 +3047,51 @@ class RIG_OT_hytale_generate_rig(Operator):
             bone.parent = parent
             bone.use_connect = False
 
+    def _reparent_extra_children(self, edit_bones, org, mch, exclude_name=None):
+        """v0.8 -- generaliza o reparent que já existia só pra ponta
+        (dedos sob Hand/Foot, sockets de attachment) pra QUALQUER
+        segmento da cadeia, incluindo os do meio (ex.: um bone extra
+        pendurado em Arm ou Forearm -- alguns modelos trazem isso, e
+        antes desse fix esses bones ficavam "descolados" quando a
+        cadeia ia pra modo IK, exatamente como um dedo ficaria se não
+        fosse reparentado pro _MCH da mão).
+
+        Reparenta pro `mch` dado o _CTRL de todo filho ORG "extra" de
+        `org` -- attachment (ver find_attachment_child) e os demais (ver
+        find_non_attachment_children). `exclude_name`: usado pelos
+        segmentos do MEIO da cadeia (Arm/Forearm) pra excluir o PRÓXIMO
+        elo da própria cadeia -- ex.: Forearm É filho de Arm na
+        hierarquia crua do ORG, mas já tem seu próprio _IK/_MCH tratado
+        à parte logo abaixo, não é um "extra" (reparentar ele aqui por
+        engano quebraria a cadeia). A ponta (tip) não passa
+        `exclude_name` -- não tem "próximo elo" depois dela.
+
+        Roda toda vez (não só quando o bone é novo) -- corrige rigs já
+        gerados antes desta função existir também. Retorna a lista de
+        nomes de _CTRL reparentados, pra alimentar
+        chains_data["reparented_ctrl_roots"] (ver
+        _propagate_pole_and_tip_to_main_collections -- reparentar pro
+        _MCH tira esses _CTRL da árvore que o walk de Main/Arm-Leg
+        percorre, então precisam ser propagados de volta pra lá
+        manualmente, do mesmo jeito que pole/tip/attachment já eram)."""
+        reparented = []
+        extra_orgs = []
+        attachment_org = find_attachment_child(org)
+        if attachment_org is not None and attachment_org.name != exclude_name:
+            extra_orgs.append(attachment_org)
+        for child in find_non_attachment_children(org):
+            if child.name == exclude_name:
+                continue
+            extra_orgs.append(child)
+        for extra_org in extra_orgs:
+            extra_ctrl = edit_bones.get(extra_org.name + SUFFIX_CTRL)
+            if extra_ctrl is None:
+                continue
+            extra_ctrl.parent = mch
+            extra_ctrl.use_connect = False
+            reparented.append(extra_ctrl.name)
+        return reparented
+
     @staticmethod
     def _order_top_down(org_bones, org_by_name):
         ordered = []
@@ -2221,47 +3133,32 @@ class RIG_OT_hytale_generate_rig(Operator):
             # reparentar neles funciona ao vivo (ORG == MCH em World
             # Space, sempre, via CONSTRAINT_ORG_TO_MCH), mas o
             # anim_importer.py só sabe projetar corretamente parents
-            # terminados em "_CTRL" ou "_MCH" -- um parent ORG cru cai
-            # no caso genérico "bone não animado" e a importação de
-            # animação desses bones sai errada (v0.5.1). _MCH dá o
+            # terminados em "_CTRL" ou "_MCH" (ver SUFFIX_MCH lá) -- um
+            # parent ORG cru cai no caso genérico "bone não animado" e a
+            # importação de animação desses bones sai errada. _MCH dá o
             # mesmo resultado visual E é reconhecido pelo importer.
             tip_mch = edit_bones.get(tip_org.name + SUFFIX_MCH) or tip_org
-            reparented_ctrl_roots = []
+            # v0.8: tip + segmentos do meio (Arm/Forearm) tratados pelo
+            # mesmo helper -- ver _reparent_extra_children logo acima.
+            reparented_ctrl_roots = self._reparent_extra_children(edit_bones, tip_org, tip_mch)
             attachment_org = find_attachment_child(tip_org)
             attachment_ctrl = edit_bones.get(attachment_org.name + SUFFIX_CTRL) if attachment_org else None
-            if attachment_ctrl is not None:
-                # O _CTRL do attachment (ex.: socket de arma na mão) é
-                # criado pelo loop padrão com parent = tip_org_CTRL (ex.:
-                # Hand_CTRL) -- mas Hand_CTRL é só o controle FK, que NÃO
-                # se move quando o braço está em modo IK. O attachment
-                # precisa seguir o resultado FINAL (_MCH, que já é
-                # constrained pra seguir FK OU IK conforme o switch), não
-                # só o FK. Roda TODA VEZ (não só "if is_new"): corrige
-                # também attachments já existentes de execuções antigas.
-                attachment_ctrl.parent = tip_mch
-                attachment_ctrl.use_connect = False
-                reparented_ctrl_roots.append(attachment_ctrl.name)
 
-            # Mesmo problema do attachment acima, mas pra filhos ORG
-            # "normais" da ponta da cadeia -- o caso mais comum é dedo
-            # (Toe* sob Foot, ou dedo de mão sob Hand): o _CTRL desses
-            # bones nasce parentado no _CTRL da ponta (Foot_CTRL/
-            # Hand_CTRL) pelo pipeline padrão de _build_edit_bones, mas
-            # esse _CTRL é só a versão FK -- não se move quando a cadeia
-            # está em modo IK, então o dedo "descola" do pé/mão nesse
-            # modo. Reparenta pro _MCH da ponta (tip_mch), que já é
-            # constrained pra seguir FK OU IK (CONSTRAINT_ORG_TO_MCH em
-            # ORG, mesmo valor em World Space que o MCH), do mesmo jeito
-            # que o attachment. Roda toda vez (não só "if is_new"),
-            # corrigindo também rigs já gerados antes dessa mudança
-            # (inclusive os que reparentavam no ORG cru, v0.5).
-            for extra_child in find_non_attachment_children(tip_org):
-                extra_ctrl = edit_bones.get(extra_child.name + SUFFIX_CTRL)
-                if extra_ctrl is None:
+            # Segmentos do MEIO da cadeia (tudo antes da ponta -- ex.:
+            # Arm/Forearm de um braço IK): mesmo problema que a ponta já
+            # tinha, mesma correção. `exclude_name` tira o PRÓXIMO elo da
+            # própria cadeia (ele já tem tratamento dedicado no loop de
+            # `ik_bones` logo abaixo -- não é um "extra").
+            for mid_index in range(tip_index):
+                mid_org = chain[mid_index]
+                mid_mch = edit_bones.get(mid_org.name + SUFFIX_MCH)
+                if mid_mch is None:
                     continue
-                extra_ctrl.parent = tip_mch
-                extra_ctrl.use_connect = False
-                reparented_ctrl_roots.append(extra_ctrl.name)
+                reparented_ctrl_roots.extend(
+                    self._reparent_extra_children(
+                        edit_bones, mid_org, mid_mch, exclude_name=chain[mid_index + 1].name
+                    )
+                )
 
             tip_length = (tip_org.tail - tip_org.head).length
             ik_bones = []
@@ -2377,6 +3274,26 @@ class RIG_OT_hytale_generate_rig(Operator):
                 pole[PROP_RIG_LAYER] = "CTRL-IK"
             coll_ctrl_ik.assign(pole)
 
+            # v0.8: bone puramente visual -- parent DIRETO no pole_ref (o
+            # próprio ORG, ex.: Forearm/Calf; não no _IK nem no _CTRL
+            # dele), esticado (Stretch To, ver _build_pose_constraints)
+            # até o "_Pole_CTRL" acabado de criar/reaproveitar acima.
+            # head = head do pole_ref (o "cotovelo"/"joelho"); tail =
+            # head do pole (só o rest -- Stretch To recalcula a cada
+            # frame, então não precisa ficar exato). hide_select=True:
+            # 100% controlado pelo constraint, nada pra o usuário posar
+            # nele.
+            pole_line, is_new_pole_line = create_bone_like(edit_bones, pole_ref, root_org.name + SUFFIX_POLE_LINE)
+            if is_new_pole_line:
+                pole_line.head = pole_ref.head.copy()
+                pole_line.tail = pole.head.copy()
+                pole_line.roll = 0.0
+                pole_line.parent = pole_ref
+                pole_line.use_connect = False
+                pole_line[PROP_RIG_LAYER] = "CTRL-IK"
+            pole_line.hide_select = True
+            coll_ctrl_ik.assign(pole_line)
+
             chains_data.append(
                 {
                     "org_names": [b.name for b in chain],
@@ -2384,7 +3301,16 @@ class RIG_OT_hytale_generate_rig(Operator):
                     "ik_solver_end": chain[tip_index - 1].name + SUFFIX_IK,
                     "ik_tip": chain[tip_index].name + SUFFIX_IK,
                     "pole": pole.name,
+                    "pole_line": pole_line.name,
                     "side": item.side,
+                    # v0.8 -- só pra _warn_shared_pole_angle_presets (ver
+                    # _build_pose_constraints) checar se uma cadeia de Arm
+                    # e uma de Leg estão sem querer usando o MESMO
+                    # pole_angle_preset_name (pole_angle_presets é indexado
+                    # só por nome+side, não por chain_type -- ver comentário
+                    # lá e em templates/__init__.py). Não afeta a resolução
+                    # do ângulo em si, só o aviso.
+                    "chain_type": item.chain_type,
                     "pole_angle_mode": item.pole_angle_mode,
                     "pole_angle_preset_name": item.pole_angle_preset_name,
                     "pole_angle_manual": item.pole_angle_manual,
@@ -2394,9 +3320,9 @@ class RIG_OT_hytale_generate_rig(Operator):
                     # dentro do bone PROPERTIES (não mais uma property por
                     # bone _IK) -- ver switch_property_name.
                     "switch_property": switch_property_name(chain[tip_index].name, item.side),
-                    # Bones _CTRL reparentados pro _MCH da ponta (ver acima:
-                    # attachment_ctrl + find_non_attachment_children) --
-                    # ficam FORA da árvore de parent que assign_descendants
+                    # Bones _CTRL reparentados pro _MCH da ponta (ver
+                    # acima: attachment_ctrl + find_non_attachment_children)
+                    # -- ficam FORA da árvore de parent que assign_descendants
                     # caminha em _build_main_collections, então precisam
                     # ser propagados manualmente pra mesma collection do
                     # resto da cadeia (ver _propagate_pole_and_tip_to_main_collections).
@@ -2500,13 +3426,17 @@ class RIG_OT_hytale_generate_rig(Operator):
     def _propagate_pole_and_tip_to_main_collections(self, edit_bones, chains_data):
         """O pole target e o "_IK" da ponta (mão/pé) ficam SOLTOS na
         hierarquia (sem parent) -- por isso nunca são alcançados pelo
-        walk de descendentes que monta Arm L/R e Leg L/R. Aqui, pra cada
-        cadeia, descobre em qual sub-collection de Main o resto da cadeia
-        (o "_IK" raiz) já caiu, e replica pro pole, pro tip e pra todo
-        _CTRL reparentado pro _MCH da ponta (attachment_ctrl/dedos -- ver
-        reparented_ctrl_roots em _build_ik_layer -- esses também ficam
-        fora da árvore de parent normal do walk, do mesmo jeito que o
-        pole/tip, só que por reparenting em vez de nascerem sem parent)."""
+        walk de descendentes que monta Arm L/R e Leg L/R. O "_Pole_Line"
+        (v0.8) tem parent, mas é o pole_ref -- um bone ORG, fora da
+        árvore _CTRL/_IK que o walk (assign_descendants, em
+        _build_main_collections) percorre -- também nunca é alcançado
+        por ali. Aqui, pra cada cadeia, descobre em qual sub-collection
+        de Main o resto da cadeia (o "_IK" raiz) já caiu, e replica pro
+        pole, pro pole line, pro tip e pra todo _CTRL reparentado pro
+        _MCH da ponta (attachment_ctrl/dedos -- ver reparented_ctrl_roots
+        em _build_ik_layer -- esses também ficam fora da árvore de
+        parent normal do walk, do mesmo jeito que o pole/tip, só que por
+        reparenting em vez de nascerem sem parent/parentados num ORG)."""
         for data in chains_data:
             ref_bone = edit_bones.get(data["ik_root"])
             if ref_bone is None:
@@ -2514,7 +3444,7 @@ class RIG_OT_hytale_generate_rig(Operator):
             member_colls = [c for c in ref_bone.collections if c.name in self._MAIN_LIMB_COLLECTION_NAMES]
             if not member_colls:
                 continue
-            for name in (data["pole"], data["ik_tip"]):
+            for name in (data["pole"], data["pole_line"], data["ik_tip"]):
                 bone = edit_bones.get(name)
                 if bone is None:
                     continue
@@ -2538,6 +3468,71 @@ class RIG_OT_hytale_generate_rig(Operator):
         except Exception:
             pass  # cosmético -- não impede o rig de funcionar
 
+    def _move_main_child_before(self, armature, child_name, before_name):
+        """Reposiciona a bone collection `child_name` (filha de Main) pra
+        ficar logo ANTES de `before_name` (outra filha de Main, MESMO
+        parent) na lista -- usado pra colocar "Tail" depois de "Leg R" e
+        antes de "Root" (v0.7).
+
+        v0.8 -- bug real corrigido aqui (não só o WARNING): a versão
+        anterior calculava os índices em `list(armature.collections)`,
+        igual _move_collection_to_index faz pra Face/Main -- só que
+        Face/Main são collections de NÍVEL RAIZ, e `armature.collections`
+        só enxerga collections de nível raiz (ver docstring de
+        _find_bone_collection_anywhere, logo acima) -- Tail e Root são
+        FILHAS de Main, nunca aparecem nessa lista. `flat.index(child)`
+        lançava ValueError toda vez, caía no antigo `except: pass`, e a
+        Tail nunca saía do lugar onde nasceu (criada em _build_tail_layer,
+        ANTES de Head/Spine/Body/Arm/Leg/Root em _build_main_collections
+        -- por isso sempre aparecia no TOPO de Main, não só "não antes de
+        Root").
+
+        Correção: usa `child_number` (índice de um bone collection DENTRO
+        da lista de filhos do PRÓPRIO parent -- API dedicada exatamente
+        pra isso, documentada pela Blender Foundation) em vez do array
+        flat inteiro do Armature. Só funciona entre irmãos (mesmo
+        parent) -- daí o guard `child.parent != target.parent` abaixo.
+
+        Ajuste de direção: setar child_number pra um valor X reposiciona
+        o item pra ficar na posição final X (empurrando o que já estava
+        lá pra frente) -- então, se `child` já vem ANTES de `target` na
+        lista (current < target.child_number, o caso normal aqui: Tail
+        nasce antes de Root), o valor certo pra terminar IMEDIATAMENTE
+        ANTES de `target` é `target.child_number - 1` (a posição de
+        Root ANTES do reposicionamento vira -1 depois que Tail sai de
+        antes dela -- setar direto pro child_number original de Root
+        colocaria Tail DEPOIS dela, não antes). Se `child` já vier DEPOIS
+        de `target`, não tem esse deslocamento -- usa o valor original.
+        """
+        child = _find_bone_collection_anywhere(armature, child_name)
+        target = _find_bone_collection_anywhere(armature, before_name)
+        if child is None or target is None:
+            self.report(
+                {"WARNING"},
+                f"Could not reorder bone collection '{child_name}' before '{before_name}' -- "
+                f"'{child_name if child is None else before_name}' not found (purely cosmetic, rig still works).",
+            )
+            return
+        if child.parent != target.parent:
+            self.report(
+                {"WARNING"},
+                f"Could not reorder bone collection '{child_name}' before '{before_name}' -- they aren't "
+                f"siblings (same parent collection) (purely cosmetic, rig still works).",
+            )
+            return
+        try:
+            current_number = child.child_number
+            target_number = target.child_number
+            new_number = target_number - 1 if current_number < target_number else target_number
+            if current_number != new_number:
+                child.child_number = new_number
+        except Exception as exc:
+            self.report(
+                {"WARNING"},
+                f"Could not reorder bone collection '{child_name}' before '{before_name}': {exc} "
+                f"(purely cosmetic, rig still works).",
+            )
+
     def _apply_collection_visibility(self, armature):
         """Esconde tudo (Internal e todo o resto), deixando visível só
         Main (+ sub-collections), Face e Attachments."""
@@ -2555,6 +3550,46 @@ class RIG_OT_hytale_generate_rig(Operator):
     # ------------------------------------------------------------------
     # Etapa 2 (Pose/Object Mode): constraints, custom properties, drivers
     # ------------------------------------------------------------------
+
+    def _warn_shared_pole_angle_presets(self, chains_data):
+        """v0.8 -- sanity check, não muda nada no rig: rig_template[
+        "pole_angle_presets"] é indexado só por nome do preset (o texto
+        livre digitado em item.pole_angle_preset_name) + side (LEFT/
+        RIGHT) -- NÃO por chain_type (ARM/LEG/TAIL). Design intencional
+        (deixa o rigger genérico -- qualquer cadeia pode reaproveitar
+        qualquer preset, mesmo entre tipos diferentes, se a geometria
+        realmente for parecida), mas é fácil pisar na bola: se uma cadeia
+        de braço e uma de perna acabarem com o MESMO nome de preset (ex.:
+        copiar/colar um item da lista e esquecer de trocar o nome, ou só
+        digitar "ARM" em tudo por hábito) elas passam a compartilhar o
+        MESMO ângulo calibrado sem nenhum aviso -- braço e perna raramente
+        têm a mesma geometria de cotovelo/joelho, então isso quase sempre
+        é sem querer, não intencional.
+
+        Só olha cadeias em modo PRESET (AUTO/MANUAL não usam
+        pole_angle_presets nenhum, nada a checar) -- ver rig_player.json
+        pra um exemplo real onde isso NÃO dispara: as pernas usam AUTO,
+        então reaproveitar o nome "ARM" ali (herdado de um template
+        antigo) não causa problema NENHUM hoje, mas viraria um se alguém
+        mudasse o modo delas pra PRESET sem também trocar o nome."""
+        preset_chain_types = {}
+        for data in chains_data:
+            if data.get("pole_angle_mode") != "PRESET":
+                continue
+            name = data.get("pole_angle_preset_name")
+            chain_type = data.get("chain_type")
+            if not name or not chain_type:
+                continue
+            preset_chain_types.setdefault(name, set()).add(chain_type)
+
+        for name, types in preset_chain_types.items():
+            if len(types) > 1:
+                self.report(
+                    {"WARNING"},
+                    f"Pole angle preset '{name}' is used in PRESET mode by more than one chain type "
+                    f"({', '.join(sorted(types))}) -- they'll share the exact same calibrated angle per side. "
+                    f"If that's not intentional, give each chain type its own preset name.",
+                )
 
     def _build_pose_constraints(self, obj, chains_data):
         pose_bones = obj.pose.bones
@@ -2604,6 +3639,7 @@ class RIG_OT_hytale_generate_rig(Operator):
                     fk_loc.influence = 1.0
 
         # Camada de IK, por cadeia.
+        self._warn_shared_pole_angle_presets(chains_data)
         for data in chains_data:
             org_names = data["org_names"]
             ik_root = data["ik_root"]
@@ -2692,6 +3728,16 @@ class RIG_OT_hytale_generate_rig(Operator):
                         f"'{pole_name}'.",
                     )
 
+            # v0.8: "_Pole_Line" -- Stretch To simples, sempre mirando no
+            # "_Pole_CTRL" desta MESMA cadeia/lado (pole_name já resolvido
+            # acima). 100% visual -- não depende de switch FK/IK nem de
+            # nenhuma outra property.
+            pole_line_name = data.get("pole_line")
+            if pole_line_name and pole_line_name in pose_bones and pole_name in pose_bones:
+                ensure_stretch_to_constraint(
+                    pose_bones[pole_line_name], obj, pole_name, CONSTRAINT_POLE_LINE_STRETCH
+                )
+
             for org_name in org_names:
                 mch_name = org_name + SUFFIX_MCH
                 bridge_name = org_name + SUFFIX_IK_MCH
@@ -2773,9 +3819,16 @@ class RIG_OT_hytale_generate_rig(Operator):
 # ---------------------------------------------------------------------------
 
 
+_CHAIN_TYPE_ICON = {"ARM": "CON_KINEMATIC", "LEG": "CON_KINEMATIC", "TAIL": "PHYSICS"}
+
+
 class RIG_UL_hytale_ik_chains(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
-        layout.prop(item, "label", text="", emboss=False, icon="BONE_DATA")
+        row = layout.row(align=True)
+        row.prop(
+            item, "label", text="", emboss=False,
+            icon=_CHAIN_TYPE_ICON.get(item.chain_type, "BONE_DATA"),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2820,9 +3873,9 @@ def _template_source(list_func, name):
 # Campos de HytaleIKChainItem serializáveis pra JSON (mesma lista usada
 # por RIG_OT_hytale_ik_chain_load_defaults pra ler de volta).
 _IK_CHAIN_JSON_FIELDS = (
-    "label", "root_bone", "tip_bone", "pole_bone", "parent_override", "side",
+    "chain_type", "label", "root_bone", "tip_bone", "pole_bone", "parent_override", "side",
     "pole_invert", "pole_distance", "pole_angle_mode", "pole_angle_preset_name",
-    "pole_angle_manual", "pole_angle_fine_tune", "extra_ik_location",
+    "pole_angle_manual", "pole_angle_fine_tune", "extra_ik_location", "tail_tip_rotation_axis", "tail_tip_rotation_deg",
 )
 
 # Bones utilitários (não derivam de nenhuma cadeia IK) que também
@@ -3246,6 +4299,7 @@ _CLASSES = (
     HytaleIKChainItem,
     RIG_UL_hytale_ik_chains,
     RIG_OT_hytale_ik_chain_add,
+    RIG_MT_hytale_ik_chain_add_menu,
     RIG_OT_hytale_ik_chain_remove,
     RIG_OT_hytale_ik_chain_set_count,
     RIG_OT_hytale_ik_chain_pick_bone,
@@ -3259,6 +4313,8 @@ _CLASSES = (
     RIG_OT_hytale_collection_template_apply,
     RIG_OT_hytale_collection_template_delete,
     RIG_OT_hytale_clear_generated,
+    RIG_OT_hytale_shape_edit_mode_enter,
+    RIG_OT_hytale_shape_edit_mode_finish,
     RIG_OT_hytale_generate_rig,
 )
 
@@ -3298,6 +4354,14 @@ def register():
         "never auto-applied by 'Create Rig')",
         default="",
     )
+    Armature.hytale_shape_edit_mode = BoolProperty(
+        name="Shape Edit Mode",
+        description="True while RIG_OT_hytale_shape_edit_mode_enter's mute is in effect on this armature's "
+        "FK/IK shape-scale drivers -- set/cleared automatically by 'Enter'/'Finish Shape Edit Mode', read by "
+        "interface.py to decide which of the two buttons to show and by 'Create Rig'/'Remove Generated Hytale "
+        "Rig Bones' to refuse running mid-edit",
+        default=False,
+    )
 
     # Seleção de template (Rig/Shape/Collection) do dropdown compacto da
     # box "Character Templates" do interface.py -- ver comentário acima
@@ -3317,11 +4381,29 @@ def register():
         name="Collection Template", items=collection_template_enum_items,
     )
 
+    # v0.8 -- borda de Shape Edit Mode (ver _draw_shape_edit_border, logo
+    # acima de RIG_OT_hytale_shape_edit_mode_enter). Registrado UMA vez
+    # por sessão do Blender aqui, não por Armature -- o callback mesmo
+    # decide se desenha, olhando hytale_shape_edit_mode do armature ativo
+    # a cada redraw.
+    global _shape_edit_border_handler
+    if _shape_edit_border_handler is None:
+        _shape_edit_border_handler = bpy.types.SpaceView3D.draw_handler_add(
+            _draw_shape_edit_border, (), "WINDOW", "POST_PIXEL"
+        )
+
 
 def unregister():
+    global _shape_edit_border_handler, _shape_edit_border_shader
+    if _shape_edit_border_handler is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(_shape_edit_border_handler, "WINDOW")
+        _shape_edit_border_handler = None
+    _shape_edit_border_shader = None
+
     del WindowManager.hytale_collection_template_selected
     del WindowManager.hytale_shape_template_selected
     del WindowManager.hytale_rig_template_selected
+    del Armature.hytale_shape_edit_mode
     del Armature.hytale_active_collection_template
     del Armature.hytale_active_shape_template
     del Armature.hytale_active_rig_template

@@ -104,13 +104,38 @@ TRANSLATIONS = {
     "panel.load_template_action": "Load",
     "panel.btn_reload_templates": "Reload Templates",
     "panel.btn_open_templates_folder": "Open Templates Folder",
-    "panel.ik_chains_box": "IK Chains",
+    "panel.ik_chains_box": "Bone Settings",
     "panel.load_preset": "Load Preset...",
     "panel.apply_ik_joint_fix": "Apply IK Joint Fix (from Template)",
+    "panel.field_chain_type": "Type",
+    # Campos genéricos (Root Bone/Tip Bone/Pole Reference/Root Parent) --
+    # v0.7: não são mais usados diretamente pela UI (Arm/Leg têm rótulos
+    # próprios abaixo, Tail tem os seus também) -- mantidas por
+    # compatibilidade (nenhum código as referencia mais, mas remover
+    # deixaria pt_br.py e qualquer outro idioma com uma key órfã sem
+    # necessidade).
     "panel.field_root_bone": "Root Bone",
     "panel.field_tip_bone": "Tip Bone",
     "panel.field_pole_bone": "Pole Reference",
     "panel.field_root_parent": "Root Parent",
+    # v0.7 -- rótulos por chain_type (ver _LIMB_FIELD_LABELS em interface.py).
+    # Arm e Leg reaproveitam os MESMOS 4 campos/mesma lógica de sempre
+    # (root_bone/tip_bone/pole_bone/parent_override) -- só o texto muda.
+    "panel.field_arm_shoulder": "Shoulder / Root Parent",
+    "panel.field_arm_upper": "Arm / Root Bone",
+    "panel.field_arm_forearm": "Forearm / Pole Reference",
+    "panel.field_arm_hand": "Hand / Tip Bone",
+    "panel.field_leg_pelvis": "Pelvis / Root Parent",
+    "panel.field_leg_thigh": "Thigh / Root Bone",
+    "panel.field_leg_calf": "Calf / Pole Reference",
+    "panel.field_leg_foot": "Foot / Tip Bone",
+    # v0.7 -- campos exclusivos de Tail (sem IK, ver rigger.py).
+    "panel.field_tail_parent": "Attach To (Parent)",
+    "panel.field_tail_start": "Start Bone",
+    "panel.field_tail_end": "End Bone",
+    "panel.field_tail_tip_rotation_axis": "Tip Rotation Axis",
+    "panel.field_tail_tip_rotation_deg": "Tip Rotation (deg)",
+    "panel.hint_tail_no_ik": "Tail bones follow their controls directly (no IK) -- ready for physics add-ons",
     "panel.field_side": "Side",
     "panel.field_pole_in_front": "Pole in Front (+Z)",
     "panel.field_copy_location_ik": "Also Copy Location on IK (root)",
@@ -120,6 +145,8 @@ TRANSLATIONS = {
     "panel.field_pole_angle_manual": "Pole Angle (deg)",
     "panel.field_pole_angle_fine_tune": "Pole Angle Fine-Tune (deg)",
     "panel.btn_create_rig": "Create Rig",
+    "panel.btn_shape_edit_enter": "Shape Edit Mode",
+    "panel.btn_shape_edit_finish": "Finish Shape Edit Mode",
     "panel.btn_remove_generated": "Remove Generated Bones",
 
     # -----------------------------------------------------------------

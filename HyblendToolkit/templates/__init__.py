@@ -56,6 +56,22 @@ plugável, orientado a arquivo, no mesmo espírito do pacote translations/
   "pole_angle_presets": {                  // opcional -- valores calibrados de pole_angle, por
     "ARM": {"LEFT": -91.25, "RIGHT": -88.76}   // preset (nome livre) -> por side. Só usado por
   },                                            // cadeias com pole_angle_mode = "PRESET".
+  // ATENÇÃO: indexado só por NOME DO PRESET + side -- NÃO por chain_type
+  // (ARM/LEG/TAIL). É intencional (deixa reaproveitar o mesmo preset
+  // entre tipos diferentes, se a geometria for parecida o bastante) --
+  // mas também significa que NADA impede uma cadeia de braço e uma de
+  // perna de acabarem com o MESMO pole_angle_preset_name por acidente
+  // (copiar/colar um item da lista e esquecer de trocar o nome, ou só
+  // digitar "ARM" em tudo por hábito) -- nesse caso elas passam a
+  // compartilhar o MESMO ângulo calibrado, silenciosamente, o que quase
+  // sempre é errado (cotovelo e joelho raramente têm a mesma geometria).
+  // Convenção recomendada: um preset por chain_type (ex.: "ARM"/"LEG"/
+  // "TAIL"), nunca o mesmo nome pros dois, a menos que você tenha
+  // verificado que o ângulo realmente bate pros dois. rigger.py (v0.8,
+  // ver _warn_shared_pole_angle_presets) avisa com um WARNING, na hora
+  // de gerar o rig, se detectar mais de um chain_type usando o mesmo
+  // nome de preset em modo PRESET -- mas só detecta, não impede/corrige
+  // nada sozinho.
   "apply_ik_joint_fix": true,              // opcional (default false) -- liga a correção de
                                             // posição de junta abaixo automaticamente ao carregar
   "ik_joint_x_overrides": {                // opcional -- ver _apply_ik_joint_fixes em rigger.py.

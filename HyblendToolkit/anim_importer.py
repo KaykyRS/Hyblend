@@ -13,46 +13,49 @@
 # zero a partir de um .blockymodel) -- aqui a geometria/hierarquia já
 # existe, só precisamos posá-la nos frames certos.
 #
-# QUATRO modos de destino (target_mode, no operador
-# IMPORT_OT_hytale_blockyanim), pensados como CAMADAS que se apoiam uma na
-# outra -- cada uma reaproveita o resultado da anterior, não são caminhos
-# paralelos independentes:
+# DOIS modos de destino (target_mode, no operador
+# IMPORT_OT_hytale_blockyanim) -- pensados como CAMADAS que se apoiam uma
+# na outra, não caminhos paralelos independentes:
 #
-#   ORG      -- keyframa o bone ORIGINAL direto (mesmo nome do
-#               .blockymodel/.blockyanim). Funciona em QUALQUER Armature
-#               que tenha esses bones, rigada ou não -- é o modo genérico
-#               que precisa funcionar pra QUALQUER personagem/criatura do
-#               Hytale, não só o Player. Numa Armature COM rig gerado, os
-#               keyframes não movem nada visualmente (o ORG está
-#               constrained -- ver Hytale_ORG_to_MCH em rigger.py).
-#   CTRL_FK  -- escreve no bone "_CTRL" (rigger.py) em vez do ORG,
-#               calculando a pose de mundo pretendida (andando a
-#               hierarquia ORG) e reprojetando no PAI REAL do _CTRL no
-#               Blender (pode ser diferente do pai ORG -- ver
-#               CTRL_PARENT_OVERRIDES em rigger.py). Sempre gera keyframe
-#               denso (um por frame) -- não tem versão esparsa.
-#   IK       -- igual o CTRL_FK pra bones fora de cadeia; bones de
-#               braço/perna (armature.hytale_ik_chains, rigger.py) vão
-#               pro "_IK" da ponta (mão/pé) + pole target em vez do
-#               "_CTRL" por segmento. O pole é posicionado replicando a
-#               MESMA fórmula geométrica que o rigger.py usa na hora de
-#               gerar o rig (offset a partir do eixo Z do bone do meio da
-#               cadeia), só que com a orientação ANIMADA em vez da rest
-#               pose -- importante pra bater com o pole_angle já
-#               calibrado. A ponta (_IK) precisa de uma correção extra
-#               (_resolve_ik_tip_matrix_basis) porque sua rest orientation
-#               é diferente da do ORG/bridge (rigger.py ajusta tail/roll
-#               dela) -- ver o comentário grande ali se for mexer nisso.
-#   BOTH     -- CTRL_FK + IK juntos, na mesma passada -- todo bone recebe
-#               seu "_CTRL" (cadeia inclusive) E cada cadeia também recebe
-#               "_IK"+pole. fk_ik_switch fica em FK (0) por padrão; o
-#               animador troca por cadeia, a qualquer momento, sem
-#               reimportar.
+#   ORG  -- keyframa o bone ORIGINAL direto (mesmo nome do
+#           .blockymodel/.blockyanim). Funciona em QUALQUER Armature que
+#           tenha esses bones, rigada ou não -- é o modo genérico que
+#           precisa funcionar pra QUALQUER personagem/criatura do Hytale,
+#           não só o Player. Numa Armature COM rig gerado, os keyframes
+#           não movem nada visualmente (o ORG está constrained -- ver
+#           Hytale_ORG_to_MCH em rigger.py).
+#   CTRL -- escreve nos bones "_CTRL"/"_IK"/pole (rigger.py) em vez do
+#           ORG, calculando a pose de mundo pretendida (andando a
+#           hierarquia ORG) e reprojetando no PAI REAL de cada bone no
+#           Blender (pode ser diferente do pai ORG -- ver
+#           CTRL_PARENT_OVERRIDES em rigger.py). Três sub-opções
+#           INDEPENDENTES (ver _apply_ctrl_mode pra detalhes de cada
+#           uma):
+#             Spine -- Default (root.master_CTRL/root.pelvis_CTRL
+#                      seguem o Pelvis, ver _apply_root_follow) ou
+#                      Spine CTRL (ficam parados, root.spine_CTRL livre
+#                      pra ajuste manual).
+#             Arms/Legs (cada um independente, mesmas 3 opções) --
+#                      Default (FK+IK), Control FK, ou Control IK (ver
+#                      armature.hytale_ik_chains, rigger.py -- cada
+#                      cadeia tem um "chain_type" ARM/LEG que diz a qual
+#                      grupo ela pertence). Bones fora de cadeia nenhuma
+#                      (torso, cabeça, dedos, cauda) sempre vão por FK,
+#                      independente dessas opções.
+#           O pole é posicionado replicando a MESMA fórmula geométrica
+#           que o rigger.py usa na hora de gerar o rig (offset a partir
+#           do eixo Z do bone do meio da cadeia), só que com a
+#           orientação ANIMADA em vez da rest pose -- importante pra
+#           bater com o pole_angle já calibrado. A ponta (_IK) precisa
+#           de uma correção extra (_resolve_ik_tip_matrix_basis) porque
+#           sua rest orientation é diferente da do ORG/bridge (rigger.py
+#           ajusta tail/roll dela) -- ver o comentário grande ali se for
+#           mexer nisso.
 #
 # Bones _CTRL com constraint extra (ex: Belly_CTRL/Chest_CTRL seguindo
 # root.spine_CTRL via Hytale_SpineFollow) e os Child Of dos pole targets
-# são MUTADOS durante o import (nos modos CTRL_FK/IK/BOTH), a menos que
-# `keep_spine_follow=True` -- ver nota grande em _apply_ctrl_fk_mode.
+# ficam ATIVOS por padrão durante o import (Target=Controllers), a menos
+# que `keep_spine_follow=False` -- ver nota grande em _apply_ctrl_mode.
 # ---------------------------------------------------------------------------
 
 bl_info = {
@@ -68,7 +71,7 @@ bl_info = {
 
 import json
 import os
-from collections import deque
+from collections import deque, namedtuple
 
 import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
@@ -77,7 +80,17 @@ from bpy_extras.io_utils import ImportHelper
 from mathutils import Matrix, Quaternion, Vector
 
 from .common import FPS_HYTALE, UNIT_SCALE_DEFAULT, quat_xyzw, vec3
-from .rigger import PROP_FK_IK_SWITCH, PROP_RIG_LAYER, SUFFIX_CTRL, SUFFIX_IK, SUFFIX_MCH, SUFFIX_POLE
+from .rigger import (
+    BONE_ROOT_MASTER,
+    BONE_ROOT_PELVIS,
+    PROP_FK_IK_SWITCH,
+    PROP_RIG_LAYER,
+    SUFFIX_CTRL,
+    SUFFIX_IK,
+    SUFFIX_MCH,
+    SUFFIX_POLE,
+    SUFFIX_TAIL,
+)
 
 # ---------------------------------------------------------------------------
 # Matemática de import -- espelho EXATO (invertido) de compute_deltas() /
@@ -368,7 +381,8 @@ def _bake_orientation_samples(samples, start_frame, fps, cyclic):
 
 
 def _apply_org_mode(
-    operator, context, armature_obj, data, start_frame, action_name, loop_mode, bake_mode, keep_spine_follow
+    operator, context, armature_obj, data, start_frame, action_name, loop_mode, bake_mode, keep_spine_follow,
+    spine_mode="DEFAULT", arms_mode="BOTH", legs_mode="BOTH",
 ):
     """Modo ORG: keyframa os bones originais direto, sem passar por
     nenhuma camada de controle. Ver nota grande no topo do módulo sobre
@@ -376,10 +390,13 @@ def _apply_org_mode(
     cima), e por isso não precisamos de rest_matrices/pose_matrices
     nenhuma aqui -- só desfazer a conversão que compute_deltas() fez.
 
-    'keep_spine_follow' não se aplica a este modo (não existe camada de
-    controle/constraint nenhuma aqui) -- recebido só pra manter a
-    assinatura igual à de _apply_ctrl_fk_mode, já que o dispatch em
-    _MODE_HANDLERS chama todo handler com os MESMOS argumentos."""
+    'keep_spine_follow' e os 3 argumentos de Target=Controllers
+    (spine_mode/arms_mode/legs_mode) não se aplicam a este modo (não
+    existe camada de controle/constraint nenhuma aqui, e
+    root.master_CTRL/root.pelvis_CTRL/cadeias IK só existem na camada de
+    controle) -- recebidos só pra manter a assinatura igual à de
+    _apply_ctrl_mode, já que o dispatch em _MODE_HANDLERS chama todo
+    handler com os MESMOS argumentos."""
     scene = context.scene
     fps = scene.render.fps / scene.render.fps_base
 
@@ -394,14 +411,7 @@ def _apply_org_mode(
     # 24 FPS), o que costuma parecer "a animação ficou cortada/faltando o
     # resto" quando na verdade só ficou compactada. Avisamos aqui pra não
     # precisar descobrir isso na unha toda vez.
-    if round(fps) != FPS_HYTALE:
-        operator.report(
-            {"WARNING"},
-            f"Scene is at {fps:g} FPS, not {FPS_HYTALE}. The animation's timing will be scaled "
-            f"to match real-world duration, but will occupy far fewer Blender frames than the "
-            f"file's 'time' numbers suggest -- set Output Properties > Frame Rate to {FPS_HYTALE} "
-            f"for an exact 1:1 match with the .blockyanim file.",
-        )
+    _warn_if_fps_mismatch(operator, fps)
 
     node_animations = data["nodeAnimations"]
 
@@ -410,13 +420,7 @@ def _apply_org_mode(
     # "CYCLE"/"ONE_SHOT" forçam o comportamento independente do que o
     # arquivo declara, pros casos em que o valor do arquivo está errado/
     # ausente ou o usuário simplesmente quer testar o outro modo.
-    if loop_mode == "CYCLE":
-        hold_last = False
-    elif loop_mode == "ONE_SHOT":
-        hold_last = True
-    else:  # "AUTO"
-        hold_last = bool(data.get("holdLastKeyframe", False))
-    duration = data.get("duration")
+    hold_last, duration, _cyclic = _resolve_loop_settings(data, loop_mode)
 
     existing_names, missing_names = collect_target_bone_names(armature_obj, node_animations)
 
@@ -435,6 +439,7 @@ def _apply_org_mode(
     pose_bones = armature_obj.pose.bones
     bones_with_rotation = set()
     max_frame_seen = start_frame
+    warned_rotation_mode = set()
 
     for name in existing_names:
         channels = node_animations[name]
@@ -470,13 +475,7 @@ def _apply_org_mode(
             # avisamos se o bone estava em outro modo (Euler/Axis Angle),
             # porque isso muda como o bone é posado em qualquer outra
             # Action que já exista nele.
-            if pbone.rotation_mode != "QUATERNION":
-                operator.report(
-                    {"WARNING"},
-                    f"Bone '{name}' rotation mode was '{pbone.rotation_mode}' -- switched to "
-                    f"'QUATERNION' to import orientation keyframes.",
-                )
-                pbone.rotation_mode = "QUATERNION"
+            _ensure_quaternion_rotation(operator, pbone, warned_rotation_mode)
             bones_with_rotation.add(name)
 
             if bake_mode:
@@ -505,14 +504,7 @@ def _apply_org_mode(
     # sem avisar. Só estica, nunca encolhe (nunca mexe em frame_start:
     # como 'time' do arquivo nunca é negativo, o frame mínimo já é
     # sempre >= start_frame, então frame_start da cena não precisa mudar).
-    if scene.frame_end < max_frame_seen:
-        old_end = scene.frame_end
-        scene.frame_end = max_frame_seen
-        operator.report(
-            {"INFO"},
-            f"Scene Frame End was {old_end}, extended to {max_frame_seen} to fit the imported "
-            f"animation.",
-        )
+    _extend_scene_frame_end(operator, scene, max_frame_seen)
 
     if missing_names:
         operator.report(
@@ -647,12 +639,24 @@ def _bake_delta_lookup(pos_raw, rot_raw, start_frame, fps, cyclic):
     return lookup
 
 
-def _apply_ctrl_fk_mode(
-    operator, context, armature_obj, data, start_frame, action_name, loop_mode, bake_mode, keep_spine_follow
-):
-    scene = context.scene
-    fps = scene.render.fps / scene.render.fps_base
+# ---------------------------------------------------------------------------
+# Helpers compartilhados por CTRL_FK / IK / BOTH -- os três modos fazem
+# exatamente a mesma preparação (checagem de FPS, resolução de loop,
+# hierarquia ORG + delta_lookup, criação da Action), a mesma reprojeção de
+# matriz por bone (parent real _CTRL/_MCH/utilitário) e o mesmo pós-
+# processamento (escrever F-Curves, esticar Frame End, mutar/relatar
+# constraints extras). Extraído aqui pra não manter três cópias quase
+# idênticas -- cada modo só precisa fornecer a parte que É de fato
+# diferente: QUAIS bones escreve e COMO calcula o world_matrix de cada um.
+# ---------------------------------------------------------------------------
 
+
+def _warn_if_fps_mismatch(operator, fps):
+    """Aviso compartilhado pelos 4 modos (ORG incluso -- chamado à parte
+    lá) -- ver a explicação completa dentro de _apply_org_mode (docstring
+    histórica, mantida lá) sobre por que um FPS de cena != FPS_HYTALE
+    ainda é matematicamente correto, só não é 1:1 com os números do
+    arquivo."""
     if round(fps) != FPS_HYTALE:
         operator.report(
             {"WARNING"},
@@ -662,7 +666,12 @@ def _apply_ctrl_fk_mode(
             f"for an exact 1:1 match with the .blockyanim file.",
         )
 
-    node_animations = data["nodeAnimations"]
+
+def _resolve_loop_settings(data, loop_mode):
+    """loop_mode escolhido pelo usuário sobrescreve o que o ARQUIVO diz
+    (holdLastKeyframe) -- "AUTO" é o único que de fato lê o arquivo;
+    "CYCLE"/"ONE_SHOT" forçam o comportamento independente do que o
+    arquivo declara. Devolve (hold_last, duration, cyclic)."""
     if loop_mode == "CYCLE":
         hold_last = False
     elif loop_mode == "ONE_SHOT":
@@ -670,7 +679,29 @@ def _apply_ctrl_fk_mode(
     else:  # "AUTO"
         hold_last = bool(data.get("holdLastKeyframe", False))
     duration = data.get("duration")
-    cyclic = not hold_last
+    return hold_last, duration, not hold_last
+
+
+_ReprojectionSetup = namedtuple(
+    "_ReprojectionSetup",
+    ["scene", "fps", "hierarchy", "delta_lookup", "end_frame", "action", "pose_bones"],
+)
+
+
+def _prepare_reprojection_setup(operator, context, armature_obj, data, start_frame, action_name, loop_mode):
+    """Preparação compartilhada por CTRL_FK/IK/BOTH: valida FPS, resolve
+    hold_last/duration/cyclic, monta a hierarquia ORG + um lookup(frame)
+    de delta_local por bone (mesmo _org_hierarchy/_bake_delta_lookup que
+    cada modo usava separado), calcula end_frame e cria a Action de
+    destino. Devolve None (já reportando {'ERROR'}) se nenhum bone do
+    arquivo existir como ORG na armature -- chamador deve retornar
+    {'CANCELLED'} nesse caso."""
+    scene = context.scene
+    fps = scene.render.fps / scene.render.fps_base
+    _warn_if_fps_mismatch(operator, fps)
+
+    node_animations = data["nodeAnimations"]
+    hold_last, duration, cyclic = _resolve_loop_settings(data, loop_mode)
 
     hierarchy = _org_hierarchy(armature_obj)
     org_names_in_file = [name for name, _, _ in hierarchy if name in node_animations]
@@ -680,7 +711,7 @@ def _apply_ctrl_fk_mode(
             "None of the bones in this .blockyanim exist as original (ORG) bones on this "
             "armature -- wrong file, wrong armature, or the rig hasn't been generated yet?",
         )
-        return {"CANCELLED"}
+        return None
 
     # Lookup(frame) -> Matrix do delta_local, por bone ORG do arquivo, e o
     # frame mais alto realmente coberto por CADA UM (pro cálculo do range
@@ -703,162 +734,485 @@ def _apply_ctrl_fk_mode(
     anim_data = armature_obj.animation_data_create()
     anim_data.action = action
 
-    pose_bones = armature_obj.pose.bones
-    ctrl_values = {}  # {ctrl_name: [(frame, loc_Vector, quat_Quaternion), ...]}
-    ctrl_rest_cache = {}
-    warned_rotation_mode = set()
+    return _ReprojectionSetup(
+        scene=scene,
+        fps=fps,
+        hierarchy=hierarchy,
+        delta_lookup=delta_lookup,
+        end_frame=end_frame,
+        action=action,
+        pose_bones=armature_obj.pose.bones,
+    )
 
-    # Alguns bones _CTRL (ex: Belly_CTRL/Chest_CTRL, ver SPINE_FOLLOW_BONES
-    # em rigger.py) têm constraints EXTRAS por cima da hierarquia FK pura
-    # (ex: Copy Transforms parcial seguindo root.spine_CTRL, pensado pra
-    # facilitar posar à mão -- mexe na espinha e o peito/barriga
-    # acompanham sozinhos). O Blender aplica essas constraints DEPOIS de
-    # resolver matrix_basis, então o resultado final da pose vira uma
-    # MISTURA do que calculamos aqui (composição hierárquica pura) com o
-    # que a constraint está fazendo por cima -- o valor final não bate
-    # com o arquivo original. Por padrão (keep_spine_follow=False)
-    # silenciamos QUALQUER constraint nos bones _CTRL que vamos escrever
-    # (não hardcoding os nomes conhecidos do rigger.py -- genérico,
-    # funciona mesmo que o rig mude no futuro), já que o objetivo aqui é
-    # reproduzir fielmente a animação importada. Se keep_spine_follow for
-    # True, o usuário está escolhendo abrir mão dessa fidelidade em troca
-    # de manter o root.spine_CTRL como ferramenta de ajuste fino
-    # utilizável em cima da animação importada -- nesse caso não mexemos
-    # em constraint nenhuma.
-    muted_constraints = []
-    if not keep_spine_follow:
-        for name, _parent_name, _rest_local in hierarchy:
-            ctrl_pbone = pose_bones.get(name + SUFFIX_CTRL)
-            if ctrl_pbone is None:
-                continue
-            for con in ctrl_pbone.constraints:
-                if not con.mute:
-                    con.mute = True
-                    muted_constraints.append((ctrl_pbone.name, con.name))
 
-    for frame in range(start_frame, end_frame + 1):
-        world_target = {}
-        for name, parent_name, rest_local in hierarchy:
-            delta = delta_lookup[name](frame) if name in delta_lookup else Matrix.Identity(4)
-            parent_world = world_target[parent_name] if parent_name is not None else Matrix.Identity(4)
-            world_target[name] = parent_world @ rest_local @ delta
+def _compute_world_targets(hierarchy, delta_lookup, frame):
+    """Anda a hierarquia ORG inteira (pai antes de filho, já garantido
+    pela ordem de _org_hierarchy) pra um ÚNICO frame, devolvendo
+    {nome_org: Matrix de mundo pretendida}. Mesma composição usada pelos
+    três modos CTRL_FK/IK/BOTH."""
+    world_target = {}
+    for name, parent_name, rest_local in hierarchy:
+        delta = delta_lookup[name](frame) if name in delta_lookup else Matrix.Identity(4)
+        parent_world = world_target[parent_name] if parent_name is not None else Matrix.Identity(4)
+        world_target[name] = parent_world @ rest_local @ delta
+    return world_target
 
-        for name, _parent_name, _rest_local in hierarchy:
-            ctrl_name = name + SUFFIX_CTRL
-            ctrl_pbone = pose_bones.get(ctrl_name)
-            if ctrl_pbone is None:
-                continue
 
-            if ctrl_name not in ctrl_rest_cache:
-                ctrl_rest_cache[ctrl_name] = _rest_local_matrix(ctrl_pbone)
-            ctrl_rest_local = ctrl_rest_cache[ctrl_name]
+def _get_rest_local(pbone, rest_cache):
+    """Cache compartilhado de _rest_local_matrix, indexado por NOME de
+    pose bone -- funciona igual pra bone _CTRL, _IK da ponta, ou pole,
+    já que cada um tem um nome único na Armature."""
+    if pbone.name not in rest_cache:
+        rest_cache[pbone.name] = _rest_local_matrix(pbone)
+    return rest_cache[pbone.name]
 
-            ctrl_parent = ctrl_pbone.parent
-            if ctrl_parent is None:
-                ctrl_parent_world = Matrix.Identity(4)
-            elif ctrl_parent.name.endswith(SUFFIX_CTRL) and ctrl_parent.name[: -len(SUFFIX_CTRL)] in world_target:
-                ctrl_parent_world = world_target[ctrl_parent.name[: -len(SUFFIX_CTRL)]]
-            elif ctrl_parent.name.endswith(SUFFIX_MCH) and ctrl_parent.name[: -len(SUFFIX_MCH)] in world_target:
-                # Caso de attachments/filhos "de ponta" (dedos, sockets de
-                # arma etc.) que o rigger.py reparenta pro "_MCH" da ponta
-                # (ex: Hand_MCH) em vez do "_CTRL" (ex: Hand_CTRL) -- _MCH
-                # reflete o resultado final tanto em FK quanto em IK,
-                # diferente do _CTRL da ponta (só se move em FK). Sem este
-                # caso, um parent "_MCH" caía no "else" abaixo e usava a
-                # pose ESTÁTICA atual como referência, quebrando a
-                # importação desses bones (v0.5.1 -- ver rigger.py).
-                ctrl_parent_world = world_target[ctrl_parent.name[: -len(SUFFIX_MCH)]]
-            else:
-                # Bone utilitário (ex: root.pelvis_CTRL) ou _CTRL/_MCH de
-                # um bone ORG que não está neste arquivo -- assumimos que
-                # não está sendo animado por NADA neste import, então a
-                # pose ATUAL dele no Blender serve como referência fixa
-                # (ver nota grande acima do bloco CTRL_FK).
-                ctrl_parent_world = ctrl_parent.matrix.copy()
 
-            ctrl_local = ctrl_parent_world.inverted() @ world_target[name]
-            matrix_basis = ctrl_rest_local.inverted() @ ctrl_local
-            loc, quat, _scale = matrix_basis.decompose()
+def _resolve_parent_world(parent, world_target, rest_cache, pose_bones):
+    """Matriz de mundo do PARENT REAL (no Blender) de um bone de
+    controle/pole/ik-tip, pra reprojeção genérica de _resolve_matrix_basis
+    -- ver a derivação completa no comentário grande "Modo CTRL_FK" logo
+    acima de _rest_local_matrix.
 
-            if ctrl_pbone.rotation_mode != "QUATERNION":
-                if ctrl_name not in warned_rotation_mode:
-                    operator.report(
-                        {"WARNING"},
-                        f"Bone '{ctrl_name}' rotation mode was '{ctrl_pbone.rotation_mode}' -- "
-                        f"switched to 'QUATERNION' to import orientation keyframes.",
-                    )
-                    warned_rotation_mode.add(ctrl_name)
-                ctrl_pbone.rotation_mode = "QUATERNION"
+    Três casos, nessa ordem:
+      1) Parent termina em SUFFIX_CTRL e o bone ORG correspondente está
+         no world_target deste frame -- usa a pose ANIMADA desse ORG.
+         v0.6 (revisão): SE esse `_CTRL` pai tiver um bridge `_Tail`
+         (cadeia TAIL -- ver _build_tail_layer, rigger.py), a pose real
+         dele NÃO é `world_target[org_name]` -- é esse valor com a MESMA
+         correção de _resolve_ctrl_matrix_basis aplicada (ver lá a
+         derivação completa). Sem isso, cada segmento de uma cauda
+         encadeada (Tail2_CTRL filho de Tail_CTRL, filho de Tail_CTRL...)
+         herdava a referência ERRADA do segmento anterior e o erro ia
+         se acumulando bone a bone -- é exatamente por isso que só
+         corrigir a equação de CADA bone individualmente (a versão
+         anterior desta função) não bastava.
+      2) Parent termina em SUFFIX_MCH (idem, sem essa correção -- MCH
+         nunca é escrito diretamente por este importador, converge pro
+         world_target via constraint em tempo de execução, não por um
+         matrix_basis que a gente calcula aqui) -- caso de attachments/
+         filhos de ponta de cadeia que o rigger.py reparenta pro _MCH em
+         vez do _CTRL da ponta (ex: dedos, sockets de arma na mão): _MCH
+         é quem reflete o resultado final tanto em FK quanto em IK,
+         diferente do _CTRL da ponta (que só se move em FK).
+      3) Nenhum dos dois bateu (bone utilitário como root.pelvis_CTRL, ou
+         _CTRL/_MCH de um bone ORG que não está neste arquivo) -- assume
+         que não está sendo animado por NADA neste import, e usa a pose
+         ATUAL dele no Blender como referência fixa.
+    """
+    if parent is None:
+        return Matrix.Identity(4)
+    for suffix in (SUFFIX_CTRL, SUFFIX_MCH):
+        if parent.name.endswith(suffix):
+            org_name = parent.name[: -len(suffix)]
+            if org_name in world_target:
+                target = world_target[org_name]
+                if suffix == SUFFIX_CTRL:
+                    bridge_pbone = pose_bones.get(org_name + SUFFIX_TAIL)
+                    if bridge_pbone is not None:
+                        bridge_rest = _get_rest_local(bridge_pbone, rest_cache)
+                        return target @ bridge_rest.inverted()
+                return target
+    return parent.matrix.copy()
 
-            ctrl_values.setdefault(ctrl_name, []).append((frame, loc, quat))
 
-    for ctrl_name, samples in ctrl_values.items():
-        pos_samples = [(f, loc, "linear") for f, loc, _q in samples]
-        rot_samples = [(f, quat, "linear") for f, _loc, quat in samples]
-        _write_channel(action, f'pose.bones["{ctrl_name}"].location', ctrl_name, 3, pos_samples)
-        _write_channel(
-            action, f'pose.bones["{ctrl_name}"].rotation_quaternion', ctrl_name, 4, rot_samples
+def _resolve_matrix_basis(pbone, world_matrix, world_target, rest_cache, pose_bones):
+    """matrix_basis (o que pbone.location/rotation_quaternion representam)
+    que faz `pbone` ocupar `world_matrix` no espaço de mundo, reprojetando
+    através do PARENT REAL dele no Blender -- ver _resolve_parent_world.
+    NÃO usar pra ik_tip (mão/pé de uma cadeia) -- ver
+    _resolve_ik_tip_matrix_basis, motivo explicado lá."""
+    rest_local = _get_rest_local(pbone, rest_cache)
+    parent_world = _resolve_parent_world(pbone.parent, world_target, rest_cache, pose_bones)
+    local = parent_world.inverted() @ world_matrix
+    return rest_local.inverted() @ local
+
+
+def _resolve_ctrl_matrix_basis(ctrl_pbone, org_name, world_matrix, world_target, rest_cache, pose_bones):
+    """Wrapper de _resolve_matrix_basis pra um bone `_CTRL` -- igual à
+    versão genérica na grande maioria dos casos, EXCETO quando esse
+    `_CTRL` tem um bridge `_Tail` como filho de verdade (rigger.py,
+    HytaleIKChainItem.chain_type == 'TAIL', ver _build_tail_layer): nesse
+    caso, o rest do `_CTRL` foi deliberadamente desviado do rest do ORG
+    (redirecionado pro head do próximo segmento da cauda -- ver
+    SUFFIX_TAIL/_build_tail_layer, rigger.py), e é o BRIDGE quem
+    realmente precisa bater com a pose-alvo (é ele que o MCH copia, não
+    o `_CTRL` -- ver _build_tail_pose_constraints, rigger.py). Mesmo
+    princípio exato de _resolve_ik_tip_matrix_basis (mesmo comentário:
+    "aquela fórmula assume implicitamente que a rest do bone bate com a
+    orientação do que ele representa visualmente, o que não é verdade
+    aqui") -- só que aqui o bone com a rest "correta" (a do ORG) é um
+    FILHO do bone que estamos escrevendo, não o próprio.
+
+    Derivação (mesma notação de _resolve_ik_tip_matrix_basis, tudo em
+    espaço de armature): bridge.matrix = ctrl.matrix @ rest_local(bridge)
+    (bridge não tem pose própria, matrix_basis dele é sempre identidade),
+    e ctrl.matrix = parent_world @ rest_local(ctrl) @ matrix_basis.
+    Querendo bridge.matrix == world_matrix:
+
+        matrix_basis = rest_local(ctrl)⁻¹ @ parent_world⁻¹ @ world_matrix
+                        @ rest_local(bridge)⁻¹
+
+    Que é EXATAMENTE a fórmula genérica de _resolve_matrix_basis com um
+    "@ rest_local(bridge)⁻¹" a mais no final -- faz sentido: sem bridge
+    nenhum (a maioria dos `_CTRL` do rig), essa correção não existe e as
+    duas fórmulas são a mesma coisa. IMPORTANTE: como esse `_CTRL` mesmo
+    NÃO fica em `world_matrix` (só o bridge fica), qualquer FILHO deste
+    `_CTRL` (o próximo segmento da cauda) precisa saber disso também ao
+    calcular SUA PRÓPRIA referência de pai -- ver a mesma correção
+    espelhada em _resolve_parent_world."""
+    bridge_pbone = pose_bones.get(org_name + SUFFIX_TAIL)
+    if bridge_pbone is None:
+        return _resolve_matrix_basis(ctrl_pbone, world_matrix, world_target, rest_cache, pose_bones)
+    ctrl_rest = _get_rest_local(ctrl_pbone, rest_cache)
+    parent_world = _resolve_parent_world(ctrl_pbone.parent, world_target, rest_cache, pose_bones)
+    bridge_rest = _get_rest_local(bridge_pbone, rest_cache)
+    local = parent_world.inverted() @ world_matrix
+    return ctrl_rest.inverted() @ local @ bridge_rest.inverted()
+
+
+def _resolve_ik_tip_matrix_basis(ik_pbone, org_rest_world, world_matrix, rest_cache):
+    """A ponta de uma cadeia IK (_IK) tem uma rest orientation PRÓPRIA,
+    diferente da do bone ORG correspondente (rigger.py ajusta o
+    tail/roll dela pra apontar pra baixo, ou pro socket de attachment,
+    em vez de manter a orientação original do ORG -- ver o comentário em
+    _build_pose_constraints, rigger.py, sobre por que o bridge/_IK_MCH
+    usa a rest do ORG/MCH, não a do _IK, 'pra cópia não sair invertida').
+    Por isso NÃO dá pra reprojetar a pose-alvo direto nela com
+    _resolve_matrix_basis -- aquela fórmula assume implicitamente que a
+    rest do bone bate com a orientação do que ele representa
+    visualmente, o que não é verdade aqui.
+
+    A ponte real (bridge, _IK_MCH) é filha DE VERDADE do _IK (parent
+    real, não constraint), mas com a REST do ORG (por construção -- ver
+    create_bone_like em rigger.py/_build_ik_layer). Isso introduz uma
+    conjugação entre as duas rests que precisa ser desfeita aqui, ou o
+    resultado final sai visualmente girado errado. Derivação: querendo
+    que bridge.world == world_matrix, e sabendo que
+    bridge.world = ik.world @ (ik_rest⁻¹ @ org_rest_world) e
+    ik.world = ik_rest @ matrix_basis (sem parent), chega-se em:
+    matrix_basis = ik_rest⁻¹ @ world_matrix @ org_rest_world⁻¹ @ ik_rest."""
+    ik_rest = _get_rest_local(ik_pbone, rest_cache)  # sem parent -- já é a rest de mundo
+    return ik_rest.inverted() @ world_matrix @ org_rest_world.inverted() @ ik_rest
+
+
+def _compute_pole_world_matrix(chain, world_target):
+    """Réplica da MESMA fórmula geométrica que rigger.py usa pra
+    posicionar o pole na hora de gerar o rig (offset a partir do eixo Z
+    do bone de referência do meio da cadeia), só que usando a orientação
+    de mundo ANIMADA (world_target) em vez da rest pose -- ver a nota
+    grande no topo do arquivo (seção "CTRL" -- Arms/Legs) pra por que essa
+    convenção importa (pole_angle calibrado em cima dela). Devolve None
+    se o bone de referência não está no world_target deste frame."""
+    pole_ref_world = world_target.get(chain["pole_ref"])
+    if pole_ref_world is None:
+        return None
+    z_axis_world = pole_ref_world.to_3x3() @ Vector((0.0, 0.0, 1.0))
+    if z_axis_world.length < 1e-9:
+        z_axis_world = Vector((0.0, 0.0, 1.0))
+    z_axis_world.normalize()
+    sign = 1.0 if chain["pole_invert"] else -1.0
+    pole_world_pos = pole_ref_world.translation + z_axis_world * (chain["pole_distance"] * sign)
+    return Matrix.Translation(pole_world_pos)
+
+
+def _ensure_quaternion_rotation(operator, pbone, warned_set):
+    """Força rotation_mode='QUATERNION' (necessário pra escrever
+    rotation_quaternion) e avisa UMA VEZ por bone (via `warned_set`
+    compartilhado entre frames/bones do mesmo import) se o bone estava
+    em outro modo -- muda como qualquer OUTRA Action nesse bone é posada,
+    então vale avisar."""
+    if pbone.rotation_mode == "QUATERNION":
+        return
+    if pbone.name not in warned_set:
+        operator.report(
+            {"WARNING"},
+            f"Bone '{pbone.name}' rotation mode was '{pbone.rotation_mode}' -- switched to "
+            f"'QUATERNION' to import orientation keyframes.",
         )
+        warned_set.add(pbone.name)
+    pbone.rotation_mode = "QUATERNION"
 
+
+def _mute_constraints_on(pbones, muted_constraints):
+    """Muta toda constraint ainda ATIVA em cada pbone de `pbones`,
+    registrando (nome_do_bone, nome_da_constraint) em `muted_constraints`
+    -- genérico (não hardcoding nomes conhecidos do rigger.py), pra
+    continuar funcionando mesmo que o rig mude no futuro. Usado tanto
+    pra bones _CTRL com constraint extra (ex: Belly_CTRL/Chest_CTRL
+    seguindo root.spine_CTRL) quanto pros Child Of dos pole targets --
+    ver a nota grande "Modo CTRL_FK" acima de _rest_local_matrix
+    pro motivo de mutar em vez de deixar ativo."""
+    for pbone in pbones:
+        if pbone is None:
+            continue
+        for con in pbone.constraints:
+            if not con.mute:
+                con.mute = True
+                muted_constraints.append((pbone.name, con.name))
+
+
+def _write_pose_samples(action, target_values):
+    """Escreve, pra cada bone em `target_values`
+    ({bone_name: [(frame, loc_ou_None, quat_ou_None), ...]}), as F-Curves
+    de location (se houver amostra de posição) e rotation_quaternion (se
+    houver amostra de rotação) -- um pole target, por exemplo, só tem
+    loc (quat=None em toda amostra seguindo _resolve_matrix_basis, que
+    não é chamada pra rotação de pole)."""
+    for bone_name, samples in target_values.items():
+        pos_samples = [(f, loc, "linear") for f, loc, _q in samples if loc is not None]
+        rot_samples = [(f, quat, "linear") for f, _loc, quat in samples if quat is not None]
+        if pos_samples:
+            _write_channel(action, f'pose.bones["{bone_name}"].location', bone_name, 3, pos_samples)
+        if rot_samples:
+            _write_channel(action, f'pose.bones["{bone_name}"].rotation_quaternion', bone_name, 4, rot_samples)
+
+
+def _extend_scene_frame_end(operator, scene, end_frame):
+    """A cena (Frame End da Timeline) pode estar mais curta do que a
+    animação recém-importada -- se a gente não esticar isso, o EXPORT
+    (que sampleia dentro do range da cena) corta o final da animação sem
+    avisar. Só estica, nunca encolhe."""
     if scene.frame_end < end_frame:
         old_end = scene.frame_end
         scene.frame_end = end_frame
         operator.report(
-            {"INFO"}, f"Scene Frame End was {old_end}, extended to {end_frame} to fit the imported animation."
-        )
-
-    if muted_constraints:
-        affected_bones = sorted({bone_name for bone_name, _con_name in muted_constraints})
-        operator.report(
-            {"WARNING"},
-            f"Muted {len(muted_constraints)} extra constraint(s) on {len(affected_bones)} control "
-            f"bone(s) so the imported pose isn't blended with anything else (ex: spine-follow "
-            f"helpers) -- left muted after import; re-enable manually in Bone Constraint "
-            f"Properties if you want that behavior back for hand-animating: "
-            f"{', '.join(affected_bones[:8])}" + ("..." if len(affected_bones) > 8 else ""),
-        )
-    elif keep_spine_follow:
-        operator.report(
             {"INFO"},
-            "Kept spine-follow (and any other extra control-bone constraints) active, as requested "
-            "-- the imported pose on affected bones (ex: Belly/Chest) will differ slightly from the "
-            "source file wherever those constraints blend in root.spine_CTRL's current pose.",
+            f"Scene Frame End was {old_end}, extended to {end_frame} to fit the imported animation.",
         )
 
+
+def _report_muted_constraints(operator, muted_constraints, note):
+    """Relatório final de quais constraints extras foram mutadas (ver
+    _mute_constraints_on) -- `note` é o parêntese que diferencia o motivo
+    entre os modos (CTRL_FK só tem spine-follow; IK/BOTH também têm o
+    Child Of dos poles)."""
+    if not muted_constraints:
+        return
+    affected_bones = sorted({bone_name for bone_name, _con_name in muted_constraints})
+    operator.report(
+        {"WARNING"},
+        f"Muted {len(muted_constraints)} extra constraint(s) on {len(affected_bones)} bone(s) "
+        f"{note} so the imported pose isn't blended with anything else -- left muted after "
+        f"import; re-enable manually if you want that behavior back: "
+        f"{', '.join(affected_bones[:8])}" + ("..." if len(affected_bones) > 8 else ""),
+    )
+
+
 # ---------------------------------------------------------------------------
-# Modo IK: idêntico ao CTRL_FK pra bones que NÃO fazem parte de uma cadeia
-# de IK (tronco, cabeça, dedos etc. -- mesmo _CTRL, mesma composição de
-# hierarquia) -- a diferença é só nos bones de braço/perna, que em vez de
-# escrever em cada "_CTRL" por segmento, escrevem em DOIS bones só por
-# cadeia: a ponta (mão/pé, "_IK") e o pole target ("_Pole_CTRL").
+# root.master_CTRL / root.pelvis_CTRL (rigger.py) são bones UTILITÁRIOS --
+# não derivam de nenhum bone ORG por sufixo (ver _build_root_controls,
+# rigger.py), então NUNCA aparecem em `world_target` (que só tem entradas
+# pra bones da hierarquia ORG -- ver _org_hierarchy/_compute_world_targets)
+# e por consequência sempre caem no fallback "pose ATUAL/estática" de
+# _resolve_parent_world. Como as animações originais do Hytale só mexem em
+# Pelvis/Belly/Chest (nunca em nenhum bone "root.*"), isso significa que
+# root.master_CTRL/root.pelvis_CTRL ficam PARADOS durante o import inteiro
+# -- e tudo que pende deles de verdade no Blender (Pelvis_CTRL via
+# CTRL_PARENT_OVERRIDES, L-Thigh_CTRL, R-Thigh_CTRL, e Belly_CTRL no caso
+# do master) reprojeta contra essa base estática errada sempre que o
+# personagem se desloca (ex.: anda pra frente) -- o corpo inteiro fica
+# "preso" na origem em vez de andar junto com o Pelvis.
 #
-# A ponta é direta: o world_target que já calculamos pro bone ORG da mão
-# (mesmo world_target usado no modo CTRL_FK) é exatamente onde o "_IK" da
-# ponta precisa estar (a constraint IK do rig, já configurada pelo
-# rigger.py com use_tail=True, copia a orientação do alvo pro solver).
+# Fix (v0.7, controlado por 3 checkboxes independentes na UI --
+# root_master_follow_loc/root_master_follow_rot/root_pelvis_follow_rot):
+# faz Pelvis "emprestar" sua pose de mundo ANIMADA (já calculada em
+# world_target["Pelvis"], de graça, todo frame) pros bones raiz escolhidos
+# -- injetando ela em `world_target` sob a MESMA chave que
+# _resolve_parent_world já sabe procurar (nome do bone sem o "_CTRL").
 #
-# O pole target é a parte que precisava de matemática nova: NÃO dá pra
-# copiar rotação nenhuma (o solver de IK não usa a rotação do pole, só a
-# posição, pra definir o plano de dobra do cotovelo/joelho). Em vez
-# disso, replicamos a MESMA fórmula geométrica que o rigger.py usa pra
-# posicionar o pole na hora de gerar o rig (_pole_position: desloca a
-# partir do eixo Z do bone de referência do meio da cadeia -- ex:
-# Forearm/Calf -- por uma distância fixa, pra frente ou pra trás), só que
-# usando a orientação de mundo ANIMADA (world_target) desse bone em vez
-# da rest pose. Isso é importante: o pole_angle de cada cadeia já foi
-# calculado (uma vez, na hora de gerar o rig) especificamente pra
-# compensar ESSA convenção -- usar outra fórmula (ex: perpendicular à
-# linha ombro-mão) deixaria o cotovelo girado errado em torno do próprio
-# eixo, mesmo com o pole numa posição "razoável".
+# v0.7 (revisão -- fix da propagação): a v0.7 original só injetava
+# "root.master" (quando master seguia o Pelvis), mas NUNCA "root.pelvis"
+# -- então quando root.master_CTRL passava a se mover, root.pelvis_CTRL
+# (filho REAL dele, SEM keyframe próprio) também passava a se mover NA
+# PRÁTICA (herda rigidamente a pose do pai, no Blender de verdade), mas
+# nosso CÁLCULO de Pelvis_CTRL/L-Thigh_CTRL/R-Thigh_CTRL (filhos de
+# root.pelvis_CTRL) continuava assumindo que ele ficava PARADO -- um
+# descompasso entre "o que calculamos" e "o que vai acontecer de verdade
+# na hora de tocar a Action" que fazia esses bones saírem
+# deslocados/amplificados (a base se moveu, mas a conta achou que não).
 #
-# O pole target (e o "_IK" da ponta) não têm parent nenhum no Blender
-# ("ponta solta", ver rigger.py) -- então a reprojeção genérica que já
-# usamos no CTRL_FK simplifica sozinha pra esses dois (parent_world =
-# Identity). O pole também tem constraints "Child Of" (local, seguindo a
-# mão; global, seguindo um bone fixo) que, exatamente como o
-# Hytale_SpineFollow do Belly/Chest, atrapalhariam se deixadas ativas --
-# mutamos elas do mesmo jeito.
+# A correção: SEMPRE que root.master_CTRL efetivamente muda de pose
+# (por qualquer um dos dois toggles), propagamos esse efeito pra
+# root.pelvis_CTRL TAMBÉM (mesmo que ele não receba keyframe próprio --
+# ver _propagate_root_pelvis abaixo), computando a pose EFETIVA que ele
+# vai ter na prática (herdada rigidamente do master) e injetando ELA em
+# world_target. Isso garante que QUALQUER bone que reprojete contra
+# root.pelvis_CTRL (via _resolve_parent_world, que só olha o NOME/chave
+# em world_target, sem saber se veio de keyframe próprio ou de herança)
+# sempre bata com o que vai acontecer de verdade no Blender -- e por uma
+# identidade básica de álgebra linear (A @ (A⁻¹ @ B) = B, pra QUALQUER A
+# invertível), isso garante matematicamente que Pelvis_CTRL sempre acabe
+# ocupando world_target["Pelvis"] EXATAMENTE, sem duplicar/amplificar
+# nada -- não precisa (e não deve) zerar location manualmente em nenhum
+# desses bones, o valor correto já sai certo da conta.
+#
+# Pra qualquer outra função do arquivo, root.master_CTRL/root.pelvis_CTRL
+# passam a se comportar EXATAMENTE como se fossem o "_CTRL" de um bone ORG
+# animado -- nenhuma outra função (_resolve_parent_world,
+# _resolve_matrix_basis, _resolve_ctrl_matrix_basis) precisa saber disso;
+# elas continuam olhando só pro nome do parent real no Blender.
 # ---------------------------------------------------------------------------
+
+
+def _pelvis_delta(pelvis_world, pelvis_rest_world):
+    """Delta (translação + rotação) que o Pelvis sofreu desde a PRÓPRIA
+    rest dele neste frame -- decompõe world_target["Pelvis"] de volta pra
+    'o quanto ele se moveu', descartando a posição ABSOLUTA da rest do
+    Pelvis (que é bem mais baixa que a de root.master_CTRL -- ele nasce
+    na altura do "Belly", ver ROOT_MASTER_SOURCE em rigger.py). Aplicar
+    esse delta em cima da rest de QUALQUER outro bone preserva o offset
+    original entre os dois -- é isso que faz o "T-Pose" (delta zero,
+    "nodeAnimations" vazio) resultar em NENHUMA mudança pros bones raiz.
+
+    v0.7 (revisão -- fix da altura): a versão anterior usava a pose de
+    mundo ABSOLUTA do Pelvis como alvo direto de root.master_CTRL --
+    matematicamente isso ainda deixava Pelvis_CTRL/Belly_CTRL/etc.
+    corretos (ver nota grande acima de _apply_root_follow: qualquer bone
+    que reprojeta contra outro sempre bate no próprio alvo, não importa
+    que valor a gente escolha pro parent, DESDE QUE seja o MESMO usado
+    pra keyframar o parent) -- só que o PRÓPRIO root.master_CTRL acabava
+    visualmente errado (a rest dele fica na altura do Belly, bem acima
+    da rest do Pelvis -- usar a pose ABSOLUTA do Pelvis como alvo fazia
+    ele 'cair' pra altura do Pelvis mesmo numa animação com Y=0, isto é,
+    mesmo sem NENHUM movimento, ver T-Pose.blockyanim, que tem
+    "nodeAnimations" vazio). Usar o DELTA em vez da pose absoluta resolve
+    isso: T-Pose (delta identidade) não move nenhum bone raiz."""
+    return pelvis_rest_world.inverted() @ pelvis_world
+
+
+def _compose_delta_world(rest_world, delta, use_loc, use_rot):
+    """rest_world @ delta, com a TRANSLAÇÃO e/ou ROTAÇÃO do delta
+    zeradas conforme os toggles -- pra dar pra escolher independentemente
+    se cada componente do movimento (do Pelvis, ou já herdado de outro
+    bone raiz) é de fato aplicado."""
+    d_loc, d_quat, _d_scale = delta.decompose()
+    loc = d_loc if use_loc else Vector((0.0, 0.0, 0.0))
+    quat = d_quat if use_rot else Quaternion()
+    return rest_world @ (Matrix.Translation(loc) @ quat.to_matrix().to_4x4())
+
+
+def _apply_root_follow(
+    operator, frame, pose_bones, world_target, rest_cache, target_values, warned_rotation_mode,
+    root_master_follow_loc, root_master_follow_rot, root_pelvis_follow_rot,
+):
+    """Chamada UMA VEZ por frame, logo depois de `world_target` ser
+    calculado e ANTES do loop principal que escreve os `_CTRL` -- pra
+    quando esse loop chegar em Pelvis_CTRL/Belly_CTRL/L-Thigh_CTRL/
+    R-Thigh_CTRL (cujo parent REAL no Blender é root.pelvis_CTRL ou
+    root.master_CTRL -- ver CTRL_PARENT_OVERRIDES em rigger.py), a
+    injeção já esteja em `world_target` e a reprojeção genérica saia
+    certa sozinha. Ver a nota grande acima pra explicação completa.
+
+      root_master_follow_loc/root_master_follow_rot -- independentes:
+          root.master_CTRL passa a somar o DELTA de translação/rotação
+          do Pelvis (ver _pelvis_delta) em cima da PRÓPRIA rest dele
+          (o componente desligado fica parado na própria rest -- nunca
+          na do Pelvis). Escreve keyframe em root.master_CTRL só se PELO
+          MENOS UM dos dois estiver ligado.
+      root_pelvis_follow_rot -- root.pelvis_CTRL soma a ROTAÇÃO (delta)
+          do Pelvis em cima de onde quer que já tenha herdado do master
+          (rigidamente, via _compose_delta_world) -- NÃO existe opção de
+          location pra este bone (o pedido original já era só de rotação
+          aqui) -- se quiser posição do Pelvis nesta parte da cadeia, use
+          os toggles de master acima.
+
+    Devolve True se conseguiu injetar/escrever alguma coisa neste frame
+    (bone raiz encontrado e "Pelvis" presente no world_target), False
+    caso contrário -- usado pelo chamador pra decidir se vale reportar um
+    aviso no final (bone raiz ausente no rig, ou arquivo sem "Pelvis")."""
+    pelvis_world = world_target.get("Pelvis")
+    pelvis_pbone = pose_bones.get("Pelvis")
+    if pelvis_world is None or pelvis_pbone is None:
+        return False  # rig/arquivo sem bone "Pelvis" -- nada a fazer
+    pelvis_delta = _pelvis_delta(pelvis_world, pelvis_pbone.bone.matrix_local)
+
+    fired = False
+    master_pbone = pose_bones.get(BONE_ROOT_MASTER)
+    master_target_world = None  # None == master não foi tocado (fica na própria rest)
+
+    if master_pbone is not None and (root_master_follow_loc or root_master_follow_rot):
+        master_rest_world = master_pbone.bone.matrix_local
+        master_target_world = _compose_delta_world(
+            master_rest_world, pelvis_delta, root_master_follow_loc, root_master_follow_rot
+        )
+        world_target[BONE_ROOT_MASTER[: -len(SUFFIX_CTRL)]] = master_target_world
+        matrix_basis = _resolve_matrix_basis(master_pbone, master_target_world, world_target, rest_cache, pose_bones)
+        loc, quat, _scale = matrix_basis.decompose()
+        _ensure_quaternion_rotation(operator, master_pbone, warned_rotation_mode)
+        target_values.setdefault(master_pbone.name, []).append((frame, loc, quat))
+        fired = True
+
+    pelvis_ctrl_pbone = pose_bones.get(BONE_ROOT_PELVIS)
+    if pelvis_ctrl_pbone is not None and (master_target_world is not None or root_pelvis_follow_rot):
+        # Pose EFETIVA que root.pelvis_CTRL vai ter na prática, herdando
+        # rigidamente do parent real dele (que É root.master_CTRL neste
+        # rig -- ver _build_root_controls, rigger.py -- mas resolve
+        # genérico via _resolve_parent_world como salvaguarda, caso um
+        # rig futuro mude isso) -- SEM nenhuma pose própria ainda.
+        if master_target_world is not None and pelvis_ctrl_pbone.parent is master_pbone:
+            parent_world_for_pelvis = master_target_world
+        else:
+            parent_world_for_pelvis = _resolve_parent_world(
+                pelvis_ctrl_pbone.parent, world_target, rest_cache, pose_bones
+            )
+        pelvis_ctrl_rest_local = _get_rest_local(pelvis_ctrl_pbone, rest_cache)
+        inherited_world = parent_world_for_pelvis @ pelvis_ctrl_rest_local
+
+        if root_pelvis_follow_rot:
+            # Soma só a ROTAÇÃO (delta) do Pelvis em cima do que já foi
+            # herdado acima -- nunca a rotação ABSOLUTA dele, pelo mesmo
+            # motivo de _pelvis_delta (preservar a orientação própria
+            # que root.pelvis_CTRL já tinha herdado, em vez de saltar
+            # pra a do Pelvis).
+            pelvis_ctrl_target_world = _compose_delta_world(inherited_world, pelvis_delta, False, True)
+        else:
+            pelvis_ctrl_target_world = inherited_world
+
+        world_target[BONE_ROOT_PELVIS[: -len(SUFFIX_CTRL)]] = pelvis_ctrl_target_world
+
+        if root_pelvis_follow_rot:
+            # Só precisa de keyframe PRÓPRIO se tem uma pose própria de
+            # verdade (rotação extra) -- se for só herança rígida do
+            # master (root_pelvis_follow_rot=False), matrix_basis fica
+            # identidade e o Blender já resolve certo via parent real,
+            # sem precisar escrever nada aqui.
+            matrix_basis = _resolve_matrix_basis(
+                pelvis_ctrl_pbone, pelvis_ctrl_target_world, world_target, rest_cache, pose_bones
+            )
+            quat = matrix_basis.decompose()[1]
+            _ensure_quaternion_rotation(operator, pelvis_ctrl_pbone, warned_rotation_mode)
+            target_values.setdefault(pelvis_ctrl_pbone.name, []).append((frame, None, quat))
+        fired = True
+
+    return fired
+
+
+def _report_root_follow(operator, root_follow_enabled, root_follow_fired):
+    """Aviso final se algum toggle de Root Follow estava ligado mas nunca
+    chegou a injetar/escrever nada em NENHUM frame (bone raiz ausente no
+    rig -- ex.: rig gerado com uma versão antiga do rigger.py -- ou
+    arquivo sem bone "Pelvis")."""
+    if not root_follow_enabled or root_follow_fired:
+        return
+    operator.report(
+        {"WARNING"},
+        f"Root Follow was enabled but '{BONE_ROOT_MASTER}'/'{BONE_ROOT_PELVIS}' and/or 'Pelvis' "
+        f"weren't found -- skipped, no keyframes written for the root control bone(s). Was the "
+        f"rig generated with a version of rigger.py that has root.master_CTRL/root.pelvis_CTRL?",
+    )
+
+
+# Spine "Default (Root CTRL)" vs "Spine CTRL" (UI, IMPORT_OT_hytale_blockyanim.spine_mode)
+# traduz direto pros 3 toggles de _apply_root_follow -- (loc, rot, pelvis_rot).
+# "DEFAULT" é a combinação validada como a melhor em testes reais no
+# Blender (root.master_CTRL segue loc+rot do Pelvis; root.pelvis_CTRL sem
+# rotação própria extra); "MANUAL" desliga tudo (root.master_CTRL/
+# root.pelvis_CTRL ficam parados, root.spine_CTRL livre pra ajuste manual
+# -- ver descrição da propriedade).
+_SPINE_MODE_ROOT_FOLLOW = {
+    "DEFAULT": (True, True, False),
+    "MANUAL": (False, False, False),
+}
 
 
 def _org_path(hierarchy, root_name, tip_name):
@@ -866,7 +1220,11 @@ def _org_path(hierarchy, root_name, tip_name):
     mesma ideia de find_org_path() em rigger.py (usada lá pra gerar o
     rig, sobre edit bones), só que aqui sobre `hierarchy` (a mesma
     estrutura que _org_hierarchy() já devolve), pra não precisar de Edit
-    Mode nenhum durante o import."""
+    Mode nenhum durante o import.
+
+    NOTA: esta função tinha sido apagada por acidente numa edição em
+    bloco anterior (mesmo acidente de _resolve_ik_chains, ver nota lá) --
+    restaurada aqui."""
     if root_name == tip_name:
         return None
     children = {}
@@ -894,9 +1252,29 @@ def _resolve_ik_chains(armature_obj, hierarchy):
     """Lê armature.hytale_ik_chains e resolve cada item nos nomes de bone
     REAIS que vamos precisar -- mesma resolução que rigger.py faz na hora
     de gerar o rig (_resolve_chains), mas devolvendo só nomes/valores (não
-    precisamos de Edit Mode aqui, só ler o que já existe)."""
+    precisamos de Edit Mode aqui, só ler o que já existe).
+
+    Só entradas ARM/LEG (item.chain_type) -- cadeias TAIL não têm IK
+    nenhum (não existe bone "_IK" nem "_Pole_CTRL" pra elas -- ver
+    _build_tail_layer, rigger.py), então tratá-las aqui geraria nomes de
+    bone que nunca existem. Cadeias TAIL sempre passam pelo caminho
+    _CTRL normal (ver _resolve_ctrl_matrix_basis), em QUALQUER
+    configuração de Arms/Legs -- essas opções só decidem isso pra bones
+    que estão de fato numa cadeia de IK.
+
+    `"group"` ("ARM"/"LEG", direto de item.chain_type) é o que permite a
+    UI configurar Arms e Legs INDEPENDENTEMENTE (ver _apply_ctrl_mode) --
+    cada cadeia usa o modo do PRÓPRIO grupo, não um modo global único
+    pra tudo.
+
+    NOTA: esta função tinha sido apagada por acidente numa edição em
+    bloco anterior (estava fisicamente entre as antigas
+    _apply_ctrl_fk_mode/_apply_ik_mode, faixa de linhas substituída de
+    uma vez só por _apply_ctrl_mode) -- restaurada aqui."""
     chains = []
     for item in armature_obj.data.hytale_ik_chains:
+        if item.chain_type == "TAIL":
+            continue
         if not item.root_bone or not item.tip_bone:
             continue
         path = _org_path(hierarchy, item.root_bone, item.tip_bone)
@@ -906,6 +1284,7 @@ def _resolve_ik_chains(armature_obj, hierarchy):
         chains.append(
             {
                 "label": item.label or item.root_bone,
+                "group": "LEG" if item.chain_type == "LEG" else "ARM",
                 "org_names": path,
                 "ik_tip": path[-1] + SUFFIX_IK,
                 "pole": path[0] + SUFFIX_POLE,
@@ -917,508 +1296,196 @@ def _resolve_ik_chains(armature_obj, hierarchy):
     return chains
 
 
-def _apply_ik_mode(
-    operator, context, armature_obj, data, start_frame, action_name, loop_mode, bake_mode, keep_spine_follow
+def _apply_ctrl_mode(
+    operator, context, armature_obj, data, start_frame, action_name, loop_mode, bake_mode, keep_spine_follow,
+    spine_mode="DEFAULT", arms_mode="BOTH", legs_mode="BOTH",
 ):
-    scene = context.scene
-    fps = scene.render.fps / scene.render.fps_base
+    """Target = Controllers -- unifica o que antes eram três modos
+    globais separados (CTRL_FK/IK/BOTH) numa função só, porque agora
+    Arms e Legs podem estar em modos DIFERENTES ao mesmo tempo (ex.:
+    braço em Control IK, perna em Default FK+IK) -- não faz mais sentido
+    ter uma cadeia "de modo global" quando cada GRUPO de cadeia decide o
+    próprio comportamento (ver `chain["group"]`, _resolve_ik_chains).
 
-    if round(fps) != FPS_HYTALE:
-        operator.report(
-            {"WARNING"},
-            f"Scene is at {fps:g} FPS, not {FPS_HYTALE}. The animation's timing will be scaled "
-            f"to match real-world duration, but will occupy far fewer Blender frames than the "
-            f"file's 'time' numbers suggest -- set Output Properties > Frame Rate to {FPS_HYTALE} "
-            f"for an exact 1:1 match with the .blockyanim file.",
-        )
-
-    node_animations = data["nodeAnimations"]
-    if loop_mode == "CYCLE":
-        hold_last = False
-    elif loop_mode == "ONE_SHOT":
-        hold_last = True
-    else:  # "AUTO"
-        hold_last = bool(data.get("holdLastKeyframe", False))
-    duration = data.get("duration")
-    cyclic = not hold_last
-
-    hierarchy = _org_hierarchy(armature_obj)
-    org_names_in_file = [name for name, _, _ in hierarchy if name in node_animations]
-    if not org_names_in_file:
-        operator.report(
-            {"ERROR"},
-            "None of the bones in this .blockyanim exist as original (ORG) bones on this "
-            "armature -- wrong file, wrong armature, or the rig hasn't been generated yet?",
-        )
+    spine_mode -- "DEFAULT" ou "MANUAL" (ver _SPINE_MODE_ROOT_FOLLOW
+        logo abaixo) -- controla só como root.master_CTRL/
+        root.pelvis_CTRL se comportam (ver _apply_root_follow). Pelvis/
+        Belly/Chest são sempre keyframados normalmente, nos dois casos.
+    arms_mode/legs_mode -- "BOTH" (Default FK+IK), "CTRL_FK" (Control
+        FK) ou "IK" (Control IK) -- aplicado independentemente às
+        cadeias de cada grupo (chain["group"] == "ARM"/"LEG"):
+          "BOTH"    -- cadeia recebe FK (_CTRL por segmento, INCLUSIVE
+                       os da cadeia) E IK (ponta + pole) ao mesmo tempo;
+                       fk_ik_switch fica fixo em FK (0), trocável depois.
+          "CTRL_FK" -- só FK (_CTRL por segmento) -- fk_ik_switch não é
+                       tocado (a cadeia nem recebe bone "_IK" nenhum).
+          "IK"      -- só IK (ponta + pole) -- os _CTRL dos segmentos
+                       da cadeia são PULADOS (não recebem keyframe);
+                       fk_ik_switch fica fixo em IK (1).
+    Bones fora de qualquer cadeia (torso, cabeça, dedos, cauda etc.)
+    sempre recebem FK via _CTRL, independente de qualquer uma dessas
+    3 opções -- elas só afetam braços/pernas/raiz."""
+    setup = _prepare_reprojection_setup(operator, context, armature_obj, data, start_frame, action_name, loop_mode)
+    if setup is None:
         return {"CANCELLED"}
+    scene, fps, hierarchy, delta_lookup, end_frame, action, pose_bones = setup
 
     chains = _resolve_ik_chains(armature_obj, hierarchy)
-    chain_bone_names = {name for chain in chains for name in chain["org_names"]}
+    group_mode = {"ARM": arms_mode, "LEG": legs_mode}
+    for chain in chains:
+        chain["mode"] = group_mode.get(chain["group"], "BOTH")
 
-    delta_lookup = {}
-    max_time = 0
-    for name in org_names_in_file:
-        channels = node_animations[name]
-        for ch in ("position", "orientation"):
-            for s in channels.get(ch, []):
-                max_time = max(max_time, s["time"])
-        pos_raw = _looped_samples(channels.get("position", []), hold_last, duration)
-        rot_raw = _looped_samples(channels.get("orientation", []), hold_last, duration)
-        delta_lookup[name] = _bake_delta_lookup(pos_raw, rot_raw, start_frame, fps, cyclic)
-    if cyclic and duration is not None:
-        max_time = max(max_time, duration)
-    end_frame = hytale_time_to_frame(max_time, start_frame, fps)
+    # Cadeias 100% IK pulam o loop de FK (_CTRL por segmento); as outras
+    # (BOTH/CTRL_FK) passam por ele normalmente, igual bone fora de
+    # cadeia nenhuma.
+    chain_bone_names_skip_fk = {
+        name for chain in chains if chain["mode"] == "IK" for name in chain["org_names"]
+    }
+    # Só cadeias BOTH/IK recebem ponta (_IK) + pole.
+    ik_chains = [chain for chain in chains if chain["mode"] in ("BOTH", "IK")]
 
-    action = bpy.data.actions.new(action_name)
-    anim_data = armature_obj.animation_data_create()
-    anim_data.action = action
-
-    pose_bones = armature_obj.pose.bones
     target_values = {}  # {bone_name: [(frame, loc_or_None, quat_or_None), ...]}
-    target_rest_cache = {}
+    rest_cache = {}
     warned_rotation_mode = set()
 
-    def _rest_local(name):
-        if name not in target_rest_cache:
-            target_rest_cache[name] = _rest_local_matrix(pose_bones[name])
-        return target_rest_cache[name]
-
-    def _resolve_matrix_basis(pbone, world_matrix):
-        """Mesma reprojeção genérica do CTRL_FK (ver nota grande lá em
-        cima) -- funciona igual pra bone _CTRL ou pole, porque só depende
-        do parent REAL do bone no Blender. NÃO usar pra ik_tip (mão/pé) --
-        ver _resolve_ik_tip_matrix_basis logo abaixo, motivo explicado
-        lá."""
-        rest_local = _rest_local(pbone.name)
-        parent = pbone.parent
-        if parent is None:
-            parent_world = Matrix.Identity(4)
-        elif parent.name.endswith(SUFFIX_CTRL) and parent.name[: -len(SUFFIX_CTRL)] in world_target:
-            parent_world = world_target[parent.name[: -len(SUFFIX_CTRL)]]
-        elif parent.name.endswith(SUFFIX_MCH) and parent.name[: -len(SUFFIX_MCH)] in world_target:
-            # Caso de attachments/dedos reparentados pro "_MCH" da ponta
-            # pelo rigger.py (ver o mesmo caso em _apply_ctrl_fk_mode,
-            # comentário completo lá) -- v0.5.1.
-            parent_world = world_target[parent.name[: -len(SUFFIX_MCH)]]
-        else:
-            parent_world = parent.matrix.copy()
-        local = parent_world.inverted() @ world_matrix
-        return rest_local.inverted() @ local
-
-    def _resolve_ik_tip_matrix_basis(ik_pbone, org_rest_world, world_matrix):
-        """A ponta de uma cadeia IK (_IK) tem uma rest orientation
-        PRÓPRIA, diferente da do bone ORG correspondente (rigger.py
-        ajusta o tail/roll do '_IK' da ponta pra apontar pra baixo, ou
-        pro socket de attachment, em vez de manter a orientação original
-        do ORG -- ver o comentário em _build_pose_constraints sobre por
-        que o bridge/_IK_MCH usa a rest do ORG/MCH, não a do _IK, 'pra
-        cópia não sair invertida'). Por isso NÃO dá pra reprojetar a
-        pose-alvo direto nele com _resolve_matrix_basis -- aquela fórmula
-        assume implicitamente que a rest do bone bate com a orientação do
-        que ele representa visualmente, o que não é verdade aqui.
-
-        A ponte real (bridge, _IK_MCH) é filha DE VERDADE do _IK (parent
-        real, não constraint), mas com a REST do ORG (por construção --
-        ver create_bone_like em rigger.py/_build_ik_layer). Isso introduz
-        uma conjugação entre as duas rests que precisa ser desfeita aqui,
-        ou o resultado final sai visualmente girado errado -- exatamente
-        o 'invertido, Y pra baixo' reportado. Derivação: querendo que
-        bridge.world == world_matrix, e sabendo que
-        bridge.world = ik.world @ (ik_rest⁻¹ @ org_rest_world) e
-        ik.world = ik_rest @ matrix_basis (sem parent), chega-se em:
-        matrix_basis = ik_rest⁻¹ @ world_matrix @ org_rest_world⁻¹ @ ik_rest."""
-        ik_rest = _rest_local(ik_pbone.name)  # sem parent -- já é a rest de mundo
-        return ik_rest.inverted() @ world_matrix @ org_rest_world.inverted() @ ik_rest
-
-    # Muta constraints extras nos bones que vamos escrever (mesma lógica
-    # do CTRL_FK -- ver nota grande lá): bones NÃO-cadeia via _CTRL
-    # (ex: Belly/Chest + SpineFollow), e agora também os poles (Child Of
-    # local/global, ver nota grande deste bloco).
+    # Muta constraints extras nos bones que vamos escrever via FK (mesma
+    # lógica de sempre -- ver nota grande acima de _apply_root_follow):
+    # bones fora das cadeias 100% IK (ex: Belly/Chest + SpineFollow), e
+    # os poles de toda cadeia que vai receber IK (Child Of local/global).
     muted_constraints = []
     if not keep_spine_follow:
-        for name, _parent_name, _rest_local_mat in hierarchy:
-            if name in chain_bone_names:
-                continue  # esses não recebem _CTRL neste modo -- ver abaixo
-            ctrl_pbone = pose_bones.get(name + SUFFIX_CTRL)
-            if ctrl_pbone is None:
-                continue
-            for con in ctrl_pbone.constraints:
-                if not con.mute:
-                    con.mute = True
-                    muted_constraints.append((ctrl_pbone.name, con.name))
-    for chain in chains:
-        pole_pbone = pose_bones.get(chain["pole"])
-        if pole_pbone is None:
-            continue
-        for con in pole_pbone.constraints:
-            if not con.mute:
-                con.mute = True
-                muted_constraints.append((pole_pbone.name, con.name))
+        _mute_constraints_on(
+            (
+                pose_bones.get(name + SUFFIX_CTRL)
+                for name, _parent_name, _rest_local in hierarchy
+                if name not in chain_bone_names_skip_fk
+            ),
+            muted_constraints,
+        )
+    _mute_constraints_on((pose_bones.get(chain["pole"]) for chain in ik_chains), muted_constraints)
 
-    # Liga o switch FK/IK de cada cadeia pro modo IK -- valor FIXO, não
-    # animado por frame (ver relatório final).
+    # fk_ik_switch: IK-only -> fixo em 1; BOTH -> fixo em 0 (default FK,
+    # trocável depois); CTRL_FK-only nem entra em `ik_chains`, então nem
+    # recebe bone "_IK" nenhum -- não há switch pra tocar.
     tip_org_rest_world = {}
-    for chain in chains:
+    for chain in ik_chains:
         ik_pbone = pose_bones.get(chain["ik_tip"])
         if ik_pbone is not None:
-            ik_pbone[PROP_FK_IK_SWITCH] = 1
+            ik_pbone[PROP_FK_IK_SWITCH] = 1 if chain["mode"] == "IK" else 0
             tip_org_rest_world[chain["ik_tip"]] = pose_bones[chain["org_names"][-1]].bone.matrix_local.copy()
 
-    for frame in range(start_frame, end_frame + 1):
-        world_target = {}
-        for name, parent_name, rest_local in hierarchy:
-            delta = delta_lookup[name](frame) if name in delta_lookup else Matrix.Identity(4)
-            parent_world = world_target[parent_name] if parent_name is not None else Matrix.Identity(4)
-            world_target[name] = parent_world @ rest_local @ delta
+    root_master_follow_loc, root_master_follow_rot, root_pelvis_follow_rot = _SPINE_MODE_ROOT_FOLLOW[spine_mode]
 
-        # Bones fora de qualquer cadeia: exatamente o modo CTRL_FK.
-        for name, _parent_name, _rest_local_mat in hierarchy:
-            if name in chain_bone_names:
+    root_follow_fired = False
+    for frame in range(start_frame, end_frame + 1):
+        world_target = _compute_world_targets(hierarchy, delta_lookup, frame)
+
+        if _apply_root_follow(
+            operator, frame, pose_bones, world_target, rest_cache, target_values, warned_rotation_mode,
+            root_master_follow_loc, root_master_follow_rot, root_pelvis_follow_rot,
+        ):
+            root_follow_fired = True
+
+        # FK: todo bone FORA das cadeias 100% IK (torso/cabeça/dedos/
+        # cauda sempre passam por aqui, e também os segmentos de
+        # cadeias BOTH/CTRL_FK).
+        for name, _parent_name, _rest_local in hierarchy:
+            if name in chain_bone_names_skip_fk:
                 continue
             ctrl_pbone = pose_bones.get(name + SUFFIX_CTRL)
             if ctrl_pbone is None:
                 continue
-            matrix_basis = _resolve_matrix_basis(ctrl_pbone, world_target[name])
+            matrix_basis = _resolve_ctrl_matrix_basis(ctrl_pbone, name, world_target[name], world_target, rest_cache, pose_bones)
             loc, quat, _scale = matrix_basis.decompose()
-            if ctrl_pbone.rotation_mode != "QUATERNION":
-                if ctrl_pbone.name not in warned_rotation_mode:
-                    operator.report(
-                        {"WARNING"},
-                        f"Bone '{ctrl_pbone.name}' rotation mode was '{ctrl_pbone.rotation_mode}' -- "
-                        f"switched to 'QUATERNION' to import orientation keyframes.",
-                    )
-                    warned_rotation_mode.add(ctrl_pbone.name)
-                ctrl_pbone.rotation_mode = "QUATERNION"
+            _ensure_quaternion_rotation(operator, ctrl_pbone, warned_rotation_mode)
             target_values.setdefault(ctrl_pbone.name, []).append((frame, loc, quat))
 
-        # Cadeias: ponta (mão/pé) + pole.
-        for chain in chains:
+        # IK: ponta (mão/pé) + pole, só das cadeias BOTH/IK.
+        for chain in ik_chains:
             tip_org_name = chain["org_names"][-1]
             ik_pbone = pose_bones.get(chain["ik_tip"])
             if ik_pbone is not None:
                 matrix_basis = _resolve_ik_tip_matrix_basis(
-                    ik_pbone, tip_org_rest_world[chain["ik_tip"]], world_target[tip_org_name]
+                    ik_pbone, tip_org_rest_world[chain["ik_tip"]], world_target[tip_org_name], rest_cache
                 )
                 loc, quat, _scale = matrix_basis.decompose()
-                if ik_pbone.rotation_mode != "QUATERNION":
-                    if ik_pbone.name not in warned_rotation_mode:
-                        operator.report(
-                            {"WARNING"},
-                            f"Bone '{ik_pbone.name}' rotation mode was '{ik_pbone.rotation_mode}' -- "
-                            f"switched to 'QUATERNION' to import orientation keyframes.",
-                        )
-                        warned_rotation_mode.add(ik_pbone.name)
-                    ik_pbone.rotation_mode = "QUATERNION"
+                _ensure_quaternion_rotation(operator, ik_pbone, warned_rotation_mode)
                 target_values.setdefault(ik_pbone.name, []).append((frame, loc, quat))
 
             pole_pbone = pose_bones.get(chain["pole"])
             if pole_pbone is not None:
-                pole_ref_world = world_target.get(chain["pole_ref"])
-                if pole_ref_world is not None:
-                    z_axis_world = pole_ref_world.to_3x3() @ Vector((0.0, 0.0, 1.0))
-                    if z_axis_world.length < 1e-9:
-                        z_axis_world = Vector((0.0, 0.0, 1.0))
-                    z_axis_world.normalize()
-                    sign = 1.0 if chain["pole_invert"] else -1.0
-                    pole_world_pos = pole_ref_world.translation + z_axis_world * (chain["pole_distance"] * sign)
-                    pole_world_matrix = Matrix.Translation(pole_world_pos)
-                    matrix_basis = _resolve_matrix_basis(pole_pbone, pole_world_matrix)
+                pole_world_matrix = _compute_pole_world_matrix(chain, world_target)
+                if pole_world_matrix is not None:
+                    matrix_basis = _resolve_matrix_basis(pole_pbone, pole_world_matrix, world_target, rest_cache, pose_bones)
                     loc = matrix_basis.decompose()[0]
-                    # Só posição importa pro pole (o solver de IK usa a
-                    # localização dele, não a rotação) -- não mexemos em
-                    # rotation_quaternion, só location.
                     target_values.setdefault(pole_pbone.name, []).append((frame, loc, None))
 
-    for bone_name, samples in target_values.items():
-        pos_samples = [(f, loc, "linear") for f, loc, _q in samples if loc is not None]
-        rot_samples = [(f, quat, "linear") for f, _loc, quat in samples if quat is not None]
-        if pos_samples:
-            _write_channel(action, f'pose.bones["{bone_name}"].location', bone_name, 3, pos_samples)
-        if rot_samples:
-            _write_channel(
-                action, f'pose.bones["{bone_name}"].rotation_quaternion', bone_name, 4, rot_samples
-            )
+    _write_pose_samples(action, target_values)
+    _extend_scene_frame_end(operator, scene, end_frame)
+    _report_muted_constraints(
+        operator, muted_constraints, "(control bones with extra blend constraints, and IK pole targets' Child Of)"
+    )
+    _report_root_follow(operator, spine_mode == "DEFAULT", root_follow_fired)
 
-    if scene.frame_end < end_frame:
-        old_end = scene.frame_end
-        scene.frame_end = end_frame
-        operator.report(
-            {"INFO"}, f"Scene Frame End was {old_end}, extended to {end_frame} to fit the imported animation."
-        )
-
-    if muted_constraints:
-        affected_bones = sorted({bone_name for bone_name, _con_name in muted_constraints})
+    arm_chains = [chain for chain in chains if chain["group"] == "ARM"]
+    leg_chains = [chain for chain in chains if chain["group"] == "LEG"]
+    if arms_mode in ("BOTH", "IK") and not arm_chains:
         operator.report(
             {"WARNING"},
-            f"Muted {len(muted_constraints)} extra constraint(s) on {len(affected_bones)} bone(s) "
-            f"(control bones with extra blend constraints, and IK pole targets' Child Of) so the "
-            f"imported pose isn't blended with anything else -- left muted after import; "
-            f"re-enable manually if you want that behavior back: "
-            f"{', '.join(affected_bones[:8])}" + ("..." if len(affected_bones) > 8 else ""),
+            "Arms is set to use IK, but no 'Arm'-type chain was found on this armature "
+            "(armature.hytale_ik_chains) -- nothing written for arms via IK.",
         )
-
-    if not chains:
+    if legs_mode in ("BOTH", "IK") and not leg_chains:
         operator.report(
             {"WARNING"},
-            "No IK chains found on this armature (armature.hytale_ik_chains is empty) -- imported "
-            "everything via FK control bones instead, same as Control Bones (FK) mode.",
+            "Legs is set to use IK, but no 'Leg'-type chain was found on this armature "
+            "(armature.hytale_ik_chains) -- nothing written for legs via IK.",
         )
 
     non_chain_ctrl_count = sum(
         1 for name in target_values if not any(name == chain["ik_tip"] or name == chain["pole"] for chain in chains)
     )
+    mode_label = {"BOTH": "FK+IK", "CTRL_FK": "FK only", "IK": "IK only"}
     operator.report(
         {"INFO"},
-        f"Imported '{action.name}' -- {len(chains)} IK chain(s) (hand/foot + pole), "
-        f"{non_chain_ctrl_count} other control bone(s), {end_frame - start_frame + 1} frame(s) "
-        f"each. fk_ik_switch was set to 1 (IK) on affected chains -- not keyframed, just set as a "
-        f"fixed value.",
+        f"Imported '{action.name}' -- Spine: {'root controllers follow Pelvis' if spine_mode == 'DEFAULT' else 'Pelvis/Belly/Chest only, root.spine_CTRL free for manual tweaks'}; "
+        f"Arms: {mode_label[arms_mode]} ({len(arm_chains)} chain(s)); "
+        f"Legs: {mode_label[legs_mode]} ({len(leg_chains)} chain(s)); "
+        f"{non_chain_ctrl_count} other control bone(s); {end_frame - start_frame + 1} frame(s) each.",
     )
     return {"FINISHED"}
 
 
-# ---------------------------------------------------------------------------
-# Modo BOTH: literalmente CTRL_FK + IK juntos, na MESMA passada (evita
-# andar a hierarquia duas vezes). Escreve _CTRL em TODO bone -- inclusive
-# os de cadeia (diferente do modo IK puro, que pula eles) -- E TAMBÉM a
-# ponta/pole de cada cadeia. Os dois conjuntos de keyframe ficam
-# presentes ao mesmo tempo; fk_ik_switch de cada cadeia fica em FK (0)
-# por padrão, e o animador troca (por cadeia, a qualquer momento) pra
-# usar a versão IK -- sem precisar reimportar nada.
-# ---------------------------------------------------------------------------
-
-
-def _apply_both_mode(
-    operator, context, armature_obj, data, start_frame, action_name, loop_mode, bake_mode, keep_spine_follow
-):
-    scene = context.scene
-    fps = scene.render.fps / scene.render.fps_base
-
-    if round(fps) != FPS_HYTALE:
-        operator.report(
-            {"WARNING"},
-            f"Scene is at {fps:g} FPS, not {FPS_HYTALE}. The animation's timing will be scaled "
-            f"to match real-world duration, but will occupy far fewer Blender frames than the "
-            f"file's 'time' numbers suggest -- set Output Properties > Frame Rate to {FPS_HYTALE} "
-            f"for an exact 1:1 match with the .blockyanim file.",
-        )
-
-    node_animations = data["nodeAnimations"]
-    if loop_mode == "CYCLE":
-        hold_last = False
-    elif loop_mode == "ONE_SHOT":
-        hold_last = True
-    else:  # "AUTO"
-        hold_last = bool(data.get("holdLastKeyframe", False))
-    duration = data.get("duration")
-    cyclic = not hold_last
-
-    hierarchy = _org_hierarchy(armature_obj)
-    org_names_in_file = [name for name, _, _ in hierarchy if name in node_animations]
-    if not org_names_in_file:
-        operator.report(
-            {"ERROR"},
-            "None of the bones in this .blockyanim exist as original (ORG) bones on this "
-            "armature -- wrong file, wrong armature, or the rig hasn't been generated yet?",
-        )
-        return {"CANCELLED"}
-
-    chains = _resolve_ik_chains(armature_obj, hierarchy)
-
-    delta_lookup = {}
-    max_time = 0
-    for name in org_names_in_file:
-        channels = node_animations[name]
-        for ch in ("position", "orientation"):
-            for s in channels.get(ch, []):
-                max_time = max(max_time, s["time"])
-        pos_raw = _looped_samples(channels.get("position", []), hold_last, duration)
-        rot_raw = _looped_samples(channels.get("orientation", []), hold_last, duration)
-        delta_lookup[name] = _bake_delta_lookup(pos_raw, rot_raw, start_frame, fps, cyclic)
-    if cyclic and duration is not None:
-        max_time = max(max_time, duration)
-    end_frame = hytale_time_to_frame(max_time, start_frame, fps)
-
-    action = bpy.data.actions.new(action_name)
-    anim_data = armature_obj.animation_data_create()
-    anim_data.action = action
-
-    pose_bones = armature_obj.pose.bones
-    target_values = {}  # {bone_name: [(frame, loc_or_None, quat_or_None), ...]}
-    target_rest_cache = {}
-    warned_rotation_mode = set()
-
-    def _rest_local(name):
-        if name not in target_rest_cache:
-            target_rest_cache[name] = _rest_local_matrix(pose_bones[name])
-        return target_rest_cache[name]
-
-    def _resolve_matrix_basis(pbone, world_matrix):
-        rest_local = _rest_local(pbone.name)
-        parent = pbone.parent
-        if parent is None:
-            parent_world = Matrix.Identity(4)
-        elif parent.name.endswith(SUFFIX_CTRL) and parent.name[: -len(SUFFIX_CTRL)] in world_target:
-            parent_world = world_target[parent.name[: -len(SUFFIX_CTRL)]]
-        elif parent.name.endswith(SUFFIX_MCH) and parent.name[: -len(SUFFIX_MCH)] in world_target:
-            # Caso de attachments/dedos reparentados pro "_MCH" da ponta
-            # pelo rigger.py (ver o mesmo caso em _apply_ctrl_fk_mode,
-            # comentário completo lá) -- v0.5.1.
-            parent_world = world_target[parent.name[: -len(SUFFIX_MCH)]]
-        else:
-            parent_world = parent.matrix.copy()
-        local = parent_world.inverted() @ world_matrix
-        return rest_local.inverted() @ local
-
-    def _resolve_ik_tip_matrix_basis(ik_pbone, org_rest_world, world_matrix):
-        # Ver a explicação completa da conjugação bridge/_IK em
-        # _apply_ik_mode -- mesma fórmula, mesma razão.
-        ik_rest = _rest_local(ik_pbone.name)
-        return ik_rest.inverted() @ world_matrix @ org_rest_world.inverted() @ ik_rest
-
-    # Muta constraints extras em TODO _CTRL -- inclusive os de cadeia,
-    # já que aqui eles TAMBÉM recebem keyframe (diferente do modo IK
-    # puro, que pula eles) -- + Child Of dos poles. Mesma lógica de
-    # sempre, ver nota grande em _apply_ctrl_fk_mode/_apply_ik_mode.
-    muted_constraints = []
-    if not keep_spine_follow:
-        for name, _parent_name, _rest_local_mat in hierarchy:
-            ctrl_pbone = pose_bones.get(name + SUFFIX_CTRL)
-            if ctrl_pbone is None:
-                continue
-            for con in ctrl_pbone.constraints:
-                if not con.mute:
-                    con.mute = True
-                    muted_constraints.append((ctrl_pbone.name, con.name))
-    for chain in chains:
-        pole_pbone = pose_bones.get(chain["pole"])
-        if pole_pbone is None:
-            continue
-        for con in pole_pbone.constraints:
-            if not con.mute:
-                con.mute = True
-                muted_constraints.append((pole_pbone.name, con.name))
-
-    # fk_ik_switch de cada cadeia fica em FK (0) por padrão -- os dois
-    # conjuntos de keyframe já estão presentes e prontos; o animador
-    # troca manualmente (por cadeia) pra ver/usar a versão IK.
-    tip_org_rest_world = {}
-    for chain in chains:
-        ik_pbone = pose_bones.get(chain["ik_tip"])
-        if ik_pbone is not None:
-            ik_pbone[PROP_FK_IK_SWITCH] = 0
-            tip_org_rest_world[chain["ik_tip"]] = pose_bones[chain["org_names"][-1]].bone.matrix_local.copy()
-
-    for frame in range(start_frame, end_frame + 1):
-        world_target = {}
-        for name, parent_name, rest_local in hierarchy:
-            delta = delta_lookup[name](frame) if name in delta_lookup else Matrix.Identity(4)
-            parent_world = world_target[parent_name] if parent_name is not None else Matrix.Identity(4)
-            world_target[name] = parent_world @ rest_local @ delta
-
-        # FK: TODO bone, inclusive os de cadeia, via _CTRL.
-        for name, _parent_name, _rest_local_mat in hierarchy:
-            ctrl_pbone = pose_bones.get(name + SUFFIX_CTRL)
-            if ctrl_pbone is None:
-                continue
-            matrix_basis = _resolve_matrix_basis(ctrl_pbone, world_target[name])
-            loc, quat, _scale = matrix_basis.decompose()
-            if ctrl_pbone.rotation_mode != "QUATERNION":
-                if ctrl_pbone.name not in warned_rotation_mode:
-                    operator.report(
-                        {"WARNING"},
-                        f"Bone '{ctrl_pbone.name}' rotation mode was '{ctrl_pbone.rotation_mode}' -- "
-                        f"switched to 'QUATERNION' to import orientation keyframes.",
-                    )
-                    warned_rotation_mode.add(ctrl_pbone.name)
-                ctrl_pbone.rotation_mode = "QUATERNION"
-            target_values.setdefault(ctrl_pbone.name, []).append((frame, loc, quat))
-
-        # IK: ponta (mão/pé) + pole de cada cadeia, ALÉM do FK acima.
-        for chain in chains:
-            tip_org_name = chain["org_names"][-1]
-            ik_pbone = pose_bones.get(chain["ik_tip"])
-            if ik_pbone is not None:
-                matrix_basis = _resolve_ik_tip_matrix_basis(
-                    ik_pbone, tip_org_rest_world[chain["ik_tip"]], world_target[tip_org_name]
-                )
-                loc, quat, _scale = matrix_basis.decompose()
-                if ik_pbone.rotation_mode != "QUATERNION":
-                    if ik_pbone.name not in warned_rotation_mode:
-                        operator.report(
-                            {"WARNING"},
-                            f"Bone '{ik_pbone.name}' rotation mode was '{ik_pbone.rotation_mode}' -- "
-                            f"switched to 'QUATERNION' to import orientation keyframes.",
-                        )
-                        warned_rotation_mode.add(ik_pbone.name)
-                    ik_pbone.rotation_mode = "QUATERNION"
-                target_values.setdefault(ik_pbone.name, []).append((frame, loc, quat))
-
-            pole_pbone = pose_bones.get(chain["pole"])
-            if pole_pbone is not None:
-                pole_ref_world = world_target.get(chain["pole_ref"])
-                if pole_ref_world is not None:
-                    z_axis_world = pole_ref_world.to_3x3() @ Vector((0.0, 0.0, 1.0))
-                    if z_axis_world.length < 1e-9:
-                        z_axis_world = Vector((0.0, 0.0, 1.0))
-                    z_axis_world.normalize()
-                    sign = 1.0 if chain["pole_invert"] else -1.0
-                    pole_world_pos = pole_ref_world.translation + z_axis_world * (chain["pole_distance"] * sign)
-                    pole_world_matrix = Matrix.Translation(pole_world_pos)
-                    matrix_basis = _resolve_matrix_basis(pole_pbone, pole_world_matrix)
-                    loc = matrix_basis.decompose()[0]
-                    target_values.setdefault(pole_pbone.name, []).append((frame, loc, None))
-
-    for bone_name, samples in target_values.items():
-        pos_samples = [(f, loc, "linear") for f, loc, _q in samples if loc is not None]
-        rot_samples = [(f, quat, "linear") for f, _loc, quat in samples if quat is not None]
-        if pos_samples:
-            _write_channel(action, f'pose.bones["{bone_name}"].location', bone_name, 3, pos_samples)
-        if rot_samples:
-            _write_channel(
-                action, f'pose.bones["{bone_name}"].rotation_quaternion', bone_name, 4, rot_samples
-            )
-
-    if scene.frame_end < end_frame:
-        old_end = scene.frame_end
-        scene.frame_end = end_frame
-        operator.report(
-            {"INFO"}, f"Scene Frame End was {old_end}, extended to {end_frame} to fit the imported animation."
-        )
-
-    if muted_constraints:
-        affected_bones = sorted({bone_name for bone_name, _con_name in muted_constraints})
-        operator.report(
-            {"WARNING"},
-            f"Muted {len(muted_constraints)} extra constraint(s) on {len(affected_bones)} bone(s) "
-            f"(control bones with extra blend constraints, and IK pole targets' Child Of) so the "
-            f"imported pose isn't blended with anything else -- left muted after import; "
-            f"re-enable manually if you want that behavior back: "
-            f"{', '.join(affected_bones[:8])}" + ("..." if len(affected_bones) > 8 else ""),
-        )
-
-    non_chain_ctrl_count = sum(
-        1 for name in target_values if not any(name == chain["ik_tip"] or name == chain["pole"] for chain in chains)
-    )
-    operator.report(
-        {"INFO"},
-        f"Imported '{action.name}' -- wrote BOTH Control FK ({non_chain_ctrl_count} control bone(s), "
-        f"including chain segments) AND Control IK ({len(chains)} chain(s): hand/foot + pole), "
-        f"{end_frame - start_frame + 1} frame(s) each. fk_ik_switch defaults to 0 (FK) on every "
-        f"chain -- toggle per chain, any time, to preview/use the IK version instead.",
-    )
-    return {"FINISHED"}
 
 
 # ---------------------------------------------------------------------------
-# Dispatch de modo -- os quatro modos (ORG/CTRL_FK/IK/BOTH) já implementados.
+# Dispatch de modo -- os dois modos (ORG/CTRL) já implementados.
 # ---------------------------------------------------------------------------
 
 _MODE_HANDLERS = {
     "ORG": _apply_org_mode,
-    "CTRL_FK": _apply_ctrl_fk_mode,
-    "IK": _apply_ik_mode,
-    "BOTH": _apply_both_mode,
+    "CTRL": _apply_ctrl_mode,
+}
+
+# Presets de "Frame Rate" (import_fps_preset) -> (fps, fps_base), MESMOS
+# valores que Blender usa nos próprios presets de Output Properties >
+# Frame Rate -- os "quebrados" (23.98/29.97/59.94, convenção NTSC) não são
+# o número redondo em si, e sim fps/fps_base -- ex.: 23.98 é na verdade
+# 24000/1001 = 23.976023...
+_FPS_PRESET_VALUES = {
+    "6": (6, 1.0),
+    "8": (8, 1.0),
+    "12": (12, 1.0),
+    "23.98": (24000, 1001.0),
+    "24": (24, 1.0),
+    "25": (25, 1.0),
+    "29.97": (30000, 1001.0),
+    "30": (30, 1.0),
+    "50": (50, 1.0),
+    "59.94": (60000, 1001.0),
+    "60": (60, 1.0),
+    "120": (120, 1.0),
+    "240": (240, 1.0),
 }
 
 
@@ -1444,32 +1511,11 @@ class IMPORT_OT_hytale_blockyanim(Operator, ImportHelper):
                 "move anything (the original bones are constrained to follow the control layer)",
             ),
             (
-                "BOTH",
-                "Default (FK + IK)",
-                "Writes Control FK and Control IK at the same time -- every bone gets its FK "
-                "'_CTRL' (chain segments included) AND every chain's IK tip + pole also get "
-                "keyframed, in the same pass. fk_ik_switch defaults to FK (0) on every chain; "
-                "toggle it any time afterward, per chain, to preview or use the IK version "
-                "instead -- no need to reimport",
-            ),
-            (
-                "CTRL_FK",
-                "Control FK",
-                "Writes onto the '_CTRL' bones generated by the auto-rig tool (rigger.py), so the "
-                "imported animation stays editable through the control rig. Always writes a dense "
-                "keyframe on every frame (the 'Bake to Every Frame' toggle doesn't apply here -- "
-                "see anim_importer.py notes). Arm/leg chain bones are written via their per-segment "
-                "_CTRL too, with the fk_ik_switch left on FK -- use 'Control IK' instead to drive "
-                "those through IK",
-            ),
-            (
-                "IK",
-                "Control IK",
-                "Same as Control FK for everything outside a chain (torso, head, fingers etc.) -- "
-                "arm/leg chains are retargeted onto the '_IK' tip (hand/foot) and pole target "
-                "instead of their per-segment '_CTRL', and fk_ik_switch is set to IK. Reads "
-                "armature.hytale_ik_chains (rigger.py) to find the chains -- falls back to "
-                "Control FK behavior entirely if that list is empty",
+                "CTRL",
+                "Controllers",
+                "Writes onto the '_CTRL'/'_IK'/pole bones generated by the auto-rig tool "
+                "(rigger.py), so the imported animation stays editable through the control rig -- "
+                "configure Spine/Arms/Legs below",
             ),
         ],
         default="ORG",
@@ -1483,6 +1529,47 @@ class IMPORT_OT_hytale_blockyanim(Operator, ImportHelper):
         name="Start Frame",
         description="Blender frame where time=0 of the animation file lands",
         default=1,
+    )
+    import_fps_preset: EnumProperty(
+        name="Frame Rate",
+        description="Target scene FPS for this import. If the scene isn't already at this FPS, "
+        "it gets changed automatically before importing -- .blockyanim files are authored at "
+        "60 FPS (FPS_HYTALE), so keeping this at 60 avoids the 'timing looks compressed' issue "
+        "from importing into a lower-FPS scene. Same list as Blender's own Output Properties > "
+        "Frame Rate -- pick 'Custom' to set FPS/Base separately, same as there",
+        items=[
+            ("6", "6", "6 fps"),
+            ("8", "8", "8 fps"),
+            ("12", "12", "12 fps"),
+            ("23.98", "23.98", "23.976 fps (24000 / 1001, NTSC film)"),
+            ("24", "24", "24 fps"),
+            ("25", "25", "25 fps"),
+            ("29.97", "29.97", "29.97 fps (30000 / 1001, NTSC)"),
+            ("30", "30", "30 fps"),
+            ("50", "50", "50 fps"),
+            ("59.94", "59.94", "59.94 fps (60000 / 1001, NTSC)"),
+            ("60", "60", "60 fps"),
+            ("120", "120", "120 fps"),
+            ("240", "240", "240 fps"),
+            ("CUSTOM", "Custom", "Set FPS and Base separately below"),
+        ],
+        default="60",
+    )
+    import_fps_custom_fps: IntProperty(
+        name="FPS",
+        description="Custom Frame Rate 'Frame Rate' is set to 'Custom' -- same field as Output "
+        "Properties > Frame Rate > FPS in Blender's own UI. Effective rate is FPS / Base",
+        default=FPS_HYTALE,  # já importado no topo do arquivo, de common.py
+        min=1,
+        soft_max=240,
+    )
+    import_fps_custom_base: FloatProperty(
+        name="Base",
+        description="Custom Frame Rate 'Frame Rate' is set to 'Custom' -- same field as Output "
+        "Properties > Frame Rate > Base in Blender's own UI. Effective rate is FPS / Base",
+        default=1.0,
+        min=0.001,
+        soft_max=120.0,
     )
     loop_mode: EnumProperty(
         name="Looping",
@@ -1525,16 +1612,96 @@ class IMPORT_OT_hytale_blockyanim(Operator, ImportHelper):
     keep_spine_follow: BoolProperty(
         name="Keep Spine-Follow Active",
         description=(
-            "Control FK, Control IK and Default (FK + IK) only: by default, any extra constraint "
-            "on a control bone (ex: Belly_CTRL/Chest_CTRL partially following root.spine_CTRL) is "
-            "muted during import, so the imported pose matches the source file exactly -- in modes "
-            "that write IK, each pole target's Child Of constraints are also muted for the same "
-            "reason. Enable this to leave those constraints active instead, keeping "
-            "root.spine_CTRL (and the poles' Child Of) usable as fine-tuning tools on top of the "
-            "imported animation -- at the cost of the affected bones no longer matching the source "
-            "file exactly"
+            "Control FK, Control IK and Default (FK + IK) only: by default, this stays ACTIVE -- "
+            "any extra constraint on a control bone (ex: Belly_CTRL/Chest_CTRL partially following "
+            "root.spine_CTRL) keeps blending in during import, and in modes that write IK, each "
+            "pole target's Child Of constraints also stay active. Disable this to mute those "
+            "constraints instead, making the imported pose match the source file exactly on the "
+            "affected bones -- at the cost of root.spine_CTRL (and the poles' Child Of) no longer "
+            "being usable as fine-tuning tools on top of the imported animation"
         ),
         default=True,
+    )
+    spine_mode: EnumProperty(
+        name="Spine",
+        description="Controllers only: how the rig's utility root bones (root.master_CTRL/"
+        "root.pelvis_CTRL, rigger.py) behave. The source animation only ever moves Pelvis/Belly/"
+        "Chest -- these root bones never move on their own, so they need this to travel with the "
+        "animation (ex: walk/run cycles) instead of staying frozen near the origin",
+        items=[
+            (
+                "DEFAULT",
+                "Default (Root CTRL)",
+                "root.master_CTRL follows the Pelvis's animated position and rotation every frame "
+                "-- root.pelvis_CTRL and Belly_CTRL (real children of root.master_CTRL) travel "
+                "along automatically. Recommended -- matches the source animation's root motion",
+            ),
+            (
+                "MANUAL",
+                "Spine CTRL",
+                "root.master_CTRL/root.pelvis_CTRL stay frozen at rest -- Pelvis/Belly/Chest are "
+                "still keyframed normally, but the character won't travel with root motion (ex: "
+                "walking will look like walking in place). Leaves root.spine_CTRL free as a manual "
+                "fine-tuning handle on top of the imported animation instead",
+            ),
+        ],
+        default="DEFAULT",
+    )
+    arms_mode: EnumProperty(
+        name="Arms",
+        description="Controllers only: how 'Arm'-type chains (armature.hytale_ik_chains, "
+        "rigger.py) are keyframed",
+        items=[
+            (
+                "BOTH",
+                "Default (FK + IK)",
+                "Writes both at once -- every arm segment gets its FK '_CTRL' AND the chain's IK "
+                "tip (hand) + pole also get keyframed. fk_ik_switch defaults to FK (0); toggle it "
+                "any time afterward, per chain, to preview or use the IK version instead -- no "
+                "need to reimport",
+            ),
+            (
+                "CTRL_FK",
+                "Control FK",
+                "Only the per-segment '_CTRL' bones -- fk_ik_switch is left untouched (the chain "
+                "doesn't receive any '_IK'/pole keyframes at all)",
+            ),
+            (
+                "IK",
+                "Control IK",
+                "Only the '_IK' tip (hand) + pole target -- per-segment '_CTRL' bones are skipped, "
+                "and fk_ik_switch is set to IK (1)",
+            ),
+        ],
+        default="BOTH",
+    )
+    legs_mode: EnumProperty(
+        name="Legs",
+        description="Controllers only: how 'Leg'-type chains (armature.hytale_ik_chains, "
+        "rigger.py) are keyframed -- same 3 options as Arms, applied independently",
+        items=[
+            (
+                "BOTH",
+                "Default (FK + IK)",
+                "Writes both at once -- every leg segment gets its FK '_CTRL' AND the chain's IK "
+                "tip (foot) + pole also get keyframed. fk_ik_switch defaults to FK (0); toggle it "
+                "any time afterward, per chain, to preview or use the IK version instead -- no "
+                "need to reimport",
+            ),
+            (
+                "CTRL_FK",
+                "Control FK",
+                "Only the per-segment '_CTRL' bones -- fk_ik_switch is left untouched (the chain "
+                "doesn't receive any '_IK'/pole keyframes at all)",
+            ),
+            (
+                "IK",
+                "Control IK",
+                "Only the '_IK' tip (foot) + pole target -- per-segment '_CTRL' bones are skipped, "
+                "and fk_ik_switch is set to IK (1)",
+            ),
+        ],
+        default="BOTH",
     )
 
     @classmethod
@@ -1569,6 +1736,21 @@ class IMPORT_OT_hytale_blockyanim(Operator, ImportHelper):
 
         action_name = self.action_name.strip() or os.path.splitext(os.path.basename(self.filepath))[0]
 
+        if self.import_fps_preset == "CUSTOM":
+            target_fps_int, target_fps_base = self.import_fps_custom_fps, self.import_fps_custom_base
+        else:
+            target_fps_int, target_fps_base = _FPS_PRESET_VALUES[self.import_fps_preset]
+        target_fps = target_fps_int / target_fps_base
+
+        current_fps = context.scene.render.fps / context.scene.render.fps_base
+        if abs(target_fps - current_fps) > 1e-6:
+            context.scene.render.fps = target_fps_int
+            context.scene.render.fps_base = target_fps_base
+            self.report(
+                {"INFO"},
+                f"Scene FPS changed from {current_fps:g} to {target_fps:g} for this import.",
+            )
+
         return handler(
             self,
             context,
@@ -1579,16 +1761,29 @@ class IMPORT_OT_hytale_blockyanim(Operator, ImportHelper):
             self.loop_mode,
             self.bake_mode,
             self.keep_spine_follow,
+            self.spine_mode,
+            self.arms_mode,
+            self.legs_mode,
         )
 
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "target_mode")
+        if self.target_mode == "CTRL":
+            box = layout.box()
+            box.prop(self, "spine_mode")
+            box.prop(self, "arms_mode")
+            box.prop(self, "legs_mode")
         layout.prop(self, "action_name")
         layout.prop(self, "start_frame")
+        layout.prop(self, "import_fps_preset")
+        if self.import_fps_preset == "CUSTOM":
+            col = layout.column(align=True)
+            col.prop(self, "import_fps_custom_fps")
+            col.prop(self, "import_fps_custom_base")
         layout.prop(self, "loop_mode")
         layout.prop(self, "bake_mode")
-        if self.target_mode in {"CTRL_FK", "IK", "BOTH"}:
+        if self.target_mode == "CTRL":
             layout.prop(self, "keep_spine_follow")
 
 
