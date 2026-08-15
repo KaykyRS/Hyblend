@@ -1,3 +1,5 @@
+<img width="1300" height="372" alt="Hyblend cover" src="https://github.com/user-attachments/assets/5e8b8d45-2db6-481b-9bf2-8e449f38b831" />
+
 ## Hyblend
 Hyblend Toolkit is a plugin for animators to be able to export their animations directly to Hytale.
 
