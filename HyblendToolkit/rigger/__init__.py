@@ -40,14 +40,47 @@ from ..templates import (
 # `.rigger` antes do split continua disponível daqui, sem precisar mudar
 # nenhum import nesses dois arquivos. Ver DEVELOPER_NOTES.md pra lista
 # completa do que cada chat consome.
+#
+# BONE_PROPERTIES e switch_property_name entraram aqui pro anim_tools.py
+# (aba "Animation" -- toggle de FK/IK por cadeia): sem esses dois, ele
+# teria que reconstruir na mão o nome do bone ("PROPERTIES") e a regra
+# de nomenclatura da custom property (prefixo do tip_bone + sufixo L/R),
+# duplicando lógica que já existe aqui -- mesmo motivo pelo qual
+# common.py existe entre importer/exporter.
+#
+# find_org_path entrou junto (FK/IK Snap, mesmo anim_tools.py): recalcula
+# em runtime o MESMO caminho root->tip (via armature.bones, não
+# edit_bones -- a função não depende do tipo, só de .name/.children/
+# .keys()) que "Create Rig" já andou uma vez em Edit Mode -- sem isso,
+# o Snap teria sua própria cópia da lógica de "andar pela hierarquia
+# ORG", podendo divergir do que o rig realmente gerado tem.
+#
+# SUFFIX_IK_MCH entrou pelo mesmo motivo (FK/IK Snap): o bone `_IK` da
+# PONTA de uma cadeia (ex. Hand_IK) tem uma rest orientation DIFERENTE
+# do bridge `_IK_MCH` correspondente (ver _build_ik_layer -- o `_IK` da
+# ponta é reorientado, o bridge não), então o Snap precisa ler
+# `bones[nome + SUFFIX_IK_MCH].matrix_local` pra calcular esse offset e
+# compensar -- sem isso, a rotação da ponta sai torta ao trocar pra IK.
+#
+# CONSTRAINT_CHILD_OF_LOCAL/GLOBAL entraram junto, mesmo motivo: tanto
+# o pole target quanto o ik_tip têm uma Child Of ATIVA por padrão (ver
+# _build_pose_constraints) -- `pose_bone.matrix = X` não é "ciente" de
+# constraints ativas (o valor final acaba deslocado pela Child Of
+# rodando de novo em cima do canal recém-escrito); o Snap precisa
+# desativar a constraint pelo NOME antes de escrever a matrix, e
+# reativar depois -- ver anim_tools.py.
 # ---------------------------------------------------------------------------
 from .constants import (  # noqa: F401
+    BONE_PROPERTIES,
     BONE_ROOT_MASTER,
     BONE_ROOT_PELVIS,
+    CONSTRAINT_CHILD_OF_GLOBAL,
+    CONSTRAINT_CHILD_OF_LOCAL,
     PROP_FK_IK_SWITCH,
     PROP_RIG_LAYER,
     SUFFIX_CTRL,
     SUFFIX_IK,
+    SUFFIX_IK_MCH,
     SUFFIX_MCH,
     SUFFIX_POLE,
     SUFFIX_TAIL,
@@ -62,6 +95,7 @@ from .rig import (  # noqa: F401
     RIG_OT_hytale_generate_rig,
     RIG_OT_hytale_ik_chain_add,
     RIG_OT_hytale_ik_chain_load_defaults,
+    RIG_OT_hytale_ik_chain_move,
     RIG_OT_hytale_ik_chain_pick_bone,
     RIG_OT_hytale_ik_chain_remove,
     RIG_OT_hytale_ik_chain_set_count,
@@ -75,7 +109,9 @@ from .rig import (  # noqa: F401
     RIG_OT_hytale_shape_template_save,
     RIG_OT_hytale_validate_rig,
     RIG_UL_hytale_ik_chains,
+    find_org_path,
     register_shape_edit_border,
+    switch_property_name,
     unregister_shape_edit_border,
 )
 
@@ -96,6 +132,7 @@ _CLASSES = (
     RIG_OT_hytale_ik_chain_set_count,
     RIG_OT_hytale_ik_chain_pick_bone,
     RIG_OT_hytale_ik_chain_load_defaults,
+    RIG_OT_hytale_ik_chain_move,
     RIG_OT_hytale_shape_template_apply,
     RIG_OT_hytale_rig_template_save,
     RIG_OT_hytale_rig_template_delete,

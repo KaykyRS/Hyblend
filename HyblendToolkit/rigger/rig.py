@@ -1416,6 +1416,49 @@ class RIG_OT_hytale_ik_chain_remove(Operator):
         return {"FINISHED"}
 
 
+class RIG_OT_hytale_ik_chain_move(Operator):
+    """Reordena uma entrada da lista (armature.hytale_ik_chains) uma
+    posição pra cima ou pra baixo, via CollectionProperty.move() --
+    mesmo padrão que interface.py já usa pro par Add/Remove, só que
+    aqui é um único operador com um `direction` (UP/DOWN) em vez de dois
+    operadores separados, já que a lógica dos dois lados é idêntica
+    (só troca o delta do índice). Reordenar é puramente cosmético/
+    organizacional -- não afeta geração de rig nenhuma (RIG_OT_hytale_
+    generate_rig lê hytale_ik_chains percorrendo a coleção inteira, sem
+    depender de ordem -- ver _build_edit_bones), só a ordem em que as
+    entradas aparecem na UIList."""
+
+    bl_idname = "armature.hytale_ik_chain_move"
+    bl_label = "Move Hytale Bone Setting"
+    bl_description = "Move the selected entry up or down in the list"
+    bl_options = {"REGISTER", "UNDO"}
+
+    direction: EnumProperty(
+        items=(
+            ("UP", "Up", "Move the entry one position up"),
+            ("DOWN", "Down", "Move the entry one position down"),
+        ),
+        default="UP",
+    )
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == "ARMATURE" and len(obj.data.hytale_ik_chains) > 1
+
+    def execute(self, context):
+        armature = context.active_object.data
+        chains = armature.hytale_ik_chains
+        index = armature.hytale_ik_chains_index
+        target = index - 1 if self.direction == "UP" else index + 1
+        if not (0 <= target < len(chains)):
+            return {"CANCELLED"}
+        chains.move(index, target)
+        armature.hytale_ik_chains_index = target
+        _redraw_all_areas(context)
+        return {"FINISHED"}
+
+
 class RIG_OT_hytale_ik_chain_set_count(Operator):
     """Ajusta a lista de cadeias de IK pra ter exatamente `count` itens --
     adiciona vazias no fim ou remove do fim, sem tocar nas do meio. Não é

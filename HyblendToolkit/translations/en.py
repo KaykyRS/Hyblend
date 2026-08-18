@@ -156,6 +156,16 @@ TRANSLATIONS = {
     "panel.btn_remove_generated": "Remove Generated Bones",
 
     # -----------------------------------------------------------------
+    # interface.py -- aba Animation (anim_tools.py)
+    # -----------------------------------------------------------------
+    "panel.hint_anim_none": "Select an armature to see its animation controls.",
+    "panel.anim_collections_box": "Bone Collections",
+    "panel.hint_anim_no_rig": "No bone collections found yet -- generate the rig first.",
+    "panel.anim_fkik_box": "FK / IK",
+    "panel.btn_snap_selected": "Snap FK/IK",
+    "panel.hint_anim_no_fkik": "No Arm/Leg chains with a generated FK/IK switch yet.",
+
+    # -----------------------------------------------------------------
     # interface.py -- avisos reaproveitados em mais de uma aba
     # -----------------------------------------------------------------
     "panel.warn_anim_experimental": "Experimental",

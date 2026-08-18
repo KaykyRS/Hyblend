@@ -34,6 +34,12 @@ from bpy.types import Panel, WindowManager
 from .exporter import EXPORT_OT_hytale_blockyanim
 from .importer import IMPORT_OT_hytale_blockymodel, IMPORT_OT_hytale_bbmodel
 from .anim_importer import IMPORT_OT_hytale_blockyanim
+from .anim_tools import (
+    ANIM_OT_hytale_set_fk_ik,
+    ANIM_OT_hytale_snap_selected,
+    ANIM_OT_hytale_toggle_collection_visibility,
+    get_fk_ik_state,
+)
 from .common import HYTALE_OT_pick_bone_into_field
 from .translations import get_language, tr
 from .rigger import (
@@ -44,6 +50,7 @@ from .rigger import (
     RIG_OT_hytale_collection_template_save,
     RIG_OT_hytale_generate_rig,
     RIG_OT_hytale_ik_chain_load_defaults,
+    RIG_OT_hytale_ik_chain_move,
     RIG_OT_hytale_ik_chain_pick_bone,
     RIG_OT_hytale_ik_chain_remove,
     RIG_OT_hytale_mirror_shape,
@@ -66,6 +73,7 @@ TAB_ITEMS = [
     ("IMPORT", "Import", "Import models and attachments", "IMPORT", 0),
     ("EXPORT", "Export", "Export animations", "EXPORT", 1),
     ("RIG", "Rig", "IK chains and rig generation", "CON_KINEMATIC", 2),
+    ("ANIMATION", "Animation", "Bone collection visibility and FK/IK switches", "ANIM", 3),
 ]
 
 # O dicionário PANEL_LABELS/PL que morava aqui virou o pacote
@@ -155,6 +163,8 @@ class HYTALE_PT_main(Panel):
             self._draw_export(layout, context, lang)
         elif tab == "RIG":
             self._draw_rig(layout, context, lang)
+        elif tab == "ANIMATION":
+            self._draw_animation(layout, context, lang)
 
     # ------------------------------------------------------------------
     # Import
@@ -448,6 +458,13 @@ class HYTALE_PT_main(Panel):
             # de um operador próprio só pra isso.
             col.operator("wm.call_menu", text="", icon="ADD").name = RIG_MT_hytale_ik_chain_add_menu.bl_idname
             col.operator(RIG_OT_hytale_ik_chain_remove.bl_idname, text="", icon="REMOVE")
+            # Setinhas de reordenar -- mesma coluna alinhada do +/-, com
+            # um separator() pra dar uma respiradinha visual entre os
+            # dois grupos (add/remove vs mover), convenção comum em
+            # UILists do próprio Blender (ex. Modifiers, Vertex Groups).
+            col.separator()
+            col.operator(RIG_OT_hytale_ik_chain_move.bl_idname, text="", icon="TRIA_UP").direction = "UP"
+            col.operator(RIG_OT_hytale_ik_chain_move.bl_idname, text="", icon="TRIA_DOWN").direction = "DOWN"
 
             # armature.hytale_apply_ik_joint_fix é BoolProperty
             # (Armature.hytale_apply_ik_joint_fix, registrada em
@@ -603,6 +620,113 @@ class HYTALE_PT_main(Panel):
             utils_row.operator(
                 TEMPLATES_OT_open_user_folder.bl_idname, text=tr("panel.btn_open_templates_folder", lang), icon="FILE_FOLDER",
             )
+
+    # ------------------------------------------------------------------
+    # Animation
+    # ------------------------------------------------------------------
+
+    # Layout da box "Bone Collections" -- uma sub-lista (linha) por
+    # entrada; cada linha pode ter 1 ou 2 pares (name, icon), desenhados
+    # lado a lado na mesma row (Arm R/Arm L e Leg R/Leg L, pra ficarem
+    # emparelhados como no resto do addon -- ver picker_row/_draw_rig).
+    # Os nomes são os literais reais das bone collections que rigger.py
+    # já cria (COLL_MAIN_HEAD etc., em rigger/constants.py) -- fixos de
+    # propósito aqui (mesmo padrão de TAB_ITEMS, no topo do arquivo):
+    # não passam por tr() porque são nomes de dado (o nome real da bone
+    # collection no Armature), não texto de interface.
+    _ANIM_COLLECTION_ROWS = [
+        [("Head", "USER")],
+        [("Spine", "BONE_DATA")],
+        [("Body", "BONE_DATA")],
+        [("Arm R", "BONE_DATA"), ("Arm L", "BONE_DATA")],
+        [("Leg R", "BONE_DATA"), ("Leg L", "BONE_DATA")],
+        [("Root", "ARMATURE_DATA")],
+        [("Tail", "BONE_DATA")],
+        [("Face", "USER")],
+        [("Attachments", "GROUP_BONE")],
+    ]
+
+    def _draw_animation(self, layout, context, lang):
+        obj = context.active_object
+        is_armature = obj is not None and obj.type == "ARMATURE"
+
+        if not is_armature:
+            layout.box().label(text=tr("panel.hint_anim_none", lang), icon="ERROR")
+            return
+
+        armature = obj.data
+
+        # --- Bone Collections --------------------------------------
+        # Só mostra/esconde -- não cria nada. Uma linha nasce só se a
+        # collection já existir nesse Armature (armature.collections_all,
+        # que enxerga aninhadas -- ver anim_tools.py); um personagem sem
+        # nenhuma cadeia Tail, por exemplo, nunca vai ter "Tail" na
+        # lista, e a linha correspondente simplesmente não é desenhada.
+        coll_box = layout.box()
+        coll_box.label(text=tr("panel.anim_collections_box", lang), icon="OUTLINER_OB_ARMATURE")
+        any_collection_found = False
+        for row_def in self._ANIM_COLLECTION_ROWS:
+            row = coll_box.row(align=True)
+            row.scale_y = 1.2
+            for name, icon in row_def:
+                coll = armature.collections_all.get(name)
+                if coll is None:
+                    continue
+                any_collection_found = True
+                op = row.operator(
+                    ANIM_OT_hytale_toggle_collection_visibility.bl_idname,
+                    text=name,
+                    icon="HIDE_OFF" if coll.is_visible else "HIDE_ON",
+                    depress=coll.is_visible,
+                )
+                op.collection_name = name
+        if not any_collection_found:
+            coll_box.label(text=tr("panel.hint_anim_no_rig", lang), icon="INFO")
+
+        layout.separator()
+
+        # --- FK / IK --------------------------------------------------
+        # Uma linha por cadeia Arm/Leg de armature.hytale_ik_chains que
+        # já tem o switch de verdade gerado (ver get_fk_ik_state, em
+        # anim_tools.py -- None pula a linha: cadeia Tail, rig nunca
+        # gerado, ou entrada adicionada à lista depois do último
+        # "Create Rig"). Os botões FK/IK da lista (por índice de cadeia)
+        # fazem uma troca CRUA -- só a influência, sem mexer na pose
+        # (ver ANIM_OT_hytale_set_fk_ik). O botão "Snap FK/IK" acima da
+        # lista faz o trabalho dos dois juntos (igualar a pose E trocar)
+        # pra UMA cadeia só -- a do bone ATIVO selecionado no momento.
+        fkik_box = layout.box()
+        fkik_box.label(text=tr("panel.anim_fkik_box", lang), icon="CON_KINEMATIC")
+
+        # Snap FK/IK -- olha o bone ATIVO selecionado
+        # (context.active_pose_bone), não passa por índice de cadeia (o
+        # próprio operador resolve isso -- ver identify_chain_from_bone
+        # em anim_tools.py). poll() do operador já cobre "sem bone
+        # ativo"/"não é Armature" -- o botão fica cinza sozinho nesses
+        # casos, sem precisar checar aqui.
+        fkik_box.operator(
+            ANIM_OT_hytale_snap_selected.bl_idname,
+            text=tr("panel.btn_snap_selected", lang),
+            icon="SNAP_ON",
+        )
+
+        any_chain_found = False
+        for index, item in enumerate(armature.hytale_ik_chains):
+            state = get_fk_ik_state(obj, item)
+            if state is None:
+                continue
+            any_chain_found = True
+            row = fkik_box.row(align=True)
+            row.label(text=item.label or item.root_bone or "(?)")
+            sub = row.row(align=True)
+            op_fk = sub.operator(ANIM_OT_hytale_set_fk_ik.bl_idname, text="FK", depress=(state == 0))
+            op_fk.chain_index = index
+            op_fk.mode = "FK"
+            op_ik = sub.operator(ANIM_OT_hytale_set_fk_ik.bl_idname, text="IK", depress=(state == 1))
+            op_ik.chain_index = index
+            op_ik.mode = "IK"
+        if not any_chain_found:
+            fkik_box.label(text=tr("panel.hint_anim_no_fkik", lang), icon="INFO")
 
 
 def register():
