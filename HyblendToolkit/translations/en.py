@@ -136,6 +136,29 @@ TRANSLATIONS = {
     "panel.field_tail_tip_rotation_axis": "Tip Rotation Axis",
     "panel.field_tail_tip_rotation_deg": "Tip Rotation (deg)",
     "panel.hint_tail_no_ik": "Tail bones follow their controls directly (no IK) -- ready for physics add-ons",
+    # v0.9 (Etapa 2) -- campos de Head/Spine (organizacional, sem IK --
+    # ver HytaleIKChainItem em rigger.py).
+    "panel.field_neck_count": "Neck Bones Amount",
+    "panel.field_neck_1": "Neck",
+    "panel.field_neck_2": "Neck 2",
+    "panel.field_neck_3": "Neck 3",
+    "panel.field_neck_4": "Neck 4",
+    "panel.field_neck_5": "Neck 5",
+    "panel.field_head_bone": "Head",
+    "panel.field_head_end_bone": "Head End",
+    "panel.hint_head_no_ik": "Head/Neck bones follow their controls directly (no IK) -- organizational only",
+    "panel.field_spine_count": "Spine Amount",
+    "panel.field_pelvis_bone": "Pelvis",
+    "panel.field_spine_1": "Spine1",
+    "panel.field_spine_2": "Spine2",
+    "panel.field_spine_3": "Spine3",
+    "panel.field_spine_4": "Spine4",
+    "panel.hint_spine_no_ik": "Spine bones follow their controls directly (no IK) -- organizational only",
+    # v0.9.7 -- campos de Attachments (organizacional, sem IK -- ver
+    # HytaleIKChainItem em rigger.py).
+    "panel.field_attachments_count": "Attachments Bones Amount",
+    "panel.field_attachment": "Attachment",
+    "panel.hint_attachments_no_ik": "Attachment bones follow their controls directly (no IK) -- organizational only",
     "panel.field_side": "Side",
     "panel.field_pole_in_front": "Pole in Front (+Z)",
     "panel.field_copy_location_ik": "Also Copy Location on IK (root)",
@@ -144,6 +167,22 @@ TRANSLATIONS = {
     "panel.field_pole_angle_preset_name": "Pole Angle Preset",
     "panel.field_pole_angle_manual": "Pole Angle (deg)",
     "panel.field_pole_angle_fine_tune": "Pole Angle Fine-Tune (deg)",
+    # v0.9 -- Collection Settings (Etapa 1). Dropdown "Collection" nas
+    # entradas Arm/Leg do Bone Settings + a box nova entre Bone Settings
+    # e Character Templates (ver interface.py/rigger.py).
+    "panel.field_collection": "Collection",
+    "panel.bone_collections_box": "Collection Settings",
+    "panel.btn_load_default_collections": "Load Default Collections",
+    "panel.btn_reset_bone_collection_grid": "Reset Row/Column to Defaults",
+    "panel.hint_bone_collections": "Organize how bones are grouped for animation.",
+    # v0.9.6 -- opções por-collection de "Collection Settings": Parent
+    # (aninhamento livre), Show in Animation Tab, e a grade (Row/Column
+    # -- ver HytaleBoneCollectionItem em rigger.py).
+    "panel.bone_collection_options_for": "Options for '{name}'",
+    "panel.field_parent": "Parent",
+    "panel.field_show_in_animation": "Show in Animation Tab",
+    "panel.field_grid_row": "Row",
+    "panel.field_grid_column": "Column",
     "panel.btn_create_rig": "Create Rig",
     "panel.btn_validate_rig": "Check Rig",
     "panel.btn_shape_edit_enter": "Shape Edit Mode",

@@ -261,6 +261,16 @@ WGT_DEFAULT_FALLBACK = "WGT_hytale_default"  # usado quando o shape "preferido" 
 WIDGET_WIRE_WIDTH = 2.0  # custom_shape_wire_width -- espessura de linha, igual pra TODOS os bones com shape
 ATTACHMENT_SHAPE_SCALE = 0.3  # scale genérico pra QUALQUER attachment sem override de "scale" específico
 
+# v0.9.7 -- teto único do "Attachments Bones Amount" (ver HytaleIKChainItem
+# em rig.py, chain_type == "ATTACHMENTS"). Blender não permite uma lista
+# de campos GENUINAMENTE ilimitada dentro de um PropertyGroup (cada
+# StringProperty precisa existir como um campo declarado) -- por isso
+# os campos attachment_bone_1..N são gerados NUM LOOP em tempo de
+# definição da classe, usando este número. Pra aumentar/diminuir o
+# limite, só mude este valor aqui -- rig.py e interface.py leem daqui,
+# nenhum outro lugar tem o número "25" hardcoded.
+ATTACHMENTS_MAX_COUNT = 25
+
 WGT_FK_RING = "WGT_hytale_fk_ring"          # bones _CTRL genéricos (FK)
 WGT_IK_BOX = "WGT_hytale_ik_box"            # ponta de cadeia IK (mão/pé -- o _IK que tem o switch)
 WGT_POLE = "WGT_hytale_pole"                # *_Pole_CTRL

@@ -44,6 +44,11 @@ from .common import HYTALE_OT_pick_bone_into_field
 from .translations import get_language, tr
 from .rigger import (
     RIG_MT_hytale_ik_chain_add_menu,
+    RIG_OT_hytale_bone_collection_add,
+    RIG_OT_hytale_bone_collection_load_defaults,
+    RIG_OT_hytale_bone_collection_move,
+    RIG_OT_hytale_bone_collection_remove,
+    RIG_OT_hytale_bone_collection_reset_grid,
     RIG_OT_hytale_clear_generated,
     RIG_OT_hytale_collection_template_apply,
     RIG_OT_hytale_collection_template_delete,
@@ -62,6 +67,10 @@ from .rigger import (
     RIG_OT_hytale_shape_template_delete,
     RIG_OT_hytale_shape_template_save,
     RIG_OT_hytale_validate_rig,
+    SUFFIX_CTRL,
+    SUFFIX_IK,
+    PARENT_COLLECTION_ROOT,
+    _collection_sort_key,
 )
 from .templates import TEMPLATES_OT_open_user_folder, TEMPLATES_OT_reload
 
@@ -141,13 +150,13 @@ def _draw_template_picker(box, wm, selected_attr, apply_idname, delete_idname, s
 
 class HYTALE_PT_main(Panel):
     """Painel principal do addon na N-Panel da Viewport 3D (aba lateral
-    'Hytale'). Só orquestra botões -- toda a lógica real mora nos
+    'Hyblend'). Só orquestra botões -- toda a lógica real mora nos
     operadores de importer.py / exporter.py."""
 
-    bl_label = "Hytale Blocky Toolkit"
+    bl_label = "Hyblend Toolkit"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "Hytale"
+    bl_category = "Hyblend"
 
     def draw(self, context):
         layout = self.layout
@@ -484,7 +493,11 @@ class HYTALE_PT_main(Panel):
             # Só faz sentido mostrar isso se já existe alguma entrada
             # ARM/LEG na lista -- a opção afeta bones de cadeias com IK,
             # entradas TAIL não usam nada disso (ver rigger.py).
-            has_limb_entry = any(c.chain_type != "TAIL" for c in armature.hytale_ik_chains)
+            # v0.9 (Etapa 2) -- HEAD/SPINE não têm IK/joint fix igual
+            # Tail já não tinha -- checa só ARM/LEG explicitamente agora,
+            # em vez de "!= TAIL" (que antes cobria tudo que não era
+            # Tail, quando só existiam ARM/LEG/TAIL).
+            has_limb_entry = any(c.chain_type in ("ARM", "LEG") for c in armature.hytale_ik_chains)
             if has_limb_entry:
                 box.prop(
                     armature,
@@ -519,6 +532,74 @@ class HYTALE_PT_main(Panel):
                     row.prop(item, "tail_tip_rotation_axis", text=tr("panel.field_tail_tip_rotation_axis", lang))
                     row.prop(item, "tail_tip_rotation_deg", text=tr("panel.field_tail_tip_rotation_deg", lang))
                     col.label(text=tr("panel.hint_tail_no_ik", lang), icon="INFO")
+                    # v0.9 (Etapa 3) -- Tail também ganha o dropdown de
+                    # Collection agora (antes ficava fixo em Main/Tail --
+                    # pedido explícito: nenhum tipo deve ficar travado).
+                    # "" (Auto) continua caindo em Main/Tail, sem mudar o
+                    # comportamento de quem nunca mexer nisso.
+                    col.separator()
+                    col.prop(item, "collection_override", text=tr("panel.field_collection", lang))
+                elif item.chain_type == "HEAD":
+                    # v0.9 (Etapa 2) -- Head não cria bone nenhum (ver
+                    # _resolve_chains/_head_spine_bone_names em rigger.py)
+                    # -- só identifica quais bones _CTRL já existentes são
+                    # o Neck/Head/Head End, pra organização de collection.
+                    # neck_count controla quantos dos 5 campos de Neck
+                    # aparecem -- Head/Head End ficam sempre visíveis.
+                    col.prop(item, "neck_count", text=tr("panel.field_neck_count", lang))
+                    neck_fields = ["neck_bone_1", "neck_bone_2", "neck_bone_3", "neck_bone_4", "neck_bone_5"]
+                    neck_labels = [
+                        "panel.field_neck_1", "panel.field_neck_2", "panel.field_neck_3",
+                        "panel.field_neck_4", "panel.field_neck_5",
+                    ]
+                    for field_name, label_key in list(zip(neck_fields, neck_labels))[: item.neck_count]:
+                        picker_row(field_name, tr(label_key, lang))
+                    picker_row("head_bone", tr("panel.field_head_bone", lang))
+                    picker_row("head_end_bone", tr("panel.field_head_end_bone", lang))
+                    col.label(text=tr("panel.hint_head_no_ik", lang), icon="INFO")
+                    col.separator()
+                    col.prop(item, "collection_override", text=tr("panel.field_collection", lang))
+                elif item.chain_type == "SPINE":
+                    # v0.9 (Etapa 2) -- mesmo espírito de Head: nenhum bone
+                    # é criado, só identificado. spine_count é o TOTAL de
+                    # bones incluindo o Pelvis (1 = só Pelvis) -- Pelvis
+                    # sempre visível, Spine1..4 conforme spine_count - 1.
+                    col.prop(item, "spine_count", text=tr("panel.field_spine_count", lang))
+                    picker_row("pelvis_bone", tr("panel.field_pelvis_bone", lang))
+                    spine_fields = ["spine_bone_1", "spine_bone_2", "spine_bone_3", "spine_bone_4"]
+                    spine_labels = [
+                        "panel.field_spine_1", "panel.field_spine_2",
+                        "panel.field_spine_3", "panel.field_spine_4",
+                    ]
+                    for field_name, label_key in list(zip(spine_fields, spine_labels))[: max(0, item.spine_count - 1)]:
+                        picker_row(field_name, tr(label_key, lang))
+                    col.label(text=tr("panel.hint_spine_no_ik", lang), icon="INFO")
+                    col.separator()
+                    col.prop(item, "collection_override", text=tr("panel.field_collection", lang))
+                elif item.chain_type == "ATTACHMENTS":
+                    # v0.9.7 -- mesmo espírito de Head/Spine: nenhum bone é
+                    # criado, só identificado. attachments_count controla
+                    # quantos campos aparecem -- diferente de Head (que tem
+                    # 2 campos "sempre visíveis" além do amount), aqui
+                    # TODOS os slots são do mesmo tipo, então não tem
+                    # nenhum campo fixo fora da contagem.
+                    #
+                    # v0.9.8 -- ERA uma lista de 5 nomes de campo + 5 keys
+                    # de tradução escritas na mão -- teto subiu pra
+                    # ATTACHMENTS_MAX_COUNT (25, ver rigger/constants.py),
+                    # e escrever 25 keys de tradução (Attachment 6..25 etc.)
+                    # seria só ruído. Em vez disso usa UMA key só
+                    # ("Attachment", traduzível) e monta o número em
+                    # código -- mesma ideia de "Neck 2"/"Spine2" que já
+                    # existiam, só que sem precisar de uma key por número.
+                    col.prop(item, "attachments_count", text=tr("panel.field_attachments_count", lang))
+                    attachment_base_label = tr("panel.field_attachment", lang)
+                    for i in range(1, item.attachments_count + 1):
+                        label = attachment_base_label if i == 1 else f"{attachment_base_label} {i}"
+                        picker_row(f"attachment_bone_{i}", label)
+                    col.label(text=tr("panel.hint_attachments_no_ik", lang), icon="INFO")
+                    col.separator()
+                    col.prop(item, "collection_override", text=tr("panel.field_collection", lang))
                 else:
                     # ARM e LEG usam os MESMOS 4 campos/mesma lógica de
                     # sempre (ver rigger.py) -- só o RÓTULO muda por tipo
@@ -553,6 +634,106 @@ class HYTALE_PT_main(Panel):
                         # por side; troca de personagem, troca de preset
                         # disponível, sem mexer em código).
                         col.prop(item, "pole_angle_preset_name", text=tr("panel.field_pole_angle_preset_name", lang))
+
+                    # v0.9 -- Collection Settings (Etapa 1/3). Arm/Leg
+                    # ganham o mesmo dropdown que Tail (ver bloco "if
+                    # item.chain_type == 'TAIL'" acima) -- "" (Auto) =
+                    # comportamento antigo (Arm L/Arm R/Leg L/Leg R), sem
+                    # mudança nenhuma pra quem nunca abrir essa opção.
+                    col.separator()
+                    col.prop(item, "collection_override", text=tr("panel.field_collection", lang))
+
+        layout.separator()
+
+        # ------------------------------------------------------------
+        # Collection Settings (v0.9, Etapa 1) -- entre Bone Settings e
+        # Character Templates, pedido explícito. Mesmo padrão de header
+        # clicável + box collapsible que a box de Bone Settings acima já
+        # usa (ver hytale_show_ik_chains) -- aqui com hytale_show_bone_collections,
+        # também fechada por padrão.
+        #
+        # v0.9.1 -- NÃO chama ensure_default_bone_collections() aqui:
+        # draw() não pode escrever em dados de ID (Blender levanta
+        # "Writing to ID classes in this context is not allowed" --
+        # aconteceu literalmente com essa linha, ver changelog). O seed
+        # das 8 collections default agora só roda de dentro de um
+        # execute() de operador: automaticamente no primeiro "Create
+        # Rig" (ver RIG_OT_hytale_generate_rig), ou manualmente aqui via
+        # o botão "Load Default Collections" (RIG_OT_hytale_bone_collection_
+        # load_defaults), mostrado só enquanto a lista ainda não foi
+        # inicializada nenhuma vez pra este armature.
+        coll_header = layout.row()
+        coll_header.prop(
+            wm, "hytale_show_bone_collections",
+            text=tr("panel.bone_collections_box", lang),
+            icon="TRIA_DOWN" if wm.hytale_show_bone_collections else "TRIA_RIGHT",
+            emboss=False,
+        )
+
+        if wm.hytale_show_bone_collections:
+            box = layout.box()
+            if not armature.hytale_bone_collections_initialized and len(armature.hytale_bone_collections) == 0:
+                box.operator(
+                    RIG_OT_hytale_bone_collection_load_defaults.bl_idname,
+                    text=tr("panel.btn_load_default_collections", lang),
+                    icon="IMPORT",
+                )
+            # v0.9.9 -- corrige entradas default (Head/Spine/Arm L/etc.)
+            # criadas ANTES de Row/Column existir como campo -- ficam
+            # travadas em row=0/column=0 pra sempre (ensure_default_bone_
+            # collections só semeia UMA vez, guardado por hytale_bone_
+            # collections_initialized) -- sintoma: ordenação da aba
+            # Animation parece "sem efeito" (tudo empatado em 0/0, cai
+            # pra ordem alfabética). Sempre visível (não só quando a
+            # lista está vazia, diferente do botão acima) -- é pra
+            # corrigir entradas que JÁ EXISTEM, não pra popular uma
+            # lista vazia.
+            if len(armature.hytale_bone_collections) > 0:
+                box.operator(
+                    RIG_OT_hytale_bone_collection_reset_grid.bl_idname,
+                    text=tr("panel.btn_reset_bone_collection_grid", lang),
+                    icon="FILE_REFRESH",
+                )
+            row = box.row()
+            row.template_list(
+                "RIG_UL_hytale_bone_collections", "",
+                armature, "hytale_bone_collections",
+                armature, "hytale_bone_collections_index",
+            )
+            col = row.column(align=True)
+            col.operator(RIG_OT_hytale_bone_collection_add.bl_idname, text="", icon="ADD")
+            col.operator(RIG_OT_hytale_bone_collection_remove.bl_idname, text="", icon="REMOVE")
+            col.separator()
+            col.operator(RIG_OT_hytale_bone_collection_move.bl_idname, text="", icon="TRIA_UP").direction = "UP"
+            col.operator(RIG_OT_hytale_bone_collection_move.bl_idname, text="", icon="TRIA_DOWN").direction = "DOWN"
+
+            # v0.9.6 -- opções da entrada SELECIONADA na lista acima
+            # (mesmo padrão de "clica na lista, aparecem as opções dela
+            # embaixo" que Bone Settings já usa pra cada IK chain):
+            # Parent (aninhamento livre -- qualquer collection da lista
+            # pode ser parent de qualquer outra, "Main (root)" = direto
+            # embaixo de Main), "Show in Animation Tab" (pedido
+            # explícito: some só o BOTÃO na aba Animation, a collection
+            # continua existindo normalmente em todo o resto) e por
+            # último Row/Column (grade -- ver _collection_sort_key em
+            # rigger.py). ▲▼ acima continuam reordenando só a LISTA em
+            # si (mais fácil de navegar) -- não afetam o layout final,
+            # isso é 100% Parent + Row/Column.
+            index = armature.hytale_bone_collections_index
+            if 0 <= index < len(armature.hytale_bone_collections):
+                selected = armature.hytale_bone_collections[index]
+                detail_box = box.box()
+                detail_box.label(
+                    text=tr("panel.bone_collection_options_for", lang).format(name=selected.name),
+                    icon="OPTIONS",
+                )
+                detail_box.prop(selected, "parent", text=tr("panel.field_parent", lang))
+                detail_box.prop(selected, "show_in_animation_tab", text=tr("panel.field_show_in_animation", lang))
+                grid_row = detail_box.row(align=True)
+                grid_row.prop(selected, "row", text=tr("panel.field_grid_row", lang))
+                grid_row.prop(selected, "column", text=tr("panel.field_grid_column", lang))
+
+            box.label(text=tr("panel.hint_bone_collections", lang), icon="INFO")
 
         layout.separator()
 
@@ -625,26 +806,18 @@ class HYTALE_PT_main(Panel):
     # Animation
     # ------------------------------------------------------------------
 
-    # Layout da box "Bone Collections" -- uma sub-lista (linha) por
-    # entrada; cada linha pode ter 1 ou 2 pares (name, icon), desenhados
-    # lado a lado na mesma row (Arm R/Arm L e Leg R/Leg L, pra ficarem
-    # emparelhados como no resto do addon -- ver picker_row/_draw_rig).
-    # Os nomes são os literais reais das bone collections que rigger.py
-    # já cria (COLL_MAIN_HEAD etc., em rigger/constants.py) -- fixos de
-    # propósito aqui (mesmo padrão de TAB_ITEMS, no topo do arquivo):
-    # não passam por tr() porque são nomes de dado (o nome real da bone
-    # collection no Armature), não texto de interface.
-    _ANIM_COLLECTION_ROWS = [
-        [("Head", "USER")],
-        [("Spine", "BONE_DATA")],
-        [("Body", "BONE_DATA")],
-        [("Arm R", "BONE_DATA"), ("Arm L", "BONE_DATA")],
-        [("Leg R", "BONE_DATA"), ("Leg L", "BONE_DATA")],
-        [("Root", "ARMATURE_DATA")],
-        [("Tail", "BONE_DATA")],
-        [("Face", "USER")],
-        [("Attachments", "GROUP_BONE")],
-    ]
+    # v0.9 (Etapa 3) -- ERA uma lista fixa de pares (nome, ícone) aqui,
+    # hardcoded na mesma ordem/agrupamento que _build_main_collections
+    # sempre usou (Head, Spine, Body, Arm R/Arm L lado a lado, Leg R/
+    # Leg L lado a lado, Root, Tail, Face, Attachments) -- sem nenhuma
+    # relação com a ordem real do personagem em "Collection Settings".
+    # Removida: _draw_animation agora lê armature.hytale_bone_collections
+    # (a MESMA lista editável/reordenável de "Collection Settings" --
+    # ver rigger.py) direto, então mover algo lá também reordena esta
+    # box, sem precisar duplicar/manter esta lista em sincronia na mão.
+    # O `icon` de cada tupla nunca era usado de verdade no loop antigo
+    # (o botão sempre mostrava HIDE_OFF/HIDE_ON, não esses ícones) --
+    # não é perda nenhuma não recriar esse mapeamento aqui.
 
     def _draw_animation(self, layout, context, lang):
         obj = context.active_object
@@ -657,29 +830,90 @@ class HYTALE_PT_main(Panel):
         armature = obj.data
 
         # --- Bone Collections --------------------------------------
-        # Só mostra/esconde -- não cria nada. Uma linha nasce só se a
-        # collection já existir nesse Armature (armature.collections_all,
-        # que enxerga aninhadas -- ver anim_tools.py); um personagem sem
-        # nenhuma cadeia Tail, por exemplo, nunca vai ter "Tail" na
-        # lista, e a linha correspondente simplesmente não é desenhada.
+        # v0.9.6 -- ERA "MAIN" e "FACE" como as duas únicas raízes
+        # possíveis (Face era hardcoded/auto-criada) -- Face deixou de
+        # existir como caso especial (pedido explícito: "remover a
+        # collection Face... caso algum usuário queira, ele cria
+        # separadamente"). Agora renderiza a ÁRVORE INTEIRA de
+        # armature.hytale_bone_collections recursivamente, seguindo
+        # `item.parent` (qualquer collection pode estar aninhada dentro
+        # de qualquer outra -- ver HytaleBoneCollectionItem.parent) --
+        # funciona pra qualquer profundidade, sem precisar saber de
+        # antemão quantos níveis existem. Dentro de cada nível, agrupa
+        # por `row` (via _collection_sort_key, que já ordena por (row,
+        # column, name)) -- cada grupo de `row` igual vira UMA linha de
+        # UI só, com um botão por coluna, lado a lado (ex. "Arm R" |
+        # "Arm L"). `show_in_animation_tab` (pedido explícito) pula o
+        # botão -- mas os FILHOS dele continuam sendo considerados
+        # normalmente (esconder o pai não esconde os filhos na árvore).
+        #
+        # Só mostra/esconde -- não cria nada; um botão só nasce se a
+        # collection já existir de verdade nesse Armature
+        # (armature.collections_all, que enxerga aninhadas). Um item de
+        # Collection Settings nunca materializado (ainda não rodou
+        # "Create Rig") simplesmente não gera botão nenhum, sem erro.
+        #
+        # v0.9.7 -- "Attachments" também é uma entrada normal de
+        # hytale_bone_collections agora (era uma raiz separada, fora do
+        # Collection Settings por completo -- ver ensure_default_bone_collections
+        # em rigger.py) -- já cai na árvore recursiva abaixo como
+        # qualquer outra, sem tratamento especial.
         coll_box = layout.box()
         coll_box.label(text=tr("panel.anim_collections_box", lang), icon="OUTLINER_OB_ARMATURE")
         any_collection_found = False
-        for row_def in self._ANIM_COLLECTION_ROWS:
-            row = coll_box.row(align=True)
-            row.scale_y = 1.2
-            for name, icon in row_def:
-                coll = armature.collections_all.get(name)
-                if coll is None:
+
+        def toggle_button(target_row, name):
+            nonlocal any_collection_found
+            coll = armature.collections_all.get(name)
+            if coll is None:
+                return
+            any_collection_found = True
+            op = target_row.operator(
+                ANIM_OT_hytale_toggle_collection_visibility.bl_idname,
+                text=name,
+                icon="HIDE_OFF" if coll.is_visible else "HIDE_ON",
+                depress=coll.is_visible,
+            )
+            op.collection_name = name
+
+        def item_parent_key(item):
+            p = (item.parent or "").strip()
+            return "Main" if (not p or p == PARENT_COLLECTION_ROOT) else p
+
+        def render_children(parent_name, indent_level):
+            children = sorted(
+                (i for i in armature.hytale_bone_collections if i.name and item_parent_key(i) == parent_name),
+                key=_collection_sort_key,
+            )
+            current_row_value = None
+            ui_row = None
+            for item in children:
+                if not item.show_in_animation_tab:
                     continue
-                any_collection_found = True
-                op = row.operator(
-                    ANIM_OT_hytale_toggle_collection_visibility.bl_idname,
-                    text=name,
-                    icon="HIDE_OFF" if coll.is_visible else "HIDE_ON",
-                    depress=coll.is_visible,
-                )
-                op.collection_name = name
+                if item.row != current_row_value or ui_row is None:
+                    current_row_value = item.row
+                    ui_row = coll_box.row(align=True)
+                    ui_row.scale_y = 1.2
+                    if indent_level:
+                        ui_row.separator(factor=2.0 * indent_level)
+                toggle_button(ui_row, item.name)
+            # Desce um nível pros filhos de CADA item deste nível, na
+            # ordem em que já foram processados (mesmo que um item tenha
+            # sido pulado por show_in_animation_tab -- os filhos dele
+            # ainda podem querer aparecer).
+            for item in children:
+                render_children(item.name, indent_level + 1)
+
+        # v0.9.7 -- ERA um botão fixo extra aqui pra "Attachments" (bug:
+        # aparecia DUAS VEZES na UI -- render_children já desenha ela
+        # sozinha, já que Attachments virou uma collection normal dentro
+        # de armature.hytale_bone_collections, filha de Main, igual
+        # Head/Spine/etc.; antes disso, quando Attachments era uma raiz
+        # separada FORA de hytale_bone_collections, esta linha extra era
+        # necessária -- ficou pra trás depois da mudança e passou a
+        # duplicar o mesmo botão. Removida.
+        render_children("Main", 0)
+
         if not any_collection_found:
             coll_box.label(text=tr("panel.hint_anim_no_rig", lang), icon="INFO")
 
@@ -710,15 +944,127 @@ class HYTALE_PT_main(Panel):
             icon="SNAP_ON",
         )
 
-        any_chain_found = False
+        # v0.9 (Etapa 3) -- reordena a lista pela collection REAL que
+        # cada cadeia caiu (Auto -> Arm L/Arm R/Leg L/Leg R por lado, ou
+        # a collection escolhida em "Collection", ver HytaleIKChainItem.
+        # collection_override em rigger.py), na ordem de "Collection
+        # Settings" -- em vez de recalcular a lógica de lado/prefixo de
+        # bone que decide Arm L vs Arm R (ARM_COLLECTION_ROOTS, bem mais
+        # complexa -- ver rigger/constants.py), lê direto a collection
+        # de VERDADE que o bone raiz da cadeia já está, depois do
+        # último "Create Rig" -- sempre bate com o resultado real,
+        # nunca diverge (ground truth, não reimplementação em paralelo).
+        #
+        # v0.9.9 -- FIX: checava só root_bone + "_CTRL", e isso sempre
+        # devolvia None (bug relatado: "não parece estar surgindo
+        # efeito" -- a ordem ficava idêntica à de Bone Settings, porque
+        # TODA cadeia caía no mesmo fallback). Causa: o "_CTRL" nem
+        # sempre é o bone que carrega a membership de Main na prática --
+        # ver _propagate_pole_and_tip_to_main_collections (rigger.py),
+        # que usa o "_IK" da raiz (chain[0].name + SUFFIX_IK) como
+        # referência, não o "_CTRL" -- em cadeias sem Shoulder (ver
+        # ARM_COLLECTION_ROOTS_NO_SHOULDER/rigger/constants.py), é
+        # justamente o "_IK" que é um dos ROOTS do walk que monta Arm L/
+        # Arm R/Leg L/Leg R, enquanto o "_CTRL" pode não ser alcançado
+        # da mesma forma. Em vez de tentar adivinhar qual dos dois é o
+        # certo pra cada caso, testa os DOIS (root_bone e tip_bone, cada
+        # um com "_CTRL" e "_IK") e usa o primeiro que encontrar
+        # membership numa collection conhecida -- cobre qualquer uma das
+        # combinações de parenting que o rig realmente usar.
+        def resolve_chain_collection_name(item):
+            known_names = {c.name for c in armature.hytale_bone_collections if c.name}
+            candidate_names = []
+            for base in (item.root_bone, item.tip_bone):
+                if base:
+                    candidate_names.append(base + SUFFIX_CTRL)
+                    candidate_names.append(base + SUFFIX_IK)
+            for name in candidate_names:
+                bone = armature.bones.get(name)
+                if bone is None:
+                    continue
+                for coll in bone.collections:
+                    if coll.name in known_names:
+                        return coll.name
+            return None
+
+        # v0.9.5 -- a "posição" de cada collection agora vem da grade
+        # (row, column, name) de Collection Settings (ver
+        # _collection_sort_key/HytaleBoneCollectionItem.row/column em
+        # rigger.py), não mais da ordem crua da lista.
+        sorted_collections = sorted(
+            (c for c in armature.hytale_bone_collections if c.name), key=_collection_sort_key
+        )
+        collection_order = {c.name: i for i, c in enumerate(sorted_collections)}
+        # v0.9.9 -- Row de cada collection (não só a posição linear) --
+        # usado só pra decidir AGRUPAMENTO visual (duas cadeias cujas
+        # collections compartilham o mesmo Row viram colunas lado a
+        # lado, mesma UI row -- pedido explícito, mesmo espírito da
+        # grade que a box "Bone Collections" já usa). A ORDENAÇÃO em si
+        # continua sendo por collection_order (row, column, name juntos)
+        # -- isso aqui só agrupa visualmente quem já ficou adjacente.
+        collection_row = {c.name: c.row for c in armature.hytale_bone_collections if c.name}
+
+        fkik_rows = []
         for index, item in enumerate(armature.hytale_ik_chains):
             state = get_fk_ik_state(obj, item)
             if state is None:
                 continue
+            coll_name = resolve_chain_collection_name(item)
+            sort_key = collection_order.get(coll_name, len(collection_order))
+            # Bucket de agrupamento -- cadeia SEM collection resolvida
+            # (coll_name None/desconhecida) nunca agrupa com outra: usa
+            # o próprio índice como bucket único, então sempre vira sua
+            # própria linha (evita juntar duas cadeias "sem posição"
+            # por coincidência).
+            row_bucket = ("row", collection_row[coll_name]) if coll_name in collection_row else ("solo", index)
+            fkik_rows.append((sort_key, index, item, state, row_bucket))
+        # Ordena por (posição da collection em "Collection Settings", índice
+        # original) -- o índice original como desempate mantém estável a
+        # ordem entre cadeias que caíram na MESMA collection.
+        fkik_rows.sort(key=lambda r: (r[0], r[1]))
+
+        any_chain_found = False
+        current_bucket = None
+        ui_row = None
+        for sort_key, index, item, state, row_bucket in fkik_rows:
             any_chain_found = True
-            row = fkik_box.row(align=True)
-            row.label(text=item.label or item.root_bone or "(?)")
-            sub = row.row(align=True)
+            if row_bucket != current_bucket or ui_row is None:
+                current_bucket = row_bucket
+                ui_row = fkik_box.row(align=True)
+            else:
+                # v0.9.9 -- respiro visual entre DUAS cadeias que caem na
+                # MESMA UI row (compartilham Row) -- sem isso, o botão IK
+                # da cadeia anterior ficava colado no label da próxima
+                # (bug relatado: "Arm R  FK/IK Arm L  FK/IK", sem
+                # separação nenhuma entre a IK de uma e o nome da outra).
+                # v0.9.10: factor reduzido pra 0.8 quando o split interno
+                # ficou mais justo -- v0.9.11: subiu de novo pra 3.0
+                # (pedido explícito: o vão INTERNO -- label pros próprios
+                # botões -- já ficou bom com split(factor=0.35); o que
+                # precisava crescer era só o vão ENTRE cadeias -- botão
+                # IK de uma pro texto da próxima).
+                ui_row.separator(factor=3.0)
+            # v0.9.9 -- ERA column(align=True) -- o label esticava pra
+            # preencher o espaço todo antes dos botões (sem proporção
+            # fixa), deixando o vão entre nome e FK/IK enorme e
+            # inconsistente entre cadeias com nomes de tamanhos
+            # diferentes. split(factor=...) fixa a proporção label/
+            # botões -- consistente pra QUALQUER texto de label, curto
+            # ou longo.
+            #
+            # v0.9.10 -- FIX: factor=0.55 reservava mais da metade de
+            # CADA coluna só pro texto -- como "Arm R"/"Leg L" etc. são
+            # curtos, sobrava um vão vazio grande antes dos botões (bug
+            # relatado: aumentou o espaço nos dois lados, não só entre
+            # cadeias). O Blender não mede a largura real do texto pra
+            # decidir a proporção do split -- é sempre uma fração FIXA
+            # da largura disponível, então baixar o factor pra algo mais
+            # compatível com nomes curtos aperta o vão sem quebrar nomes
+            # mais longos (que só ficam truncados/elípticos, não
+            # sobrepostos).
+            split = ui_row.split(factor=0.35, align=True)
+            split.label(text=item.label or item.root_bone or "(?)")
+            sub = split.row(align=True)
             op_fk = sub.operator(ANIM_OT_hytale_set_fk_ik.bl_idname, text="FK", depress=(state == 0))
             op_fk.chain_index = index
             op_fk.mode = "FK"
@@ -737,6 +1083,7 @@ def register():
     # (pedido explícito: as duas começam collapsed, o fluxo comum do dia
     # a dia é só "Create Rig", sem precisar abrir nenhuma delas).
     WindowManager.hytale_show_ik_chains = BoolProperty(default=False)
+    WindowManager.hytale_show_bone_collections = BoolProperty(default=False)
     WindowManager.hytale_show_templates = BoolProperty(default=False)
     bpy.utils.register_class(HYTALE_PT_main)
 
@@ -744,5 +1091,6 @@ def register():
 def unregister():
     bpy.utils.unregister_class(HYTALE_PT_main)
     del WindowManager.hytale_show_templates
+    del WindowManager.hytale_show_bone_collections
     del WindowManager.hytale_show_ik_chains
     del WindowManager.hytale_active_tab

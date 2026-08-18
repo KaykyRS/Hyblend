@@ -86,8 +86,14 @@ from .constants import (  # noqa: F401
     SUFFIX_TAIL,
 )
 from .rig import (  # noqa: F401
+    HytaleBoneCollectionItem,
     HytaleIKChainItem,
     RIG_MT_hytale_ik_chain_add_menu,
+    RIG_OT_hytale_bone_collection_add,
+    RIG_OT_hytale_bone_collection_load_defaults,
+    RIG_OT_hytale_bone_collection_move,
+    RIG_OT_hytale_bone_collection_remove,
+    RIG_OT_hytale_bone_collection_reset_grid,
     RIG_OT_hytale_clear_generated,
     RIG_OT_hytale_collection_template_apply,
     RIG_OT_hytale_collection_template_delete,
@@ -108,10 +114,17 @@ from .rig import (  # noqa: F401
     RIG_OT_hytale_shape_template_delete,
     RIG_OT_hytale_shape_template_save,
     RIG_OT_hytale_validate_rig,
+    RIG_UL_hytale_bone_collections,
     RIG_UL_hytale_ik_chains,
+    PARENT_COLLECTION_ROOT,
+    _collection_sort_key,
+    _resolve_collection_parent,
+    ensure_default_bone_collections,
     find_org_path,
+    register_bone_collection_defaults_handler,
     register_shape_edit_border,
     switch_property_name,
+    unregister_bone_collection_defaults_handler,
     unregister_shape_edit_border,
 )
 
@@ -133,6 +146,17 @@ _CLASSES = (
     RIG_OT_hytale_ik_chain_pick_bone,
     RIG_OT_hytale_ik_chain_load_defaults,
     RIG_OT_hytale_ik_chain_move,
+    # v0.9 -- Collection Settings (Etapa 1). HytaleBoneCollectionItem
+    # precisa registrar ANTES de qualquer coisa que a referencie via
+    # CollectionProperty(type=...) logo abaixo (mesmo motivo pelo qual
+    # HytaleIKChainItem é o primeiro da lista).
+    HytaleBoneCollectionItem,
+    RIG_UL_hytale_bone_collections,
+    RIG_OT_hytale_bone_collection_load_defaults,
+    RIG_OT_hytale_bone_collection_reset_grid,
+    RIG_OT_hytale_bone_collection_add,
+    RIG_OT_hytale_bone_collection_remove,
+    RIG_OT_hytale_bone_collection_move,
     RIG_OT_hytale_shape_template_apply,
     RIG_OT_hytale_rig_template_save,
     RIG_OT_hytale_rig_template_delete,
@@ -194,6 +218,21 @@ def register():
         default=False,
     )
 
+    # v0.9 -- Collection Settings (Etapa 1-3). Lista editável de
+    # collections (Main/Face), fonte do dropdown "Collection" em cada
+    # entrada de hytale_ik_chains (ver HytaleIKChainItem.collection_override
+    # em rig.py) e do que _apply_bone_collection_overrides cria de
+    # verdade em "Create Rig". hytale_bone_collections_initialized
+    # controla o seed único das 9 entradas default (Head/Spine/Body/
+    # Arm L/Arm R/Leg L/Leg R/Root/Tail) -- ver ensure_default_bone_collections,
+    # chamada de dentro de execute() de operador (RIG_OT_hytale_generate_rig,
+    # RIG_OT_hytale_bone_collection_load_defaults) ou do handler automático
+    # register_bone_collection_defaults_handler logo abaixo -- NUNCA de
+    # dentro de draw() (ver docstring de ensure_default_bone_collections).
+    Armature.hytale_bone_collections = CollectionProperty(type=HytaleBoneCollectionItem)
+    Armature.hytale_bone_collections_index = IntProperty(default=0)
+    Armature.hytale_bone_collections_initialized = BoolProperty(default=False)
+
     # Seleção de template (Rig/Shape/Collection) do dropdown compacto da
     # box "Character Templates" do interface.py. No WindowManager (não no
     # Armature, como hytale_ik_chains) porque é a mesma lista de arquivos
@@ -212,13 +251,25 @@ def register():
     # hytale_shape_edit_mode do armature ativo a cada redraw.
     register_shape_edit_border()
 
+    # v0.9.2 -- seed automático de hytale_bone_collections (Collection
+    # Settings), sem precisar clicar em "Load Default Collections" --
+    # mesmo espírito do handler acima, um handler de
+    # depsgraph_update_post que roda de FORA de draw() (ver docstring
+    # completa em register_bone_collection_defaults_handler/rig.py sobre
+    # por que draw() não pode fazer isso direto).
+    register_bone_collection_defaults_handler()
+
 
 def unregister():
+    unregister_bone_collection_defaults_handler()
     unregister_shape_edit_border()
 
     del WindowManager.hytale_collection_template_selected
     del WindowManager.hytale_shape_template_selected
     del WindowManager.hytale_rig_template_selected
+    del Armature.hytale_bone_collections_initialized
+    del Armature.hytale_bone_collections_index
+    del Armature.hytale_bone_collections
     del Armature.hytale_shape_edit_mode
     del Armature.hytale_active_collection_template
     del Armature.hytale_active_shape_template
