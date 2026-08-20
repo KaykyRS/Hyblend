@@ -36,6 +36,9 @@ from mathutils import Quaternion, Vector
 # 1/64 de um lado e um 1/65 do outro por acidente de digitação.
 UNIT_SCALE_DEFAULT = 1.0 / 64.0
 
+ACTION_SOURCE_DURATION_PROP = "hytale_source_duration"
+ACTION_SOURCE_HOLD_LAST_KEYFRAME_PROP = "hytale_source_hold_last_keyframe"
+
 # O .blockyanim grava "duration" e "time" em frames a 60 FPS FIXOS,
 # independente do FPS da cena do Blender. Usado só pelo exporter hoje, mas
 # fica aqui porque é uma constante do FORMATO do jogo, não uma escolha do

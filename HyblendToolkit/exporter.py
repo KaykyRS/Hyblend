@@ -26,6 +26,8 @@ from bpy.types import Armature, Operator, PropertyGroup
 from mathutils import Matrix, Quaternion, Vector
 
 from .common import (
+    ACTION_SOURCE_DURATION_PROP,
+    ACTION_SOURCE_HOLD_LAST_KEYFRAME_PROP,
     BONE_ORIGINAL_NAME_PROP,
     FPS_HYTALE,
     SUFFIX_CTRL,
@@ -970,224 +972,249 @@ class EXPORT_OT_hytale_blockyanim(Operator):
     # ---------------- Geral (sempre visível) ----------------
 
     bake_animation: BoolProperty(
-        name="Bake Animation",
+        name="Bake Every Frame",
         description=(
-            "ON: samples the fully-resolved pose (IK, constraints, "
-            "everything) at every frame -- most robust, recommended "
-            "whenever IK is involved. Always writes Linear interpolation "
-            "(no Smooth option here -- see the Advanced section for why). "
-            "OFF: tries to preserve as much as possible by only sampling "
-            "at frames where SOMETHING in the rig has a keyframe"
+            "ON (recommended): samples the final pose at every single "
+            "frame, exactly as it looks in the viewport (IK, constraints, "
+            "everything). Always safe, but makes bigger files. OFF: only "
+            "samples frames that actually have a keyframe -- smaller "
+            "files, but can look wrong if your rig uses IK, since IK "
+            "poses aren't simple straight lines between keyframes"
         ),
         default=True,
     )
 
-    hold_last_keyframe: BoolProperty(
-        name="Hold Last Keyframe (no loop)",
+    is_loop: BoolProperty(
+        name="Loop?",
         description=(
-            "Applies to every file exported in this batch. ON: animation "
-            "stops and holds its last pose. OFF: animation loops back to "
-            "the start"
+            "ON: the animation eases back to its starting pose at the "
+            "end, so it can repeat seamlessly (walk, run, idle). OFF: the "
+            "animation just stops and holds its last pose (attacks, "
+            "deaths, one-off actions). This setting applies to every file "
+            "in this export, EXCEPT Actions re-exported with 'Keep "
+            "Imported Timing' ON (Advanced Options > Re-Export), which use "
+            "their own original value instead"
         ),
         default=False,
     )
 
     force_start_end_keying: BoolProperty(
-        name="Force Start/End Keying",
+        name="Keep First & Last Frame",
         description=(
-            "Only matters when Bake Animation is OFF: guarantees the first "
-            "and last frame of each Action's own range gets sampled, even "
-            "if there's no literal keyframe exactly there. With Bake "
-            "Animation ON this is always true anyway (every frame is "
-            "sampled regardless)"
+            "Only matters when 'Bake Every Frame' is OFF: makes sure the "
+            "very first and last frame of each Action always get written, "
+            "even if nothing was explicitly keyed exactly there. Without "
+            "this, the exported clip could start or end a few frames "
+            "early/late. Always on automatically when 'Bake Every Frame' "
+            "is ON"
         ),
         default=True,
     )
 
-    show_advanced: BoolProperty(name="Advanced Options", default=False)
+    show_optimization: BoolProperty(name="Optimization", default=False)
+    show_stretch: BoolProperty(name="Stretch Animation", default=False)
+    show_uv: BoolProperty(name="Mouth / UV Animation", default=False)
+    show_rig: BoolProperty(name="Rig Setup", default=False)
+    show_format: BoolProperty(name="File Format", default=False)
+    show_reexport: BoolProperty(name="Re-Export", default=False)
 
-    # ---------------- Avançado (recolhido por padrão) ----------------
+    # ---------------- Avançado (cada categoria colapsa por conta própria,
+    # ver draw() -- não existe mais um "Advanced Options" único envolvendo
+    # todas elas) ----------------
 
     frame_step: IntProperty(
         name="Frame Step",
-        description="Only used when Bake Animation is ON -- 1 samples every frame",
+        description=(
+            "Only used when 'Bake Every Frame' is ON: 1 writes every "
+            "single frame (safest). A higher number skips frames to save "
+            "space, at the cost of smoothness -- only raise this if file "
+            "size is a real problem"
+        ),
         default=1,
         min=1,
     )
 
     preserved_interpolation: EnumProperty(
-        name="Interpolation (Bake Animation OFF)",
+        name="Curve Style",
         description=(
-            "Blockyanim only supports 'linear' or 'smooth' per keyframe "
-            "(not full bezier handles), so this is applied uniformly"
+            "Only used when 'Bake Every Frame' is OFF: how the game "
+            "should smoothly move between two keyframes. Blockyanim only "
+            "understands two styles (not full Bezier handles like "
+            "Blender), so this one style is used for every keyframe"
         ),
         items=[
-            ("smooth", "Smooth (Catmull-Rom)", "Closer to Blender's default Bezier handles"),
-            ("linear", "Linear", ""),
+            ("smooth", "Smooth", "Eases in and out between keyframes -- closest to Blender's default curves"),
+            ("linear", "Linear", "Moves at a constant speed between keyframes, no easing"),
         ],
         default="smooth",
     )
 
-    unit_scale: FloatProperty(
-        name="Scale (Blender units per game unit)",
+    quantize_values: BoolProperty(
+        name="Snap to Grid",
         description=(
-            "MUST match the value used when this rig was imported by the "
-            "Hytale Blockymodel Importer -- positions are multiplied by "
-            "1/this value to convert back to game units"
-        ),
-        default=UNIT_SCALE_DEFAULT,
-        min=0.0001,
-        max=10.0,
-    )
-
-    export_scale: BoolProperty(
-        name="Export Scale (shapeStretch)",
-        description=(
-            "Also export the bone's scale relative to rest as the "
-            "'shapeStretch' channel. 1.0 on all axes = no stretch"
+            "ON (recommended): rounds every written number to a fixed "
+            "precision (see the three Step values below), which cleans up "
+            "invisible floating-point jitter that Blender's math produces "
+            "even for a bone that looks perfectly still. OFF: writes "
+            "numbers exactly as Blender computed them, decimals and all"
         ),
         default=True,
     )
 
-    scale_zero_epsilon: FloatProperty(
-        name="Scale Noise Floor (distance from 1.0)",
-        description="Same idea as the position noise floor, but around identity scale (1,1,1) instead of zero",
-        default=0.001,
+    position_quantize_step: FloatProperty(
+        name="Position Step",
+        description="Smallest position change 'Snap to Grid' will keep, in game units. Smaller = more precise, larger file",
+        default=0.0001,
+        min=0.0,
+    )
+    rotation_quantize_step: FloatProperty(
+        name="Rotation Step",
+        description="Smallest rotation change 'Snap to Grid' will keep. Smaller = more precise, larger file",
+        default=0.00001,
+        min=0.0,
+    )
+    scale_quantize_step: FloatProperty(
+        name="Stretch Step",
+        description="Smallest stretch/scale change 'Snap to Grid' will keep. Smaller = more precise, larger file",
+        default=0.0001,
         min=0.0,
     )
 
-    uv_offset_step_x: FloatProperty(
-        name="Grid Step X (Blender units)",
-        description=(
-            "Divisor used to snap the control bone's Location X to a grid "
-            "-- must match the divisor in your Mapping node driver's X "
-            "expression (e.g. round(location/0.1)*... -> 0.1 goes here)"
-        ),
-        default=0.1,
-    )
-
-    uv_offset_px_x: FloatProperty(
-        name="Pixels per Step X",
-        description=(
-            "Raw atlas pixels moved per grid step on X, written directly "
-            "into shapeUvOffset -- the game expects raw pixel offsets, "
-            "not normalized UV (0..1)"
-        ),
-        default=20.0,
-    )
-
-    uv_offset_step_y: FloatProperty(
-        name="Grid Step Y (Blender units)",
-        description="Same idea as Grid Step X, applied to the control bone's Location Y",
-        default=-0.045,
-    )
-
-    uv_offset_px_y: FloatProperty(
-        name="Pixels per Step Y",
-        description="Same idea as Pixels per Step X, applied to Y",
-        default=-10.0,
-    )
-
-    quantize_values: BoolProperty(
-        name="Quantize Values (snap to grid)",
-        description=(
-            "Rounds every written position/rotation/scale component to a "
-            "fixed step. Suppresses tiny floating-point jitter riding on "
-            "top of real motion, even with no constraints involved at all"
-        ),
-        default=True,
-    )
-
-    position_quantize_step: FloatProperty(name="Position Quantize Step (game units)", default=0.0001, min=0.0)
-    rotation_quantize_step: FloatProperty(name="Rotation Quantize Step (quaternion component)", default=0.00001, min=0.0)
-    scale_quantize_step: FloatProperty(name="Scale Quantize Step", default=0.0001, min=0.0)
-
     position_zero_epsilon: FloatProperty(
-        name="Position Noise Floor (game units)",
+        name="Position Noise Floor",
         description=(
-            "Any position delta smaller than this is treated as EXACTLY "
-            "zero. Floating-point matrix math produces tiny non-zero noise "
-            "even for bones that should never translate -- left unclamped, "
-            "that noise reads as micro-shake in-game"
+            "A bone that should be perfectly still can still end up with "
+            "a microscopic position value due to floating-point math -- "
+            "in-game this can look like tiny, invisible-in-Blender "
+            "shaking. Any position smaller than this (in game units) gets "
+            "snapped to exactly zero instead"
         ),
         default=0.001,
         min=0.0,
     )
 
     rotation_zero_epsilon: FloatProperty(
-        name="Rotation Noise Floor (dot product)",
+        name="Rotation Noise Floor",
         description=(
-            "Same idea as the position noise floor, but for rotation: any "
-            "orientation delta whose dot product with the identity "
-            "quaternion is within this distance of 1.0 is snapped to "
-            "EXACTLY identity. Matters most on IK bones -- the IK solver "
-            "is iterative, so even a target sitting exactly at the rest "
-            "position can converge to a solution a tiny fraction off from "
-            "the bind pose, baking a constant 'phantom' rotation into "
-            "every single frame (Thigh/Foot on an IK leg are the classic "
-            "case; the mid-chain Calf/Shin usually isn't affected)"
+            "Same idea as Position Noise Floor, but for rotation: a bone "
+            "that should be perfectly still can end up with a "
+            "microscopic rotation instead of none at all (very common on "
+            "IK legs/arms, where the solver rarely lands on an EXACT "
+            "answer). Any rotation closer to 'no rotation at all' than "
+            "this gets snapped to exactly zero"
         ),
         default=0.0001,
         min=0.0,
     )
 
     skip_redundant_frames: BoolProperty(
-        name="Skip Redundant Frames (RDP)",
+        name="Remove Extra Frames",
         description=(
-            "OFF by default: writes every sampled frame, guaranteeing an "
-            "exact match to what you see in Blender. Note that compact "
-            "formatting + rounding (below) already does most of the file-"
-            "size work losslessly -- this option is a further, LOSSY "
-            "reduction on top of that, so only turn it on if file size is "
-            "still a problem after that. Uses Ramer-Douglas-Peucker per "
-            "bone per channel: instead of only comparing each frame to the "
-            "last one WRITTEN, it looks at the whole run of samples "
-            "between two keyframes and drops the ones that are already "
-            "well-approximated by a straight line/slerp between the "
-            "endpoints -- catches long near-linear stretches (e.g. a slow "
-            "ease) that a neighbor-only comparison would miss. Bones that "
-            "keep DIFFERENT reduced keyframes near the same moment (e.g. "
-            "during a fast multi-bone pose change) are automatically "
-            "synced to a shared set of times in that window, so a pose "
-            "change always lands on the same frame across the whole rig "
-            "-- this is always on when this option is on, there's no "
-            "separate switch for it, and no need to know in advance "
-            "whether a given animation needs it"
+            "OFF (default): writes every sampled frame, guaranteeing an "
+            "exact match to what you see in Blender. ON: additionally "
+            "drops frames that don't add any real information -- for "
+            "example, a long straight stretch of motion doesn't need a "
+            "point every single frame if a few points already describe "
+            "the same curve. This makes the file noticeably smaller but "
+            "is LOSSY (can very slightly change the curve) -- only turn "
+            "it on if file size is still a problem after 'Snap to Grid' "
+            "and compact JSON formatting, which already help for free"
         ),
         default=False,
     )
 
-
     position_epsilon: FloatProperty(
-        name="Position Epsilon (game units)",
+        name="Position Tolerance",
         description=(
-            "RDP tolerance for 'Skip Redundant Frames' on position and "
-            "shapeStretch (scale): a sample is dropped if it's within this "
-            "distance of the straight line connecting its two neighboring "
-            "keyframes"
+            "Only used when 'Remove Extra Frames' is ON: how far (in game "
+            "units) a position/stretch frame is allowed to drift from a "
+            "straight line before it's considered necessary to keep. "
+            "Higher = more frames removed, less precise"
         ),
         default=0.001,
         min=0.0,
     )
     rotation_epsilon: FloatProperty(
-        name="Rotation Epsilon (dot product)",
+        name="Rotation Tolerance",
         description=(
-            "RDP tolerance for 'Skip Redundant Frames' on orientation: a "
-            "sample is dropped if it's within this distance (1.0 minus "
-            "quaternion dot product) of the slerp connecting its two "
-            "neighboring keyframes"
+            "Only used when 'Remove Extra Frames' is ON: how far a "
+            "rotation frame is allowed to drift from a smooth curve "
+            "before it's considered necessary to keep. Higher = more "
+            "frames removed, less precise"
         ),
         default=0.0001,
         min=0.0,
     )
 
-    output_decimal_places: IntProperty(
-        name="Output Decimal Places",
+    export_scale: BoolProperty(
+        name="Export Stretch (Scale)",
         description=(
-            "Numbers in the written file are rounded to this many decimal "
-            "places -- purely cosmetic/file-size, doesn't drop any "
-            "keyframes, just shortens each number's text representation "
-            "(e.g. avoids things like 0.30000000000000004)"
+            "ON (recommended): includes bone scale/stretch animation in "
+            "the file (the 'shapeStretch' channel -- e.g. an eyebrow "
+            "squashing/stretching). Turn OFF only if this rig never "
+            "animates stretch and you want to skip sampling it entirely"
+        ),
+        default=True,
+    )
+
+    scale_zero_epsilon: FloatProperty(
+        name="Stretch Noise Floor",
+        description="Same idea as Position Noise Floor, but for stretch: any scale closer to 1.0 (no stretch) than this on every axis gets snapped to exactly 1.0",
+        default=0.001,
+        min=0.0,
+    )
+
+    uv_offset_step_x: FloatProperty(
+        name="Grid Step X",
+        description=(
+            "In Blender units: how far the control bone has to move on X "
+            "for the mouth/face texture to shift by one step. Must match "
+            "whatever your shader/driver setup actually uses -- this "
+            "doesn't invent the behavior, it just has to describe it "
+            "correctly"
+        ),
+        default=0.1,
+    )
+
+    uv_offset_px_x: FloatProperty(
+        name="Pixels per Step X",
+        description="How many raw texture pixels one X grid step represents in the file (the game expects raw pixel offsets, not a 0..1 fraction)",
+        default=20.0,
+    )
+
+    uv_offset_step_y: FloatProperty(
+        name="Grid Step Y",
+        description="Same as Grid Step X, for the control bone's Y movement",
+        default=-0.045,
+    )
+
+    uv_offset_px_y: FloatProperty(
+        name="Pixels per Step Y",
+        description="Same as Pixels per Step X, for Y",
+        default=-10.0,
+    )
+
+    unit_scale: FloatProperty(
+        name="Blender Units per Game Unit",
+        description=(
+            "MUST match the exact value used when this character was "
+            "imported (Hytale Blockymodel Importer) -- if they don't "
+            "match, every position in the exported file will be wrong by "
+            "a consistent scale factor. When in doubt, leave this at the "
+            "default"
+        ),
+        default=UNIT_SCALE_DEFAULT,
+        min=0.0001,
+        max=10.0,
+    )
+
+    output_decimal_places: IntProperty(
+        name="Decimal Places",
+        description=(
+            "How many digits after the decimal point to keep for every "
+            "number in the file. Purely cosmetic and doesn't drop any "
+            "keyframes -- just keeps the file from being full of numbers "
+            "like 0.30000000000000004"
         ),
         default=6,
         min=1,
@@ -1195,17 +1222,37 @@ class EXPORT_OT_hytale_blockyanim(Operator):
     )
 
     pretty_print_json: BoolProperty(
-        name="Pretty Print (indented JSON)",
+        name="Readable JSON",
         description=(
-            "Off by default: the file is written as a single compact line "
-            "(smaller file, and nothing normally reads it by hand). Turn "
-            "this on to write indented, multi-line JSON instead -- purely "
-            "for manually opening/comparing/diffing the file (e.g. against "
-            "a Blockbench re-export), roughly doubles file size and "
-            "changes nothing the game/Blockbench actually reads"
+            "OFF (default): writes the file as one compact line -- "
+            "smaller, and nothing normally needs to read it by hand. ON: "
+            "writes it nicely indented across many lines instead, purely "
+            "so a human can open and read/compare it (roughly doubles "
+            "file size; the game and Blockbench read either format "
+            "identically)"
         ),
         default=False,
     )
+
+    use_source_metadata: BoolProperty(
+        name="Keep Imported Timing",
+        description=(
+            "Only matters for an Action that was imported by 'Import "
+            "Hytale Animation' and hasn't been edited since. ON: reuse "
+            "that file's exact original Duration/Loop values instead of "
+            "the 'Loop?' option above and the current timeline length -- "
+            "useful for a verification export, to check that reimporting "
+            "an unedited file gives back exactly the same file. OFF "
+            "(default, and what you want for normal editing work): always "
+            "compute Duration/Loop fresh from the current timeline and "
+            "the 'Loop?' option above. Leave this OFF whenever you've "
+            "actually changed the animation, or a stale imported Duration "
+            "shorter than your edit could silently cut off frames in the "
+            "exported file"
+        ),
+        default=False,
+    )
+
 
     @classmethod
     def poll(cls, context):
@@ -1253,36 +1300,64 @@ class EXPORT_OT_hytale_blockyanim(Operator):
 
         general_box = layout.box()
         general_box.prop(self, "bake_animation")
-        general_box.prop(self, "hold_last_keyframe")
+        general_box.prop(self, "is_loop")
         fsub = general_box.column()
         fsub.enabled = not self.bake_animation
         fsub.prop(self, "force_start_end_keying")
 
         layout.prop(
-            self, "show_advanced",
-            icon="TRIA_DOWN" if self.show_advanced else "TRIA_RIGHT",
+            self, "show_optimization",
+            icon="TRIA_DOWN" if self.show_optimization else "TRIA_RIGHT",
             emboss=False,
         )
-        if self.show_advanced:
-            adv = layout.box()
+        if self.show_optimization:
+            opt_box = layout.box()
 
-            step_col = adv.column()
+            step_col = opt_box.column()
             step_col.enabled = self.bake_animation
             step_col.prop(self, "frame_step")
 
-            interp_col = adv.column()
+            interp_col = opt_box.column()
             interp_col.enabled = not self.bake_animation
             interp_col.prop(self, "preserved_interpolation")
 
-            adv.separator()
-            adv.prop(self, "unit_scale")
+            opt_box.separator()
+            opt_box.prop(self, "quantize_values")
+            quant_col = opt_box.column()
+            quant_col.enabled = self.quantize_values
+            quant_col.prop(self, "position_quantize_step")
+            quant_col.prop(self, "rotation_quantize_step")
+            quant_col.prop(self, "scale_quantize_step")
 
-            adv.separator()
-            adv.prop(self, "export_scale")
-            scale_col = adv.column()
+            opt_box.separator()
+            opt_box.prop(self, "position_zero_epsilon")
+            opt_box.prop(self, "rotation_zero_epsilon")
+
+            opt_box.separator()
+            opt_box.prop(self, "skip_redundant_frames")
+            skip_col = opt_box.column()
+            skip_col.enabled = self.skip_redundant_frames
+            skip_col.prop(self, "position_epsilon")
+            skip_col.prop(self, "rotation_epsilon")
+
+        layout.prop(
+            self, "show_stretch",
+            icon="TRIA_DOWN" if self.show_stretch else "TRIA_RIGHT",
+            emboss=False,
+        )
+        if self.show_stretch:
+            stretch_box = layout.box()
+            stretch_box.prop(self, "export_scale")
+            scale_col = stretch_box.column()
             scale_col.enabled = self.export_scale
             scale_col.prop(self, "scale_zero_epsilon")
 
+        layout.prop(
+            self, "show_uv",
+            icon="TRIA_DOWN" if self.show_uv else "TRIA_RIGHT",
+            emboss=False,
+        )
+        if self.show_uv:
             # Export Bone Collection e Export UV Offset (toggle + qual bone
             # é fonte/alvo) saíram deste diálogo -- agora ficam no painel
             # "Hytale Export" (Object Properties da Armature), editado pelo
@@ -1290,41 +1365,45 @@ class EXPORT_OT_hytale_blockyanim(Operator):
             # UV, que é OUTRO tipo de dado (constantes de conversão
             # px<->unidade Blender, não "qual bone"/"ligado ou não") -- por
             # isso não faz sentido mover pra lá junto. Ver DEVELOPER_NOTES.md.
-            adv.separator()
-            uv_col = adv.column()
-            uv_col.label(
-                text="UV Offset grid calibration (on/off + bones: Hytale Export panel)",
+            uv_box = layout.box()
+            uv_box.label(
+                text="Turn on/pick bones in the 'Hytale Export' panel -- this is just the grid calibration",
                 icon="INFO",
             )
-            uv_row1 = uv_col.row(align=True)
+            uv_row1 = uv_box.row(align=True)
             uv_row1.prop(self, "uv_offset_step_x")
             uv_row1.prop(self, "uv_offset_px_x")
-            uv_row2 = uv_col.row(align=True)
+            uv_row2 = uv_box.row(align=True)
             uv_row2.prop(self, "uv_offset_step_y")
             uv_row2.prop(self, "uv_offset_px_y")
 
-            adv.separator()
-            adv.prop(self, "quantize_values")
-            quant_col = adv.column()
-            quant_col.enabled = self.quantize_values
-            quant_col.prop(self, "position_quantize_step")
-            quant_col.prop(self, "rotation_quantize_step")
-            quant_col.prop(self, "scale_quantize_step")
+        layout.prop(
+            self, "show_rig",
+            icon="TRIA_DOWN" if self.show_rig else "TRIA_RIGHT",
+            emboss=False,
+        )
+        if self.show_rig:
+            rig_box = layout.box()
+            rig_box.prop(self, "unit_scale")
 
-            adv.separator()
-            adv.prop(self, "position_zero_epsilon")
-            adv.prop(self, "rotation_zero_epsilon")
+        layout.prop(
+            self, "show_format",
+            icon="TRIA_DOWN" if self.show_format else "TRIA_RIGHT",
+            emboss=False,
+        )
+        if self.show_format:
+            format_box = layout.box()
+            format_box.prop(self, "output_decimal_places")
+            format_box.prop(self, "pretty_print_json")
 
-            adv.separator()
-            adv.prop(self, "skip_redundant_frames")
-            skip_col = adv.column()
-            skip_col.enabled = self.skip_redundant_frames
-            skip_col.prop(self, "position_epsilon")
-            skip_col.prop(self, "rotation_epsilon")
-
-            adv.separator()
-            adv.prop(self, "output_decimal_places")
-            adv.prop(self, "pretty_print_json")
+        layout.prop(
+            self, "show_reexport",
+            icon="TRIA_DOWN" if self.show_reexport else "TRIA_RIGHT",
+            emboss=False,
+        )
+        if self.show_reexport:
+            reexport_box = layout.box()
+            reexport_box.prop(self, "use_source_metadata")
 
     def execute(self, context):
         obj = context.active_object
@@ -1388,10 +1467,27 @@ class EXPORT_OT_hytale_blockyanim(Operator):
                 )
 
                 duration_seconds = (frame_end - frame_start) / fps
+                computed_duration = max(1, round(duration_seconds * FPS_HYTALE))
+
+                # Se este Action veio do anim_importer.py e ainda carrega os
+                # valores originais do arquivo (ver _stamp_action_source_metadata
+                # em anim_importer.py), preferir eles em vez do que acabamos de
+                # recalcular a partir do frame range atual -- ver
+                # use_source_metadata, acima, pra quando isso NÃO é desejado.
+                duration_value = computed_duration
+                hold_last_value = not self.is_loop
+                if self.use_source_metadata:
+                    stamped_duration = action.get(ACTION_SOURCE_DURATION_PROP)
+                    if stamped_duration is not None:
+                        duration_value = max(1, int(round(stamped_duration)))
+                    stamped_hold_last = action.get(ACTION_SOURCE_HOLD_LAST_KEYFRAME_PROP)
+                    if stamped_hold_last is not None:
+                        hold_last_value = bool(stamped_hold_last)
+
                 content = {
                     "formatVersion": 1,
-                    "duration": max(1, round(duration_seconds * FPS_HYTALE)),
-                    "holdLastKeyframe": self.hold_last_keyframe,
+                    "duration": duration_value,
+                    "holdLastKeyframe": hold_last_value,
                     "nodeAnimations": node_animations,
                 }
 

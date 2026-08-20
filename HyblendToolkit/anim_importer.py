@@ -79,7 +79,14 @@ from bpy.types import Operator
 from bpy_extras.io_utils import ImportHelper
 from mathutils import Matrix, Quaternion, Vector
 
-from .common import FPS_HYTALE, UNIT_SCALE_DEFAULT, quat_xyzw, vec3
+from .common import (
+    ACTION_SOURCE_DURATION_PROP,
+    ACTION_SOURCE_HOLD_LAST_KEYFRAME_PROP,
+    FPS_HYTALE,
+    UNIT_SCALE_DEFAULT,
+    quat_xyzw,
+    vec3,
+)
 from .rigger import (
     BONE_ROOT_MASTER,
     BONE_ROOT_PELVIS,
@@ -380,6 +387,97 @@ def _bake_orientation_samples(samples, start_frame, fps, cyclic):
     return [(frame, _vec4_to_quat(v), interp) for frame, v, interp in baked]
 
 
+def _bake_stretch_samples(samples, start_frame, fps, cyclic):
+    """Mesmo motor Hermite/Catmull-Rom de _bake_position_samples, mas SEM
+    aplicar UNIT_SCALE_DEFAULT -- 'shapeStretch' é um fator de escala
+    ADIMENSIONAL (mesma natureza do 'stretch' de shape que importer.py já
+    trata assim pro .bbmodel/.blockymodel, ver nota grande lá), não uma
+    medida de comprimento. Eixo ausente no arquivo assume 1.0 (escala
+    identidade), não 0.0 -- por isso o default= explícito no vec3()."""
+    times = [s["time"] for s in samples]
+    values = [vec3(s.get("delta", {}), default=1.0) for s in samples]
+    return _hermite_resample(times, values, start_frame, fps, cyclic)
+
+
+def _apply_stretch_channels(operator, armature_obj, action, node_animations, hold_last, duration, start_frame, fps, bake_mode):
+    """Aplica o canal 'shapeStretch' (escala do bone), INDEPENDENTE do
+    target_mode (ORG ou CTRL) -- chamada por AMBOS _apply_org_mode e
+    _apply_ctrl_mode, sempre por último, escrevendo na MESMA action que
+    cada um já criou.
+
+    EM QUAL BONE ESCREVER (isso NÃO depende do target_mode escolhido, e
+    sim de o RIG existir ou não nesta Armature): _build_pose_constraints
+    (rigger.py) cria, pra cada bone com par MCH+CTRL, um trio Location/
+    Rotation/**Scale** (ensure_copy_set(..., types=(...,"SCALE")),
+    CONSTRAINT_ORG_TO_MCH) fazendo o ORG copiar a escala do MCH, que por
+    sua vez copia a escala do _CTRL (FK_CopyScale). Ou seja: numa
+    Armature rigada, escrever pbone.scale direto no ORG é sobrescrito
+    pela constraint (some, some volta pra identidade) -- a escala "de
+    verdade" mora no _CTRL. Por isso: se o bone tiver um `_CTRL`
+    correspondente na Armature, escrevemos NELE; senão (bone sem rig
+    nenhum em cima, ou Armature sem rig gerado), caímos pro bone ORG
+    direto, que aí sim fica livre. É esse fallback que faz o import
+    funcionar tanto numa Armature crua quanto numa já rigada, sem
+    precisar saber de antemão qual das duas é.
+
+    Faltava por completo antes desta função existir -- 'shapeStretch' não
+    era lido em lugar nenhum deste módulo. É o que fazia, por exemplo,
+    uma sobrancelha animada erguendo (shapeStretch.y indo de 1 pra 1.5)
+    ficar com a posição/orientação certas mas sem o "esticar", porque só
+    esses dois canais eram aplicados."""
+    pose_bones = armature_obj.pose.bones
+    written_names = []
+    max_frame_seen = start_frame
+    for name, channels in node_animations.items():
+        target_name = name + SUFFIX_CTRL if (name + SUFFIX_CTRL) in pose_bones else name
+        pbone = pose_bones.get(target_name)
+        if pbone is None:
+            continue
+        stretch_raw = _looped_samples(channels.get("shapeStretch", []), hold_last, duration)
+        if not stretch_raw:
+            continue
+
+        if bake_mode:
+            stretch_samples = _bake_stretch_samples(stretch_raw, start_frame, fps, cyclic=not hold_last)
+        else:
+            stretch_samples = [
+                (
+                    hytale_time_to_frame(s["time"], start_frame, fps),
+                    vec3(s.get("delta", {}), default=1.0),
+                    s.get("interpolationType", INTERPOLATION_DEFAULT),
+                )
+                for s in stretch_raw
+            ]
+        _write_channel(
+            action,
+            f'pose.bones["{target_name}"].scale',
+            target_name,
+            3,
+            stretch_samples,
+        )
+        written_names.append(target_name)
+        max_frame_seen = max(max_frame_seen, max(f for f, _, _ in stretch_samples))
+    return written_names, max_frame_seen
+
+
+def _stamp_action_source_metadata(action, data):
+    """Grava 'duration' e 'holdLastKeyframe' do ARQUIVO ORIGINAL como
+    custom properties na Action recém-criada, pro exporter.py poder
+    reescrever esses dois campos fielmente num reexport em vez de ter que
+    reconstruí-los adivinhando a partir do estado atual da timeline/
+    F-Curves do Blender (que pode divergir -- ex: 'duration' do arquivo
+    pode ser maior que o último keyframe real de qualquer canal, algo
+    que não dá pra recuperar só olhando os F-Curves depois do import).
+    Ver DEVELOPER_NOTES.md / common.py para o nome exato dessas duas
+    propriedades (ACTION_SOURCE_DURATION_PROP /
+    ACTION_SOURCE_HOLD_LAST_KEYFRAME_PROP) -- o exporter.py PRECISA usar
+    os MESMOS nomes pra este contrato funcionar."""
+    duration = data.get("duration")
+    if duration is not None:
+        action[ACTION_SOURCE_DURATION_PROP] = duration
+    action[ACTION_SOURCE_HOLD_LAST_KEYFRAME_PROP] = bool(data.get("holdLastKeyframe", False))
+
+
 def _apply_org_mode(
     operator, context, armature_obj, data, start_frame, action_name, loop_mode, bake_mode, keep_spine_follow,
     spine_mode="DEFAULT", arms_mode="BOTH", legs_mode="BOTH",
@@ -435,6 +533,7 @@ def _apply_org_mode(
     action = bpy.data.actions.new(action_name)
     anim_data = armature_obj.animation_data_create()
     anim_data.action = action
+    _stamp_action_source_metadata(action, data)
 
     pose_bones = armature_obj.pose.bones
     bones_with_rotation = set()
@@ -498,6 +597,11 @@ def _apply_org_mode(
             )
             max_frame_seen = max(max_frame_seen, max(f for f, _, _ in rot_samples))
 
+    stretch_names, stretch_max_frame = _apply_stretch_channels(
+        operator, armature_obj, action, node_animations, hold_last, duration, start_frame, fps, bake_mode
+    )
+    max_frame_seen = max(max_frame_seen, stretch_max_frame)
+
     # A cena (Frame End da Timeline) pode estar mais curta do que a
     # animação recém-importada -- se a gente não esticar isso, o EXPORT
     # (que sampleia dentro do range da cena) corta o final da animação
@@ -518,7 +622,7 @@ def _apply_org_mode(
     operator.report(
         {"INFO"},
         f"Imported '{action.name}' onto {len(existing_names)} bone(s) "
-        f"({len(bones_with_rotation)} with rotation).",
+        f"({len(bones_with_rotation)} with rotation, {len(stretch_names)} with shape stretch).",
     )
     return {"FINISHED"}
 
@@ -1329,6 +1433,7 @@ def _apply_ctrl_mode(
     if setup is None:
         return {"CANCELLED"}
     scene, fps, hierarchy, delta_lookup, end_frame, action, pose_bones = setup
+    _stamp_action_source_metadata(action, data)
 
     chains = _resolve_ik_chains(armature_obj, hierarchy)
     group_mode = {"ARM": arms_mode, "LEG": legs_mode}
@@ -1421,6 +1526,18 @@ def _apply_ctrl_mode(
                     target_values.setdefault(pole_pbone.name, []).append((frame, loc, None))
 
     _write_pose_samples(action, target_values)
+
+    # shapeStretch não faz parte da reprojeção FK/IK acima (ver docstring
+    # de _apply_stretch_channels) -- precisa só de hold_last/duration, que
+    # _prepare_reprojection_setup já calculou mas não devolveu no
+    # namedtuple; recalcular aqui é uma chamada pura e barata (mesmos
+    # argumentos), não vale mudar o contrato do namedtuple só por isso.
+    hold_last, duration, _cyclic = _resolve_loop_settings(data, loop_mode)
+    stretch_names, stretch_max_frame = _apply_stretch_channels(
+        operator, armature_obj, action, data["nodeAnimations"], hold_last, duration, start_frame, fps, bake_mode
+    )
+    end_frame = max(end_frame, stretch_max_frame)
+
     _extend_scene_frame_end(operator, scene, end_frame)
     _report_muted_constraints(
         operator, muted_constraints, "(control bones with extra blend constraints, and IK pole targets' Child Of)"
@@ -1451,7 +1568,8 @@ def _apply_ctrl_mode(
         f"Imported '{action.name}' -- Spine: {'root controllers follow Pelvis' if spine_mode == 'DEFAULT' else 'Pelvis/Belly/Chest only, root.spine_CTRL free for manual tweaks'}; "
         f"Arms: {mode_label[arms_mode]} ({len(arm_chains)} chain(s)); "
         f"Legs: {mode_label[legs_mode]} ({len(leg_chains)} chain(s)); "
-        f"{non_chain_ctrl_count} other control bone(s); {end_frame - start_frame + 1} frame(s) each.",
+        f"{non_chain_ctrl_count} other control bone(s); {len(stretch_names)} bone(s) with shape "
+        f"stretch; {end_frame - start_frame + 1} frame(s) each.",
     )
     return {"FINISHED"}
 
@@ -1604,8 +1722,9 @@ class IMPORT_OT_hytale_blockyanim(Operator, ImportHelper):
             "(proper spherical interpolation for rotation), instead of relying on Blender's own "
             "per-component Bezier F-Curves. Produces far more keyframes, but avoids rotation "
             "interpolation artifacts -- especially noticeable with few, far-apart orientation "
-            "keyframes (common in this format). Recommended for Cycle imports. Only affects "
-            "'Original Bones' -- 'Control Bones (FK)' always bakes every frame regardless"
+            "keyframes (common in this format). Recommended for Cycle imports. Affects "
+            "position/rotation on 'Original Bones' and shape stretch on both targets -- "
+            "'Control Bones (FK)' position/rotation always bakes every frame regardless"
         ),
         default=False,
     )
