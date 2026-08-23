@@ -59,6 +59,8 @@ from .rigger import (
     RIG_OT_hytale_ik_chain_pick_bone,
     RIG_OT_hytale_ik_chain_remove,
     RIG_OT_hytale_mirror_shape,
+    RIG_OT_hytale_mouth_atlas_create,
+    RIG_OT_hytale_mouth_atlas_remove,
     RIG_OT_hytale_rig_template_delete,
     RIG_OT_hytale_rig_template_save,
     RIG_OT_hytale_shape_edit_mode_enter,
@@ -300,6 +302,15 @@ class HYTALE_PT_main(Panel):
 
                 uv_picker_row("uv_offset_source_bone")
                 uv_picker_row("uv_offset_target_bone", text=tr("panel.mouth_bone", lang))
+                # v0.10.13 -- Companion Target Bones: lista (não um bone
+                # só), então sem o picker de eyedropper de uv_picker_row
+                # acima -- normalmente preenchido sozinho por "Create
+                # Mouth Atlas" a partir dos Companion Bones da entrada
+                # MOUTH (aba Rig), editável aqui só pra ajuste manual.
+                sub.prop(
+                    settings, "uv_offset_target_bones_extra",
+                    text=tr("panel.mouth_extra_target_bones", lang),
+                )
 
         col = layout.column(align=True)
         col.scale_y = 1.4
@@ -517,6 +528,18 @@ class HYTALE_PT_main(Panel):
                     op.chain_index = index
                     op.field = field_name
 
+                def _picker_row_into(layout, field_name, text):
+                    # v0.10.14 -- mesma lógica de picker_row acima, mas
+                    # desenhando num layout QUALQUER (ex.: dentro de um
+                    # box.column() de uma sub-seção) em vez de sempre em
+                    # `col` direto -- usado pela UI de MOUTH, reorganizada
+                    # em caixas por seção (Bone/Plane/Companions).
+                    r = layout.row(align=True)
+                    r.prop(item, field_name, text=text)
+                    op = r.operator(RIG_OT_hytale_ik_chain_pick_bone.bl_idname, text="", icon="EYEDROPPER")
+                    op.chain_index = index
+                    op.field = field_name
+
                 col.prop(item, "chain_type", text=tr("panel.field_chain_type", lang))
 
                 if item.chain_type == "TAIL":
@@ -598,6 +621,132 @@ class HYTALE_PT_main(Panel):
                         label = attachment_base_label if i == 1 else f"{attachment_base_label} {i}"
                         picker_row(f"attachment_bone_{i}", label)
                     col.label(text=tr("panel.hint_attachments_no_ik", lang), icon="INFO")
+                    col.separator()
+                    col.prop(item, "collection_override", text=tr("panel.field_collection", lang))
+                elif item.chain_type == "MOUTH":
+                    # v0.10 -- Mouth não cria bone de IK nenhum -- só
+                    # identifica QUAL bone original é a boca, e dispara
+                    # a criação do atlas picker (root.ui/ui.mouth_uv +
+                    # plane de referência + driver no material -- ver
+                    # rigger/rig.py, _build_mouth_atlas).
+                    #
+                    # v0.10.14 -- reorganizado em seções (pedido
+                    # explícito do usuário: layout anterior ficava tudo
+                    # "achatado" numa coluna só). Mouth Bone/Picker
+                    # Parent ficam SOLTOS (sem box), mesmo espírito de
+                    # Root Bone/Tip Bone em ARM/LEG logo abaixo -- só as
+                    # seções realmente OPCIONAIS (Reference Image,
+                    # Companion Bones, Grid Detection) ganham box +
+                    # collapsible. Rótulos/hints encurtados -- explicação
+                    # técnica completa continua nos comentários de
+                    # código e nas tooltips (hover).
+                    picker_row("mouth_bone", tr("panel.field_mouth_bone", lang))
+                    picker_row("mouth_ui_parent_bone", tr("panel.field_mouth_ui_parent_bone", lang))
+                    col.separator()
+
+                    # v0.10.15 -- collapsible SEM trava: rodada anterior
+                    # forçava aberto se já tinha companion configurado
+                    # (pra não "esconder" dado em uso) -- pedido explícito
+                    # do usuário pra tirar isso, deixar o toggle igual
+                    # aos outros (usuário decide, sem comportamento
+                    # especial por trás).
+                    plane_box = col.box()
+                    plane_header = plane_box.row()
+                    plane_header.prop(
+                        wm, "hytale_show_mouth_plane",
+                        text=tr("panel.mouth_section_plane", lang),
+                        icon="TRIA_DOWN" if wm.hytale_show_mouth_plane else "TRIA_RIGHT",
+                        emboss=False,
+                    )
+                    if wm.hytale_show_mouth_plane:
+                        plane_col = plane_box.column(align=True)
+                        plane_col.prop(item, "mouth_plane_scale", text=tr("panel.field_mouth_plane_scale", lang))
+                        plane_row = plane_col.row(align=True)
+                        plane_row.prop(
+                            item, "mouth_plane_offset_x", text=tr("panel.field_mouth_plane_offset_x", lang)
+                        )
+                        plane_row.prop(
+                            item, "mouth_plane_offset_y", text=tr("panel.field_mouth_plane_offset_y", lang)
+                        )
+
+                    # v0.10.13 -- Companion Bones: outras malhas/bones
+                    # que compartilham o atlas de bocas e devem trocar
+                    # de expressão JUNTO com Mouth Bone (ex.: metades
+                    # L/R espelhadas) -- mesmo padrão de lista em loop
+                    # que Attachments (attachments_count acima), teto
+                    # bem menor (ver MOUTH_EXTRA_BONES_MAX_COUNT em
+                    # rigger/constants.py). Não criam bone nenhum --
+                    # só recebem material+driver de UV, ver
+                    # _apply_mouth_atlas_to_companion em rigger/rig.py.
+                    companion_box = col.box()
+                    companion_header = companion_box.row()
+                    companion_header.prop(
+                        wm, "hytale_show_mouth_companions",
+                        text=tr("panel.mouth_section_companions", lang),
+                        icon="TRIA_DOWN" if wm.hytale_show_mouth_companions else "TRIA_RIGHT",
+                        emboss=False,
+                    )
+                    if wm.hytale_show_mouth_companions:
+                        companion_col = companion_box.column(align=True)
+                        companion_col.prop(
+                            item, "mouth_extra_bone_count", text=tr("panel.field_mouth_extra_count", lang)
+                        )
+                        companion_base_label = tr("panel.field_mouth_extra_bone", lang)
+                        for i in range(1, item.mouth_extra_bone_count + 1):
+                            label = companion_base_label if i == 1 else f"{companion_base_label} {i}"
+                            _picker_row_into(companion_col, f"mouth_extra_bone_{i}", label)
+                        if item.mouth_extra_bone_count == 0:
+                            companion_col.label(text=tr("panel.hint_mouth_companions_empty", lang), icon="INFO")
+
+                    # v0.10.12 -- Manual Grid: bypass TOTAL da detecção
+                    # por alpha -- pro caso em que os ícones de boca
+                    # têm largura visual desigual dentro de células
+                    # uniformes (a banda de alpha de cada um começa/
+                    # termina em pontos diferentes dentro da própria
+                    # célula, então medir a distância entre bandas não
+                    # bate com o pitch real, mesmo ele sendo uniforme
+                    # de verdade no Blockbench). v0.10.15 -- collapsible
+                    # também agora, mesmo padrão das duas seções acima.
+                    grid_box = col.box()
+                    grid_header = grid_box.row()
+                    grid_header.prop(
+                        wm, "hytale_show_mouth_grid",
+                        text=tr("panel.mouth_section_grid", lang),
+                        icon="TRIA_DOWN" if wm.hytale_show_mouth_grid else "TRIA_RIGHT",
+                        emboss=False,
+                    )
+                    if wm.hytale_show_mouth_grid:
+                        grid_col = grid_box.column(align=True)
+                        grid_col.prop(
+                            item, "mouth_atlas_use_manual_grid",
+                            text=tr("panel.field_mouth_manual_grid", lang),
+                        )
+                        if item.mouth_atlas_use_manual_grid:
+                            grid_row = grid_col.row(align=True)
+                            grid_row.prop(
+                                item, "mouth_atlas_grid_cols", text=tr("panel.field_mouth_grid_cols", lang)
+                            )
+                            grid_row.prop(
+                                item, "mouth_atlas_grid_rows", text=tr("panel.field_mouth_grid_rows", lang)
+                            )
+                            grid_row = grid_col.row(align=True)
+                            grid_row.prop(
+                                item, "mouth_atlas_grid_cell_width",
+                                text=tr("panel.field_mouth_grid_cell_width", lang),
+                            )
+                            grid_row.prop(
+                                item, "mouth_atlas_grid_cell_height",
+                                text=tr("panel.field_mouth_grid_cell_height", lang),
+                            )
+                        else:
+                            grid_col.label(text=tr("panel.hint_mouth_auto_grid", lang), icon="INFO")
+
+                    col.separator()
+                    action_row = col.row(align=True)
+                    action_row.scale_y = 1.3
+                    action_row.operator(RIG_OT_hytale_mouth_atlas_create.bl_idname, icon="IMAGE_DATA")
+                    action_row.operator(RIG_OT_hytale_mouth_atlas_remove.bl_idname, icon="X", text="")
+                    col.label(text=tr("panel.hint_mouth_no_ik", lang), icon="INFO")
                     col.separator()
                     col.prop(item, "collection_override", text=tr("panel.field_collection", lang))
                 else:
@@ -1085,11 +1234,26 @@ def register():
     WindowManager.hytale_show_ik_chains = BoolProperty(default=False)
     WindowManager.hytale_show_bone_collections = BoolProperty(default=False)
     WindowManager.hytale_show_templates = BoolProperty(default=False)
+    # v0.10.14/v0.10.15 -- seções opcionais dentro de uma entrada MOUTH
+    # (Reference Image, Companion Bones, Grid Detection) -- mesmo
+    # espírito das três acima (só estado de UI, não dado do rig), mas
+    # globais entre TODAS as entradas MOUTH/armaturas (não por item da
+    # lista -- é só "estou olhando esse tipo de ajuste ou não" no
+    # momento). Default False = fechada. Sem trava/auto-abrir nenhuma
+    # (pedido explícito do usuário -- v0.10.14 tinha isso só pra
+    # Companion Bones, removido na v0.10.15: usuário decide sozinho,
+    # sem comportamento especial por trás).
+    WindowManager.hytale_show_mouth_plane = BoolProperty(default=False)
+    WindowManager.hytale_show_mouth_companions = BoolProperty(default=False)
+    WindowManager.hytale_show_mouth_grid = BoolProperty(default=False)
     bpy.utils.register_class(HYTALE_PT_main)
 
 
 def unregister():
     bpy.utils.unregister_class(HYTALE_PT_main)
+    del WindowManager.hytale_show_mouth_grid
+    del WindowManager.hytale_show_mouth_companions
+    del WindowManager.hytale_show_mouth_plane
     del WindowManager.hytale_show_templates
     del WindowManager.hytale_show_bone_collections
     del WindowManager.hytale_show_ik_chains

@@ -159,6 +159,35 @@ TRANSLATIONS = {
     "panel.field_attachments_count": "Attachments Bones Amount",
     "panel.field_attachment": "Attachment",
     "panel.hint_attachments_no_ik": "Attachment bones follow their controls directly (no IK) -- organizational only",
+    # v0.10 -- campos de Mouth (organizacional + botão de geração, sem
+    # IK -- ver HytaleIKChainItem/_build_mouth_atlas em rigger/rig.py).
+    # v0.10.14/v0.10.15 -- Mouth Bone/Picker Parent ficam soltos (sem
+    # box) -- só as seções realmente opcionais (Reference Image,
+    # Companion Bones, Grid Detection) viraram box collapsible.
+    # Rótulos/hints encurtados -- explicação técnica completa continua
+    # nos comentários de código e nas tooltips (hover).
+    "panel.field_mouth_bone": "Mouth Bone",
+    "panel.field_mouth_ui_parent_bone": "Picker Parent (opt.)",
+    "panel.mouth_section_plane": "Reference Image",
+    "panel.field_mouth_plane_scale": "Size",
+    "panel.field_mouth_plane_offset_x": "Offset X",
+    "panel.field_mouth_plane_offset_y": "Offset Y",
+    "panel.hint_mouth_no_ik": "Builds a texture picker, not a bone chain",
+    # v0.10.13 -- Companion Bones (ver HytaleIKChainItem.mouth_extra_bone_count/_1..N em rigger/rig.py).
+    "panel.mouth_section_companions": "Companion Bones",
+    "panel.field_mouth_extra_count": "Amount",
+    "panel.field_mouth_extra_bone": "Bone",
+    "panel.hint_mouth_companions_empty": "For extra bones that move with this one (e.g. mirrored halves)",
+    # v0.10.13 -- Companion Target Bones no painel Export (ver HYTALE_export_bone_settings.uv_offset_target_bones_extra em exporter.py).
+    "panel.mouth_extra_target_bones": "Companion Target Bones (auto-filled)",
+    # v0.10.12/v0.10.14/v0.10.15 -- Grid Detection (ver HytaleIKChainItem.mouth_atlas_use_manual_grid em rigger/rig.py).
+    "panel.mouth_section_grid": "Grid Detection",
+    "panel.field_mouth_manual_grid": "Set Manually",
+    "panel.field_mouth_grid_cols": "Columns",
+    "panel.field_mouth_grid_rows": "Rows",
+    "panel.field_mouth_grid_cell_width": "Cell Width",
+    "panel.field_mouth_grid_cell_height": "Cell Height",
+    "panel.hint_mouth_auto_grid": "Detected automatically from the texture",
     "panel.field_side": "Side",
     "panel.field_pole_in_front": "Pole in Front (+Z)",
     "panel.field_copy_location_ik": "Also Copy Location on IK (root)",

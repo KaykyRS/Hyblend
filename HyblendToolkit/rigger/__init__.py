@@ -106,6 +106,8 @@ from .rig import (  # noqa: F401
     RIG_OT_hytale_ik_chain_remove,
     RIG_OT_hytale_ik_chain_set_count,
     RIG_OT_hytale_mirror_shape,
+    RIG_OT_hytale_mouth_atlas_create,
+    RIG_OT_hytale_mouth_atlas_remove,
     RIG_OT_hytale_rig_template_delete,
     RIG_OT_hytale_rig_template_save,
     RIG_OT_hytale_shape_edit_mode_enter,
@@ -171,6 +173,11 @@ _CLASSES = (
     RIG_OT_hytale_generate_rig,
     RIG_OT_hytale_validate_rig,
     RIG_OT_hytale_mirror_shape,
+    # v0.10 -- Mouth Atlas. Sem dependência de ordem conhecida com o
+    # resto (mesmo espírito de validate_rig/mirror_shape acima) --
+    # acrescentados no fim.
+    RIG_OT_hytale_mouth_atlas_create,
+    RIG_OT_hytale_mouth_atlas_remove,
 )
 
 

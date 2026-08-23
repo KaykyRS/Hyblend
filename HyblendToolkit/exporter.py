@@ -168,8 +168,8 @@ class HYTALE_export_bone_settings(PropertyGroup):
             "read the material/shader -- it reproduces the same snap-to-"
             "grid math directly from the control bone's Location, so it "
             "must match whatever math your driver uses. The grid "
-            "calibration itself (Grid Step/Pixels per Step) stays in the "
-            "export dialog's Advanced Options"
+            "calibration itself (Grid Step/Pixels per Step) lives in "
+            "the export dialog's Advanced Options, further down"
         ),
         default=False,
     )
@@ -190,6 +190,67 @@ class HYTALE_export_bone_settings(PropertyGroup):
             "bones (e.g. 'Mouth')"
         ),
         default=UV_OFFSET_TARGET_BONE_DEFAULT,
+    )
+    # v0.10.13 -- Companion targets (rigger's "Mouth Amount" --
+    # HytaleIKChainItem.mouth_extra_bone_1..N in rigger/rig.py). Some
+    # characters have their "mouth" split across more than one mesh/bone
+    # (e.g. mirrored L/R halves meeting in the middle) that need the
+    # SAME expression change at the SAME time -- this field lets the
+    # SAME shapeUvOffset delta be written to more bones besides the
+    # primary uv_offset_target_bone. Comma-separated exact bone names
+    # (same name-space as uv_offset_target_bone -- raw Blender bone
+    # names, matched against the exportable set the same way). A name
+    # that isn't exportable is warned and skipped individually -- it
+    # does NOT cancel the primary target or the other companions (see
+    # sample_action()). Written automatically by 'Create Mouth Atlas'
+    # (rigger/rig.py, _build_mouth_atlas) from the companion bones
+    # configured on the active MOUTH entry -- normally you don't need
+    # to type here by hand.
+    uv_offset_target_bones_extra: StringProperty(
+        name="Companion Target Bones (shapeUvOffset)",
+        description=(
+            "Comma-separated extra bone names that receive the exact same 'shapeUvOffset' data as "
+            "Target Bone above -- for characters whose mouth is split across more than one mesh/bone "
+            "(e.g. mirrored left/right halves) that must change expression together. Usually filled "
+            "automatically by 'Create Mouth Atlas' from the Companion Bones configured on the MOUTH "
+            "entry, not typed here directly"
+        ),
+        default="",
+    )
+    # v0.6.5 -- MOVIDOS de EXPORT_OT_hytale_blockyanim pra cá (eram
+    # Property de Operator, não persistiam com o arquivo -- resetavam
+    # pro default toda vez que o diálogo de export abria, então o
+    # Rigger (Mouth Atlas, "Create Mouth Atlas") não tinha como
+    # pré-preencher isso de verdade por mais que calculasse os valores
+    # certos). Mesmos nomes/defaults/descriptions de antes -- só troca
+    # de dono, de Operator (sessão) pra PropertyGroup (persistido na
+    # Armature). Ver sample_action(), que já busca esta PropertyGroup
+    # (bone_settings) bem perto de onde sample_uv_offset_px é chamado.
+    uv_offset_step_x: FloatProperty(
+        name="Grid Step X",
+        description=(
+            "In Blender units: how far the control bone has to move on X "
+            "for the mouth/face texture to shift by one step. Must match "
+            "whatever your shader/driver setup actually uses -- this "
+            "doesn't invent the behavior, it just has to describe it "
+            "correctly"
+        ),
+        default=0.1,
+    )
+    uv_offset_px_x: FloatProperty(
+        name="Pixels per Step X",
+        description="How many raw texture pixels one X grid step represents in the file (the game expects raw pixel offsets, not a 0..1 fraction)",
+        default=20.0,
+    )
+    uv_offset_step_y: FloatProperty(
+        name="Grid Step Y",
+        description="Same as Grid Step X, for the control bone's Y movement",
+        default=-0.045,
+    )
+    uv_offset_px_y: FloatProperty(
+        name="Pixels per Step Y",
+        description="Same as Pixels per Step X, for Y",
+        default=-10.0,
     )
 
 
@@ -500,6 +561,28 @@ def pose_matrices(armature_obj):
     return out
 
 
+def rest_local_positions(armature_obj, rest_by_bone, exportable_names, unit_scale):
+    """v0.10.19 -- posição LOCAL (relativa ao pai) de cada bone exportável
+    NA POSE DE REPOUSO (rest/bind pose), em unidades de jogo -- não muda
+    entre frames (repouso é fixo), calculada uma vez só ANTES do loop de
+    frames (diferente de compute_deltas, que roda todo frame). Usada só
+    por Bake Parent Scale into Children (ver sample_action()), pra saber o
+    quanto "puxar" o pivot de cada filho em direção ao pivot do pai quando
+    o pai encolhe/cresce -- sem isso, o filho encolhe no PRÓPRIO lugar em
+    vez de se aproximar/afastar do pai, ficando com aparência errada
+    (gap/sobreposição) mesmo com o tamanho certo."""
+    inv_scale = 1.0 / unit_scale
+    out = {}
+    for pbone in armature_obj.pose.bones:
+        name = pbone.name
+        if name not in exportable_names:
+            continue
+        parent_name = pbone.parent.name if pbone.parent else None
+        rest_local = local_matrix(rest_by_bone, name, parent_name)
+        out[name] = rest_local.to_translation() * inv_scale
+    return out
+
+
 def compute_deltas(armature_obj, rest_by_bone, pose_by_bone, exportable_names, unit_scale):
     """Para cada bone exportável, calcula (posição delta em unidades de
     jogo, quaternion delta, escala delta) na pose ATUAL vs repouso."""
@@ -630,10 +713,12 @@ def dump_pretty_blockyanim(content, indent=2):
 # ---------------------------------------------------------------------------
 
 
-def sample_action(context, obj, action, exportable_names, rest_by_bone, opts):
+def sample_action(context, obj, action, exportable_names, rest_by_bone, rest_local_pos, opts):
     """'opts' é o próprio operador (self) -- só lemos as Properties dele.
     Assume que obj.animation_data.action já foi setado pra 'action' antes
-    de chamar. Devolve (node_animations, frame_start, frame_end, fps)."""
+    de chamar. 'rest_local_pos' -- ver rest_local_positions(), só usado
+    quando opts.bake_scale_hierarchy está ligado. Devolve (node_animations,
+    frame_start, frame_end, fps)."""
     scene = context.scene
     fps = scene.render.fps / scene.render.fps_base
 
@@ -696,6 +781,7 @@ def sample_action(context, obj, action, exportable_names, rest_by_bone, opts):
     bone_settings = get_export_bone_settings(obj)
 
     uv_control_pbone = None
+    uv_target_bones = []
     if bone_settings.export_uv_offset:
         uv_control_pbone = obj.pose.bones.get(bone_settings.uv_offset_source_bone)
         if uv_control_pbone is None:
@@ -713,6 +799,28 @@ def sample_action(context, obj, action, exportable_names, rest_by_bone, opts):
                 f"'{action.name}'.",
             )
             uv_control_pbone = None
+        else:
+            # v0.10.13 -- Companion targets: mesmo delta gravado em mais
+            # de um bone (ver comentário grande em
+            # HYTALE_export_bone_settings.uv_offset_target_bones_extra).
+            # Nome que não é exportável é avisado e IGNORADO individual-
+            # mente -- não cancela o alvo principal nem os outros
+            # companions (diferente do alvo principal, cuja ausência
+            # cancela o canal inteiro, ver elif acima).
+            uv_target_bones = [bone_settings.uv_offset_target_bone]
+            for extra_name in (bone_settings.uv_offset_target_bones_extra or "").split(","):
+                extra_name = extra_name.strip()
+                if not extra_name or extra_name in uv_target_bones:
+                    continue  # vazio, ou duplicado do principal/de outro companion já aceito
+                if extra_name not in node_animations:
+                    opts.report(
+                        {"WARNING"},
+                        f"UV Offset: bone extra '{extra_name}' não está entre os bones "
+                        f"exportáveis -- pulando esse alvo (os outros continuam) na Action "
+                        f"'{action.name}'.",
+                    )
+                    continue
+                uv_target_bones.append(extra_name)
 
     for frame in frames:
         is_edge_frame = frame == frames[0] or frame == frames[-1]
@@ -724,12 +832,75 @@ def sample_action(context, obj, action, exportable_names, rest_by_bone, opts):
         deltas = compute_deltas(obj, rest_by_bone, pose_by_bone, exportable_names, opts.unit_scale)
         hytale_time = frame_to_hytale_time(frame, frame_start, fps)
 
+        # v0.10.18 -- Bake Parent Scale into Children: calcula, pra este
+        # frame, o scale "em cascata" de cada bone (produto do próprio
+        # scale LOCAL -- já em `deltas` -- com o de TODOS os ancestrais
+        # exportáveis, subindo a hierarquia). Memoizado num dict só deste
+        # frame (cascaded_scale_cache) -- cada bone calculado uma vez só,
+        # mesmo se vários irmãos compartilharem o mesmo ancestral. Só
+        # existe se o toggle estiver ligado -- custo zero quando desligado.
+        cascaded_scale_cache = {}
+
+        def _cascaded_scale(bone_name):
+            if bone_name in cascaded_scale_cache:
+                return cascaded_scale_cache[bone_name]
+            own_scale = deltas[bone_name][2] if bone_name in deltas else Vector((1.0, 1.0, 1.0))
+            pbone = obj.pose.bones.get(bone_name)
+            if pbone is not None and pbone.parent is not None and pbone.parent.name in exportable_names:
+                parent_scale = _cascaded_scale(pbone.parent.name)
+                result = Vector((
+                    own_scale.x * parent_scale.x,
+                    own_scale.y * parent_scale.y,
+                    own_scale.z * parent_scale.z,
+                ))
+            else:
+                result = own_scale
+            cascaded_scale_cache[bone_name] = result
+            return result
+
         for name, (pos, quat, scale) in deltas.items():
             # Correção de sinal (dupla cobertura, q == -q) -- ANTES de
             # quantizar e ANTES de acumular pra RDP, pra continuidade
             # correta nos dois. Ver fix_quaternion_sign().
             quat = fix_quaternion_sign(quat, last_raw_quat.get(name))
             last_raw_quat[name] = quat
+
+            # v0.10.19 -- também exige opts.export_scale, não só o próprio
+            # toggle: a UI deixa "Bake Parent Scale into Children" cinza/
+            # travado quando "Export Scale" está desligado, mas isso só
+            # bloqueia interação, não reseta o VALOR guardado -- sem essa
+            # checagem aqui, um usuário que ligou o Bake e depois desligou
+            # o Export Scale (deixando o Bake True por baixo) exportaria
+            # a POSIÇÃO dos filhos corrigida como se o pai tivesse
+            # encolhido, mas o shapeStretch do PRÓPRIO pai nunca sairia no
+            # arquivo -- o pai renderiza no tamanho normal, os filhos
+            # ficam deslocados como se ele tivesse encolhido. Sem sentido
+            # bakear posição em cima de uma escala que nem vai existir no
+            # export.
+            if opts.bake_scale_hierarchy and opts.export_scale:
+                scale = _cascaded_scale(name)
+                # v0.10.19 -- corrige o PIVOT do filho junto com o tamanho
+                # (ver rest_local_positions() e a descrição do campo
+                # bake_scale_hierarchy pro motivo -- sem isso, o filho
+                # encolhe no PRÓPRIO lugar em vez de se aproximar/afastar
+                # do pivot do pai, causando gap/sobreposição visual mesmo
+                # com o tamanho certo). Fórmula (por eixo): nova_posição =
+                # posição_de_repouso * (escala_do_pai - 1) + posição_
+                # própria_atual * escala_do_pai -- reconstrói o que a
+                # composição de matriz de verdade faria (child_world =
+                # parent_world @ child_local), já que Hytale NÃO faz essa
+                # composição sozinho (ver teste ao vivo do usuário: pai
+                # escalado não move os filhos no Blockbench).
+                pbone_current = obj.pose.bones.get(name)
+                if pbone_current is not None and pbone_current.parent is not None \
+                        and pbone_current.parent.name in exportable_names:
+                    parent_scale = _cascaded_scale(pbone_current.parent.name)
+                    rest_pos = rest_local_pos.get(name, Vector((0.0, 0.0, 0.0)))
+                    pos = Vector((
+                        rest_pos.x * (parent_scale.x - 1.0) + pos.x * parent_scale.x,
+                        rest_pos.y * (parent_scale.y - 1.0) + pos.y * parent_scale.y,
+                        rest_pos.z * (parent_scale.z - 1.0) + pos.z * parent_scale.z,
+                    ))
 
             if opts.quantize_values:
                 pos = quantize_vector(pos, opts.position_quantize_step)
@@ -749,7 +920,11 @@ def sample_action(context, obj, action, exportable_names, rest_by_bone, opts):
                 scale_samples[name].append((hytale_time, scale))
 
         if uv_control_pbone is not None:
-            px_x, px_y = sample_uv_offset_px(uv_control_pbone, opts)
+            # v0.6.5 -- 'bone_settings' (não 'opts'/self do Operator):
+            # os 4 campos de calibração moraram no Operator antes, agora
+            # moram aqui (persistido na Armature) -- ver
+            # HYTALE_export_bone_settings.
+            px_x, px_y = sample_uv_offset_px(uv_control_pbone, bone_settings)
 
             # Dedupe por igualdade EXATA (não por epsilon/RDP) -- o valor
             # já é discreto (snap-to-grid), então dois frames iguais em
@@ -758,20 +933,26 @@ def sample_action(context, obj, action, exportable_names, rest_by_bone, opts):
             # interpolável (lerp/slerp) entre âncoras, o que não faz
             # sentido pra um offset de atlas em degraus -- por isso esse
             # canal continua com seu próprio dedupe simples, independente.
+            #
+            # v0.10.13 -- dedupe agora é UM valor só (não mais por bone
+            # alvo): todo bone em uv_target_bones lê do MESMO
+            # uv_control_pbone, então o valor amostrado é idêntico pra
+            # todos no mesmo frame -- se não mudou pro principal, não
+            # mudou pra nenhum companion também, não faz sentido rastrear
+            # por bone.
             write_uv = True
-            if not is_edge_frame:
-                prev_uv = last_sampled_uv.get(bone_settings.uv_offset_target_bone)
-                if prev_uv == (px_x, px_y):
-                    write_uv = False
-            last_sampled_uv[bone_settings.uv_offset_target_bone] = (px_x, px_y)
+            if not is_edge_frame and last_sampled_uv.get("_shared") == (px_x, px_y):
+                write_uv = False
+            last_sampled_uv["_shared"] = (px_x, px_y)
             if write_uv:
-                node_animations[bone_settings.uv_offset_target_bone]["shapeUvOffset"].append(
-                    {
-                        "time": hytale_time,
-                        "delta": {"x": px_x, "y": px_y},
-                        "interpolationType": interp,
-                    }
-                )
+                for target_name in uv_target_bones:
+                    node_animations[target_name]["shapeUvOffset"].append(
+                        {
+                            "time": hytale_time,
+                            "delta": {"x": px_x, "y": px_y},
+                            "interpolationType": interp,
+                        }
+                    )
 
     # -----------------------------------------------------------------
     # Noise floor: canal inteiro, não frame a frame.
@@ -1164,35 +1345,51 @@ class EXPORT_OT_hytale_blockyanim(Operator):
         min=0.0,
     )
 
-    uv_offset_step_x: FloatProperty(
-        name="Grid Step X",
+    # v0.10.18 -- diferente de Blender (onde escalar um bone pai encolhe os
+    # filhos JUNTO na viewport por padrão -- "Inherit Scale"), o Hytale/
+    # Blockbench NÃO herda escala pela hierarquia: cada bone tem seu
+    # 'shapeStretch' totalmente independente (confirmado ao vivo pelo
+    # usuário -- escalar um bone pai dentro do próprio Blockbench não
+    # afeta os filhos). Sem esse toggle, uma animação que só escala o bone
+    # PAI no Blender (esperando que os filhos encolham visualmente junto,
+    # como aparece na viewport) exporta um shapeStretch que só existe no
+    # pai -- os filhos saem parados em 1.0, e no Blockbench/jogo eles NÃO
+    # encolhem (só o pai). Ligado, cada bone exportável recebe o produto
+    # do seu próprio scale local com o de TODOS os ancestrais exportáveis
+    # (mesmo espírito do "Inherit Scale: Full" do Blender) -- calculado só
+    # na hora de amostrar pro export (ver sample_action()), sem alterar
+    # nenhum keyframe de verdade na Action.
+    #
+    # v0.10.19 -- CORRIGIDO: só o tamanho (shapeStretch) não bastava --
+    # relatado ao vivo pelo usuário depois de testar a v0.10.18 (os filhos
+    # encolhiam, mas cada um em torno do PRÓPRIO pivot, em vez de se
+    # aproximar do pivot do pai, como a composição de matriz de verdade do
+    # Blender faz). Agora também corrige a POSIÇÃO de cada filho (ver
+    # rest_local_positions() + fórmula em sample_action()), puxando o
+    # pivot dele em direção ao pivot do pai proporcionalmente à escala em
+    # cascata -- reconstrói o efeito completo de "child_world = parent_
+    # world @ child_local" que o Hytale não faz sozinho.
+    bake_scale_hierarchy: BoolProperty(
+        name="Bake Parent Scale into Children",
         description=(
-            "In Blender units: how far the control bone has to move on X "
-            "for the mouth/face texture to shift by one step. Must match "
-            "whatever your shader/driver setup actually uses -- this "
-            "doesn't invent the behavior, it just has to describe it "
-            "correctly"
+            "Hytale/Blockbench bones don't inherit scale from their parent the way Blender's viewport "
+            "does -- if you only keyframed scale on a parent bone (e.g. shrinking it to hide it, expecting "
+            "children inside it to shrink and move closer together), the children would export with no "
+            "scale/position change at all and stay full-size, spread out, in Blockbench/the game. Turn "
+            "this ON to bake the parent's scale into every child's exported 'shapeStretch' AND pull each "
+            "child's pivot toward the parent's, matching what you see in the Blender viewport. Only "
+            "affects the exported file -- doesn't touch your actual keyframes"
         ),
-        default=0.1,
+        default=False,
     )
 
-    uv_offset_px_x: FloatProperty(
-        name="Pixels per Step X",
-        description="How many raw texture pixels one X grid step represents in the file (the game expects raw pixel offsets, not a 0..1 fraction)",
-        default=20.0,
-    )
-
-    uv_offset_step_y: FloatProperty(
-        name="Grid Step Y",
-        description="Same as Grid Step X, for the control bone's Y movement",
-        default=-0.045,
-    )
-
-    uv_offset_px_y: FloatProperty(
-        name="Pixels per Step Y",
-        description="Same as Pixels per Step X, for Y",
-        default=-10.0,
-    )
+    # v0.6.5 -- uv_offset_step_x/px_x/step_y/px_y MOVIDOS pra
+    # HYTALE_export_bone_settings (persistido na Armature) -- eram
+    # Property de Operator aqui, resetavam pro default toda vez que
+    # este diálogo abria (não persistiam com o arquivo), o que
+    # impedia o Rigger (Mouth Atlas) de pré-preencher isso de verdade.
+    # draw()/sample_action() abaixo agora leem/escrevem via
+    # get_export_bone_settings(obj) em vez de 'self'.
 
     unit_scale: FloatProperty(
         name="Blender Units per Game Unit",
@@ -1351,6 +1548,7 @@ class EXPORT_OT_hytale_blockyanim(Operator):
             scale_col = stretch_box.column()
             scale_col.enabled = self.export_scale
             scale_col.prop(self, "scale_zero_epsilon")
+            scale_col.prop(self, "bake_scale_hierarchy")
 
         layout.prop(
             self, "show_uv",
@@ -1358,24 +1556,31 @@ class EXPORT_OT_hytale_blockyanim(Operator):
             emboss=False,
         )
         if self.show_uv:
-            # Export Bone Collection e Export UV Offset (toggle + qual bone
-            # é fonte/alvo) saíram deste diálogo -- agora ficam no painel
-            # "Hytale Export" (Object Properties da Armature), editado pelo
-            # interface.py. Aqui sobra só a calibração numérica do grid de
-            # UV, que é OUTRO tipo de dado (constantes de conversão
-            # px<->unidade Blender, não "qual bone"/"ligado ou não") -- por
-            # isso não faz sentido mover pra lá junto. Ver DEVELOPER_NOTES.md.
+            # v0.6.5 -- os 4 campos de calibração (Grid Step/Pixels per
+            # Step) AGORA vivem em HYTALE_export_bone_settings
+            # (persistido na Armature, igual export_uv_offset/
+            # uv_offset_source_bone/_target_bone) -- não mais Property
+            # deste Operator. Por isso lê/escreve via
+            # get_export_bone_settings(obj) em vez de 'self' -- e por
+            # isso PRECISA da Armature ativa aqui (igual invoke() já
+            # faz); sem Armature ativa não tem onde gravar, só mostra
+            # aviso.
+            obj = context.active_object
+            bone_settings = get_export_bone_settings(obj) if obj is not None and obj.type == "ARMATURE" else None
             uv_box = layout.box()
             uv_box.label(
-                text="Turn on/pick bones in the 'Hytale Export' panel -- this is just the grid calibration",
+                text="Turn on/pick bones in the 'Hytale Export' panel (Object Properties)",
                 icon="INFO",
             )
-            uv_row1 = uv_box.row(align=True)
-            uv_row1.prop(self, "uv_offset_step_x")
-            uv_row1.prop(self, "uv_offset_px_x")
-            uv_row2 = uv_box.row(align=True)
-            uv_row2.prop(self, "uv_offset_step_y")
-            uv_row2.prop(self, "uv_offset_px_y")
+            if bone_settings is None:
+                uv_box.label(text="No Armature active -- can't edit grid calibration.", icon="ERROR")
+            else:
+                uv_row1 = uv_box.row(align=True)
+                uv_row1.prop(bone_settings, "uv_offset_step_x")
+                uv_row1.prop(bone_settings, "uv_offset_px_x")
+                uv_row2 = uv_box.row(align=True)
+                uv_row2.prop(bone_settings, "uv_offset_step_y")
+                uv_row2.prop(bone_settings, "uv_offset_px_y")
 
         layout.prop(
             self, "show_rig",
@@ -1449,6 +1654,10 @@ class EXPORT_OT_hytale_blockyanim(Operator):
                 return {"CANCELLED"}
 
         rest_by_bone = rest_matrices(obj)
+        # v0.10.19 -- só usado por Bake Parent Scale into Children (ver
+        # rest_local_positions()) -- calculado aqui, uma vez só pra toda a
+        # sessão de export (repouso é fixo, não muda por Action/frame).
+        rest_local_pos = rest_local_positions(obj, rest_by_bone, exportable_names, self.unit_scale)
 
         original_action = obj.animation_data.action
         original_frame = context.scene.frame_current
@@ -1463,7 +1672,7 @@ class EXPORT_OT_hytale_blockyanim(Operator):
 
                 obj.animation_data.action = action
                 node_animations, frame_start, frame_end, fps = sample_action(
-                    context, obj, action, exportable_names, rest_by_bone, self
+                    context, obj, action, exportable_names, rest_by_bone, rest_local_pos, self
                 )
 
                 duration_seconds = (frame_end - frame_start) / fps
