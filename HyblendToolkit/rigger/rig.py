@@ -2126,6 +2126,31 @@ class HytaleIKChainItem(PropertyGroup):
 # ---------------------------------------------------------------------------
 
 
+def _unique_bone_setting_label(chains, base_label, ignore_index=None):
+    """Devolve `base_label` sozinho se nenhum item da lista (fora
+    `ignore_index`, usado quando já existe um item sendo re-rotulado) já
+    tiver exatamente esse label -- só acrescenta um sufixo (".001",
+    ".002", ...) quando já existe colisão, mesma convenção que o próprio
+    Blender usa pra nomes duplicados de objeto/collection/etc. Antes
+    disso, todo item novo nascia como "Head 3", "Arm 5" etc. (o índice
+    cru dentro da lista, sempre crescente mesmo depois de remover itens
+    do meio) -- pedido explícito do usuário pra só aparecer sufixo quando
+    for necessário pra desambiguar de verdade."""
+    existing = {
+        item.label
+        for i, item in enumerate(chains)
+        if item.label and i != ignore_index
+    }
+    if base_label not in existing:
+        return base_label
+    n = 1
+    while True:
+        candidate = f"{base_label}.{n:03d}"
+        if candidate not in existing:
+            return candidate
+        n += 1
+
+
 class RIG_OT_hytale_ik_chain_add(Operator):
     """Adiciona uma entrada vazia à lista (preencha os nomes dos bones
     depois -- ou via um picker). v0.7: recebe `chain_type` (ARM/LEG/
@@ -2155,7 +2180,12 @@ class RIG_OT_hytale_ik_chain_add(Operator):
         # entrada num estado inválido se o menu mandar algo inesperado.
         item.chain_type = self.chain_type if self.chain_type in {"ARM", "LEG", "TAIL", "HEAD", "SPINE", "ATTACHMENTS", "TEXTURE_PICKER"} else "ARM"
         prefix = {"ARM": "Arm", "LEG": "Leg", "TAIL": "Tail", "HEAD": "Head", "SPINE": "Spine", "ATTACHMENTS": "Attachments", "TEXTURE_PICKER": "Texture Picker"}.get(item.chain_type, "Chain")
-        item.label = f"{prefix} {len(chains)}"
+        # v0.13 -- só ganha sufixo ".001" se JÁ existir outro item com esse
+        # label exato (ver _unique_bone_setting_label) -- antes usava
+        # sempre `len(chains)` cru, então o primeiro "Head" adicionado
+        # depois de já existirem outros tipos na lista nascia "Head 3" só
+        # por coincidência de posição, mesmo sendo o único Head.
+        item.label = _unique_bone_setting_label(chains, prefix)
         # v0.8: pole_angle_preset_name (StringProperty) nasce com default=
         # "ARM" fixo na PROPRIA definição do campo (ver HytaleIKChainItem)
         # -- sem esta linha, TODO item novo (mesmo um Leg ou um Tail)
@@ -2322,7 +2352,9 @@ class RIG_OT_hytale_ik_chain_set_count(Operator):
         while len(chains) < self.count:
             item = chains.add()
             item.chain_type = chain_type
-            item.label = f"{prefix} {len(chains)}"
+            # v0.13 -- mesmo fix de RIG_OT_hytale_ik_chain_add: sufixo só
+            # quando já existe outro item com esse label exato.
+            item.label = _unique_bone_setting_label(chains, prefix)
             item.pole_angle_preset_name = chain_type  # v0.8 -- mesmo fix de RIG_OT_hytale_ik_chain_add acima
         while len(chains) > self.count:
             chains.remove(len(chains) - 1)

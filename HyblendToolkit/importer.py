@@ -1387,6 +1387,78 @@ def decode_bbmodel_texture(texture_entry):
     return image
 
 
+def prescan_bbmodel_mesh_groups(outliner_roots, groups_by_uuid):
+    """Anda a árvore do outliner ANTES de criar bone/malha nenhuma, só pra
+    responder duas perguntas adiantado (em espaço de uuid do JSON, não de
+    nome de bone -- nomes de bone só existem depois de dedup, na hora de
+    verdade da criação):
+
+    - `uuids_with_direct_mesh`: quais groups têm pelo menos 1 element
+      FILHO DIRETO (não contando elements de sub-groups).
+    - `uuid_parent_map`: uuid do group -> uuid do group PAI (ou None se
+      for raiz do outliner).
+
+    Precisa ser um pré-scan (não dá pra descobrir isso "ao vivo" durante
+    a construção de verdade) porque `children` mistura elements e
+    sub-groups NA ORDEM DO ARQUIVO -- um group pode ter seu próprio
+    element DEPOIS de um sub-group na lista, e o aninhamento do
+    sub-group já precisa saber se esse group é "dono de malha" desde
+    ANTES de descer nele. Ver bbmodel_ancestor_fn/resolve_mesh_bone_collection
+    pra como isso é usado."""
+    uuids_with_direct_mesh = set()
+    uuid_parent_map = {}
+
+    def walk(children, current_group_uuid):
+        for child in children:
+            if isinstance(child, str):
+                if current_group_uuid is not None:
+                    uuids_with_direct_mesh.add(current_group_uuid)
+                continue
+            group = groups_by_uuid.get(child.get("uuid"))
+            if group is None:
+                continue
+            uuid_parent_map[child["uuid"]] = current_group_uuid
+            walk(child.get("children", []), child["uuid"])
+
+    walk(outliner_roots, None)
+    return uuids_with_direct_mesh, uuid_parent_map
+
+
+def make_bbmodel_ancestor_fn(mesh_build_context):
+    """Devolve a função `nearest_ancestor_fn` (ver
+    resolve_mesh_bone_collection) pro caminho .bbmodel -- traduz o
+    caminho de uuids do pré-scan (prescan_bbmodel_mesh_groups) pra nomes
+    de bone de verdade via mesh_build_context["group_uuid_to_bone_name"]
+    (só populado durante a construção real, mas SEMPRE já disponível pra
+    qualquer ancestral no momento em que um descendente precisa dele --
+    bone pai sempre nasce antes de recursar pros filhos).
+
+    Se `flat_mesh_collections` estiver ligado no operador, devolve uma
+    função que sempre responde None (nenhum ancestral) -- é assim que o
+    modo flat desliga o aninhamento sem precisar de um caminho de código
+    separado em resolve_mesh_bone_collection."""
+    if mesh_build_context["settings"].flat_mesh_collections:
+        return lambda bone_name: None
+
+    uuid_parent_map = mesh_build_context["uuid_parent_map"]
+    uuids_with_direct_mesh = mesh_build_context["uuids_with_direct_mesh"]
+    group_uuid_to_bone_name = mesh_build_context["group_uuid_to_bone_name"]
+    bone_name_to_group_uuid = mesh_build_context["bone_name_to_group_uuid"]
+
+    def ancestor_fn(bone_name):
+        uuid = bone_name_to_group_uuid.get(bone_name)
+        if uuid is None:
+            return None
+        parent_uuid = uuid_parent_map.get(uuid)
+        while parent_uuid is not None:
+            if parent_uuid in uuids_with_direct_mesh:
+                return group_uuid_to_bone_name.get(parent_uuid)
+            parent_uuid = uuid_parent_map.get(parent_uuid)
+        return None
+
+    return ancestor_fn
+
+
 def build_bbmodel_recursive(
     armature_data,
     outliner_children,
@@ -1398,12 +1470,19 @@ def build_bbmodel_recursive(
     unit_scale,
     stats,
     mesh_build_context,
+    parent_group_uuid=None,
 ):
     """Percorre uma lista de filhos do outliner (mistura de dict = group e
     string = uuid de element) e constrói bones (groups) + meshes
     (elements), recursivamente. `ancestor_pivot_matrix` e
     `ancestor_rotation_matrix` -- ver a nota grande no topo desta seção
-    pra o que cada um representa e por que são acumuladores SEPARADOS."""
+    pra o que cada um representa e por que são acumuladores SEPARADOS.
+    `parent_group_uuid`: uuid (no JSON, não nome de bone) do group ATUAL
+    dono destes `outliner_children` -- None na raiz do outliner. Só serve
+    pra resolver aninhamento de mesh collection (ver
+    mesh_build_context["group_uuid_to_bone_name"]/bbmodel_ancestor_fn,
+    abaixo) -- é uma identidade ESTÁVEL (uuid do arquivo) que não depende
+    do nome final do bone no Blender (que pode levar dedup)."""
     edit_bones = armature_data.edit_bones
 
     for child in outliner_children:
@@ -1436,7 +1515,26 @@ def build_bbmodel_recursive(
                 mesh_build_context["generate_uvs"],
             )
             obj = bpy.data.objects.new(elem.get("name", "Element") + "_ref", mesh)
-            mesh_build_context["target_collection"].objects.link(obj)
+
+            # Sub-collection pro group (bone) dono deste element (nome =
+            # "{bone} - {armature}" -- ver resolve_mesh_bone_collection
+            # sobre por que o sufixo do personagem é obrigatório),
+            # aninhada (ou não -- ver flat_mesh_collections) dentro de
+            # "Main - X". Se o element não tem group ancestral nenhum
+            # (parent_bone_name is None, caso raro tratado no `else`
+            # abaixo), não tem por qual bone separar -- fica solto direto
+            # em target_collection, igual antes.
+            if parent_bone_name is not None:
+                mesh_collection = resolve_mesh_bone_collection(
+                    mesh_build_context["bone_collection_cache"],
+                    mesh_build_context["target_collection"],
+                    mesh_build_context["armature_obj"].name,
+                    parent_bone_name,
+                    mesh_build_context["ancestor_fn"],
+                )
+                mesh_collection.objects.link(obj)
+            else:
+                mesh_build_context["target_collection"].objects.link(obj)
 
             tex_index = next((f.get("texture") for f in faces.values() if f.get("texture") is not None), None)
             material = mesh_build_context["material_by_texture_index"].get(tex_index)
@@ -1502,6 +1600,15 @@ def build_bbmodel_recursive(
 
         stats["bones"] += 1
 
+        # Registra a identidade uuid(JSON) -> nome final do bone no
+        # Blender ASSIM QUE o bone nasce -- é o que permite
+        # bbmodel_ancestor_fn (ver mais abaixo) traduzir um uuid de
+        # ancestral achado no pré-scan pro nome de bone de verdade, e
+        # sempre vai estar disponível a tempo pra qualquer descendente
+        # (bones pai são sempre criados ANTES de recursar pros filhos).
+        mesh_build_context["group_uuid_to_bone_name"][child["uuid"]] = bone.name
+        mesh_build_context["bone_name_to_group_uuid"][bone.name] = child["uuid"]
+
         child_ancestor_pivot = ancestor_pivot_matrix @ bb_rotate_around_pivot(origin, rotation_deg)
         build_bbmodel_recursive(
             armature_data,
@@ -1514,6 +1621,7 @@ def build_bbmodel_recursive(
             unit_scale,
             stats,
             mesh_build_context,
+            parent_group_uuid=child["uuid"],
         )
 
 
@@ -1545,6 +1653,73 @@ def get_or_create_child_collection(parent_collection, name):
     new_coll = bpy.data.collections.new(name)
     parent_collection.children.link(new_coll)
     return new_coll
+
+
+def resolve_mesh_bone_collection(cache, top_collection, armature_name, bone_name, nearest_ancestor_fn):
+    """Devolve (criando se preciso) a collection de malhas do bone
+    `bone_name`, resolvendo recursivamente ONDE ela deve morar:
+
+    - `nearest_ancestor_fn(bone_name)` devolve o nome do bone ANCESTRAL
+      mais próximo que também é dono de malha direta, ou None se não
+      achar nenhum (ou se o import estiver em modo flat -- ver as duas
+      implementações concretas, `blockymodel_ancestor_fn`/
+      `bbmodel_ancestor_fn`, que já devolvem sempre None quando
+      `flat_mesh_collections` está ligado no operador).
+    - Se achou um ancestral, a collection de `bone_name` nasce DENTRO da
+      collection do ancestral (resolvida recursivamente -- pode ter mais
+      de um nível: A dentro de B dentro de C, se B e C também forem donos
+      de malha) -- é assim que o modo aninhado (padrão) mirrora a
+      hierarquia de bones/groups só nos pontos que realmente têm malha,
+      pulando bones puramente organizacionais no meio (que nunca ganham
+      collection própria -- só quando têm malha DIRETA).
+    - Se não achou (bone raiz do lado de malha, ou modo flat), a
+      collection nasce direto dentro de `top_collection` (Main -
+      <armature_name> / Mesh Attachments - <armature_name>).
+
+    O nome final de cada collection leva `" - {armature_name}"` no fim
+    (mesmo sufixo que `build_character_collections` já usa em "Rig - X"/
+    "Main - X"), NÃO só `bone_name` puro -- nomes de bone como "Head"/
+    "Pelvis"/"Origin"/"Chest" são comuns a praticamente todo personagem, e
+    nomes de Collection são ÚNICOS GLOBALMENTE em bpy.data.collections
+    (não só dentro do parent). Sem o sufixo, importar um SEGUNDO
+    personagem faria o Blender renomear a collection colidente sozinho
+    pra "Head.001" (a criação teria "sucesso" sem erro nenhum, mas
+    silenciosamente errado), e cada reimport posterior criaria mais uma.
+
+    `cache`: dict {(id(top_collection), bone_name): collection}, mantido
+    pelo CHAMADOR (uma vida por chamada de add_reference_visuals/
+    build_bbmodel_recursive) -- também serve pra cortar a recursão assim
+    que uma collection já resolvida antes é encontrada de novo (ex: dois
+    irmãos com o mesmo ancestral dono de malha)."""
+    key = (id(top_collection), bone_name)
+    coll = cache.get(key)
+    if coll is not None:
+        return coll
+
+    ancestor_name = nearest_ancestor_fn(bone_name)
+    if ancestor_name is not None and ancestor_name != bone_name:
+        parent_collection = resolve_mesh_bone_collection(
+            cache, top_collection, armature_name, ancestor_name, nearest_ancestor_fn
+        )
+    else:
+        parent_collection = top_collection
+
+    coll = get_or_create_child_collection(parent_collection, f"{bone_name} - {armature_name}")
+    cache[key] = coll
+    return coll
+
+
+def collect_object_names_recursive(collection, names_out):
+    """Preenche `names_out` (um set) com os nomes de TODOS os objetos
+    dentro de `collection`, incluindo os que moram em sub-collections dela
+    (recursivo, qualquer profundidade -- necessário desde que o modo
+    aninhado/padrão pode empilhar collection dentro de collection). Usado
+    só pro snapshot "o que já existia antes desta chamada de import"
+    (ATTACH_EXISTING, pra não duplicar malha em reimport -- ver
+    add_reference_visuals)."""
+    names_out.update(collection.objects.keys())
+    for child in collection.children:
+        collect_object_names_recursive(child, names_out)
 
 
 def build_character_collections(context, armature_name):
@@ -1661,7 +1836,45 @@ def add_reference_visuals(
     # incorretamente tratado como duplicata de uma passada anterior e
     # pulado, sumindo com a malha de referência dele. Mesma lógica de
     # `reusable_bone_names`, em execute(), acima.
-    existing_ref_names_before = set(boxes_collection.objects.keys())
+    #
+    # RECURSIVO (collect_object_names_recursive, não só
+    # boxes_collection.objects.keys()) desde que as malhas passaram a
+    # morar dentro de uma sub-collection por bone (ver
+    # resolve_mesh_bone_collection, abaixo) -- boxes_collection em si não
+    # tem mais objeto NENHUM linkado direto, só sub-collections.
+    existing_ref_names_before = set()
+    collect_object_names_recursive(boxes_collection, existing_ref_names_before)
+
+    # Cache local (uma vida só desta chamada) pra resolve_mesh_bone_collection
+    # não reescanear as collections a cada malha do mesmo bone.
+    bone_collection_cache = {}
+
+    # nearest_ancestor_fn pro modo aninhado (padrão): bones_with_mesh é o
+    # conjunto de bones que são donos de pelo menos 1 shape DIRETA -- só
+    # esses ganham collection própria (mesma regra "só cria quando tem
+    # malha dentro" de antes). A cadeia de pais já está inteira disponível
+    # aqui (armature_obj.data.bones, Object Mode -- todos os bones do
+    # arquivo já foram commitados antes desta função ser chamada), então
+    # não precisa de pré-scan feito à parte, diferente do caminho .bbmodel
+    # (onde bone e malha nascem juntos, na mesma passada -- ver
+    # prescan_bbmodel_mesh_groups). Modo flat (settings.flat_mesh_collections)
+    # simplesmente nunca devolve ancestral nenhum.
+    if settings.flat_mesh_collections:
+        ancestor_fn = lambda bone_name: None
+    else:
+        bones_with_mesh = {node_id_to_bone_name[id(n)] for n in shape_nodes}
+        bones_data = armature_obj.data.bones
+
+        def ancestor_fn(bone_name):
+            bone = bones_data.get(bone_name)
+            if bone is None:
+                return None
+            parent = bone.parent
+            while parent is not None:
+                if parent.name in bones_with_mesh:
+                    return parent.name
+                parent = parent.parent
+            return None
 
     for node in shape_nodes:
         name = node["name"]
@@ -1687,13 +1900,25 @@ def add_reference_visuals(
             mesh = make_quad_mesh(name, shape, size_scaled, size_raw, atlas_w, atlas_h, settings.generate_uvs)
 
         obj = bpy.data.objects.new(obj_name, mesh)
-        boxes_collection.objects.link(obj)
+
+        # Sub-collection pro bone dono desta malha (nome = "{bone} -
+        # {armature}", mesmo padrão de "Main - X"/"Rig - X" -- ver
+        # resolve_mesh_bone_collection sobre por que o sufixo do
+        # personagem é obrigatório), aninhada (ou não -- ver
+        # flat_mesh_collections/ancestor_fn acima) dentro de
+        # boxes_collection (Main/Mesh Attachments) -- só criada aqui
+        # (nunca antecipada) porque é exatamente aqui que sabemos que
+        # existe uma malha de verdade pra colocar dentro.
+        bone_name = node_id_to_bone_name[id(node)]
+        mesh_collection = resolve_mesh_bone_collection(
+            bone_collection_cache, boxes_collection, armature_obj.name, bone_name, ancestor_fn
+        )
+        mesh_collection.objects.link(obj)
 
         if material is not None:
             obj.data.materials.append(material)
 
         node_world = world_matrices[id(node)]
-        bone_name = node_id_to_bone_name[id(node)]
         local_offset_scale = Matrix.Translation(offset) @ Matrix.Diagonal(
             (stretch.x, stretch.y, stretch.z, 1.0)
         )
@@ -1829,6 +2054,19 @@ class IMPORT_OT_hytale_blockymodel(Operator, ImportHelper):
             "reference while animating, and already deformable/paintable"
         ),
         default=True,
+    )
+
+    flat_mesh_collections: BoolProperty(
+        name="Flat Mesh Collections",
+        description=(
+            "Keep every bone's mesh collection at a single flat level, "
+            "instead of the default nested layout (a bone's mesh collection "
+            "sits inside its nearest ancestor bone's mesh collection, "
+            "mirroring the model's own hierarchy -- same idea as folders in "
+            "Blockbench). Enable this to flatten everything to one level "
+            "instead"
+        ),
+        default=False,
     )
 
     generate_uvs: BoolProperty(
@@ -2009,6 +2247,7 @@ class IMPORT_OT_hytale_blockymodel(Operator, ImportHelper):
 
         sub = vis_box.column()
         sub.enabled = self.generate_reference_boxes
+        sub.prop(self, "flat_mesh_collections", text=tr("importer.flat_mesh_collections", lang))
         sub.prop(self, "generate_uvs", text=tr("importer.generate_uvs", lang))
         sub.prop(self, "create_material", text=tr("importer.create_material", lang))
 
@@ -2240,6 +2479,18 @@ class IMPORT_OT_hytale_bbmodel(Operator, ImportHelper):
         default=True,
     )
 
+    flat_mesh_collections: BoolProperty(
+        name="Flat Mesh Collections",
+        description=(
+            "Keep every bone's mesh collection at a single flat level, "
+            "instead of the default nested layout (a bone's mesh collection "
+            "sits inside its nearest ancestor bone's mesh collection, "
+            "mirroring the .bbmodel's own outliner/folder hierarchy). "
+            "Enable this to flatten everything to one level instead"
+        ),
+        default=False,
+    )
+
     generate_uvs: BoolProperty(
         name="Generate UVs",
         description=(
@@ -2281,6 +2532,7 @@ class IMPORT_OT_hytale_bbmodel(Operator, ImportHelper):
 
         sub = vis_box.column()
         sub.enabled = self.generate_reference_boxes
+        sub.prop(self, "flat_mesh_collections", text=tr("importer.flat_mesh_collections", lang))
         sub.prop(self, "generate_uvs", text=tr("importer.generate_uvs", lang))
         sub.prop(self, "create_material", text=tr("importer.create_material", lang))
 
@@ -2327,6 +2579,17 @@ class IMPORT_OT_hytale_bbmodel(Operator, ImportHelper):
                 )
                 material_by_texture_index[idx] = material
 
+        # Pré-scan (só quando modo aninhado está ligado -- ver
+        # make_bbmodel_ancestor_fn) pra saber ADIANTADO quais groups têm
+        # malha DIRETA e qual é o group pai de cada group, em espaço de
+        # uuid do JSON -- não dá pra descobrir isso "ao vivo" durante a
+        # construção real porque elements/sub-groups vêm misturados na
+        # ordem do arquivo (ver prescan_bbmodel_mesh_groups).
+        if self.flat_mesh_collections:
+            uuids_with_direct_mesh, uuid_parent_map = set(), {}
+        else:
+            uuids_with_direct_mesh, uuid_parent_map = prescan_bbmodel_mesh_groups(outliner_roots, groups_by_uuid)
+
         mesh_build_context = {
             "target_collection": main_collection,
             "armature_obj": armature_obj,
@@ -2335,7 +2598,28 @@ class IMPORT_OT_hytale_bbmodel(Operator, ImportHelper):
             "generate_meshes": self.generate_reference_boxes,
             "generate_uvs": self.generate_reference_boxes and self.generate_uvs,
             "settings": self,
+            # Cache de resolve_mesh_bone_collection (uma vida só desta
+            # chamada de import) -- separa as malhas por bone/group dono
+            # dentro de "Main - X", aninhado ou flat conforme
+            # flat_mesh_collections -- ver build_bbmodel_recursive.
+            "bone_collection_cache": {},
+            # uuid(JSON) <-> nome final do bone -- group_uuid_to_bone_name
+            # é populado AO VIVO conforme os bones nascem (ver
+            # build_bbmodel_recursive); bone_name_to_group_uuid é o
+            # inverso, preenchido junto, usado por make_bbmodel_ancestor_fn
+            # pra converter um bone_name de volta pro espaço de uuid antes
+            # de andar uuid_parent_map.
+            "group_uuid_to_bone_name": {},
+            "bone_name_to_group_uuid": {},
+            "uuids_with_direct_mesh": uuids_with_direct_mesh,
+            "uuid_parent_map": uuid_parent_map,
         }
+        # ancestor_fn só pode ser montada DEPOIS do dict acima existir --
+        # ela fecha sobre mesh_build_context (lê group_uuid_to_bone_name/
+        # bone_name_to_group_uuid, que só terminam de ser populados
+        # durante build_bbmodel_recursive, mas sempre a tempo pra qualquer
+        # ancestral -- ver make_bbmodel_ancestor_fn).
+        mesh_build_context["ancestor_fn"] = make_bbmodel_ancestor_fn(mesh_build_context)
 
         # Mesma cautela do import de .blockymodel -- ver a nota grande em
         # IMPORT_OT_hytale_blockymodel.execute() sobre X-Axis Mirror.

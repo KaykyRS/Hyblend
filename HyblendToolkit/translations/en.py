@@ -51,6 +51,7 @@ TRANSLATIONS = {
     "importer.unit_scale": "Scale (Blender units per game unit)",
     "importer.section_visuals": "Reference Visuals",
     "importer.generate_reference_boxes": "Generate Reference Meshes",
+    "importer.flat_mesh_collections": "Flat Mesh Collections",
     "importer.generate_uvs": "Generate UVs",
     "importer.create_material": "Create Material",
     "importer.missing_face_mode": "Faces Missing Texture Data",

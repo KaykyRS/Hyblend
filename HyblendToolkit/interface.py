@@ -284,7 +284,22 @@ class HYTALE_PT_main(Panel):
 
             settings_box = layout.box()
             settings_box.label(text=tr("panel.export_settings_box", lang), icon="TOOL_SETTINGS")
-            settings_box.prop(settings, "export_collection_name", text=tr("panel.export_collection", lang))
+            # prop_search em vez de prop(): mostra um dropdown/autocomplete
+            # com as Bone Collections que JÁ EXISTEM na Armature (mesmo
+            # padrão já usado em importer.py pra target_armature_name),
+            # em vez de exigir digitar o nome de cabeça. Continua sendo um
+            # StringProperty por baixo (não vira PointerProperty) -- então
+            # o valor default "Hytale Export" continua aparecendo mesmo
+            # antes dessa collection existir de verdade (o usuário ainda
+            # pode digitar/editar livremente, o dropdown é só um atalho).
+            # armature_data.collections_all (não só .collections) pra
+            # também listar Bone Collections aninhadas dentro de outra,
+            # não só as de nível raiz -- ver rigger/rig.py sobre a
+            # diferença entre os dois.
+            settings_box.prop_search(
+                settings, "export_collection_name", armature_data, "collections_all",
+                text=tr("panel.export_collection", lang),
+            )
 
             # v0.12 -- armature.hytale_export_settings.export_uv_offset
             # (toggle único) + os campos de UV Offset viraram armature.
