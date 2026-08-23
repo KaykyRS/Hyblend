@@ -31,7 +31,11 @@ import bpy
 from bpy.props import BoolProperty, EnumProperty
 from bpy.types import Panel, WindowManager
 
-from .exporter import EXPORT_OT_hytale_blockyanim
+from .exporter import (
+    EXPORT_OT_hytale_blockyanim,
+    EXPORT_OT_texture_picker_export_add,
+    EXPORT_OT_texture_picker_export_remove,
+)
 from .importer import IMPORT_OT_hytale_blockymodel, IMPORT_OT_hytale_bbmodel
 from .anim_importer import IMPORT_OT_hytale_blockyanim
 from .anim_tools import (
@@ -59,8 +63,8 @@ from .rigger import (
     RIG_OT_hytale_ik_chain_pick_bone,
     RIG_OT_hytale_ik_chain_remove,
     RIG_OT_hytale_mirror_shape,
-    RIG_OT_hytale_mouth_atlas_create,
-    RIG_OT_hytale_mouth_atlas_remove,
+    RIG_OT_hytale_texture_picker_create,
+    RIG_OT_hytale_texture_picker_remove,
     RIG_OT_hytale_rig_template_delete,
     RIG_OT_hytale_rig_template_save,
     RIG_OT_hytale_shape_edit_mode_enter,
@@ -269,48 +273,115 @@ class HYTALE_PT_main(Panel):
 
         if is_armature:
             # active.data.hytale_export_settings é PointerProperty ->
-            # HYTALE_export_bone_settings, registrada por exporter.py
-            # (mesmo padrão do hytale_ik_chains do rigger.py: quem é
-            # dono da lógica registra o dado em Armature, aqui só
-            # desenha). Não passa por get_export_bone_settings() -- essa
-            # função é só um atalho interno do exporter.py, o painel lê
-            # o caminho direto (ver comentário dele em exporter.py).
+            # HYTALE_export_settings, registrada por exporter.py (mesmo
+            # padrão do hytale_ik_chains do rigger.py: quem é dono da
+            # lógica registra o dado em Armature, aqui só desenha). Não
+            # passa por get_export_settings() -- essa função é só um
+            # atalho interno do exporter.py, o painel lê o caminho
+            # direto (ver comentário dele em exporter.py).
             settings = active.data.hytale_export_settings
+            armature_data = active.data
 
             settings_box = layout.box()
             settings_box.label(text=tr("panel.export_settings_box", lang), icon="TOOL_SETTINGS")
             settings_box.prop(settings, "export_collection_name", text=tr("panel.export_collection", lang))
 
-            mouth_row = settings_box.row(align=True)
-            mouth_row.prop(settings, "export_uv_offset", text=tr("panel.mouth_animation", lang))
-            wip_sub = mouth_row.row()
+            # v0.12 -- armature.hytale_export_settings.export_uv_offset
+            # (toggle único) + os campos de UV Offset viraram armature.
+            # hytale_texture_picker_exports (CollectionProperty, uma
+            # entrada por instância -- ver exporter.py, HYTALE_texture_
+            # picker_export_item) -- múltiplas instâncias independentes
+            # agora exportam corretamente no mesmo arquivo, sem uma
+            # sobrescrever a calibração da outra (bug real com o toggle
+            # único antigo). Normalmente esta lista é preenchida sozinha
+            # por "Create Texture Picker" (aba Rig, uma entrada TEXTURE_
+            # PICKER por instância) -- Add/Remove aqui existem só pra
+            # ajuste manual.
+            #
+            # v0.12.1 -- CORRIGIDO (feedback do usuário testando o painel
+            # de verdade): esta caixa aparecia sempre, mesmo sem NENHUMA
+            # instância configurada -- a maioria dos personagens nunca usa
+            # Texture Picker, então virava poluição visual permanente na
+            # aba Export. Agora é collapsible, mesmo padrão exato de
+            # Reference Image/Companion Bones/Grid (aba Rig, dentro de uma
+            # entrada TEXTURE_PICKER) -- toggle próprio no WindowManager
+            # (hytale_show_export_texture_picker), fechado por padrão.
+            wm = context.window_manager
+            texture_picker_box = layout.box()
+            texture_picker_header = texture_picker_box.row()
+            texture_picker_header.prop(
+                wm, "hytale_show_export_texture_picker",
+                text=tr("panel.export_texture_picker", lang),
+                icon="TRIA_DOWN" if wm.hytale_show_export_texture_picker else "TRIA_RIGHT",
+                emboss=False,
+            )
+            wip_sub = texture_picker_header.row()
             wip_sub.alignment = "RIGHT"
-            wip_sub.label(text=tr("panel.warn_mouth_wip_short", lang), icon="ERROR")
+            wip_sub.label(text=tr("panel.warn_texture_picker_wip_short", lang), icon="ERROR")
 
-            if settings.export_uv_offset:
-                sub = settings_box.column(align=True)
-
-                def uv_picker_row(field_name, text=None):
-                    r = sub.row(align=True)
-                    if text is not None:
-                        r.prop(settings, field_name, text=text)
-                    else:
-                        r.prop(settings, field_name)
-                    op = r.operator(HYTALE_OT_pick_bone_into_field.bl_idname, text="", icon="EYEDROPPER")
-                    op.data_path = "data.hytale_export_settings"
-                    op.field = field_name
-
-                uv_picker_row("uv_offset_source_bone")
-                uv_picker_row("uv_offset_target_bone", text=tr("panel.mouth_bone", lang))
-                # v0.10.13 -- Companion Target Bones: lista (não um bone
-                # só), então sem o picker de eyedropper de uv_picker_row
-                # acima -- normalmente preenchido sozinho por "Create
-                # Mouth Atlas" a partir dos Companion Bones da entrada
-                # MOUTH (aba Rig), editável aqui só pra ajuste manual.
-                sub.prop(
-                    settings, "uv_offset_target_bones_extra",
-                    text=tr("panel.mouth_extra_target_bones", lang),
+            if wm.hytale_show_export_texture_picker:
+                list_row = texture_picker_box.row()
+                list_row.template_list(
+                    "HYTALE_UL_texture_picker_exports", "",
+                    armature_data, "hytale_texture_picker_exports",
+                    armature_data, "hytale_texture_picker_exports_index",
                 )
+                list_col = list_row.column(align=True)
+                list_col.operator(EXPORT_OT_texture_picker_export_add.bl_idname, text="", icon="ADD")
+                list_col.operator(EXPORT_OT_texture_picker_export_remove.bl_idname, text="", icon="REMOVE")
+
+                exports = armature_data.hytale_texture_picker_exports
+                index = armature_data.hytale_texture_picker_exports_index
+                if exports and 0 <= index < len(exports):
+                    active_export = exports[index]
+                    sub = texture_picker_box.column(align=True)
+
+                    def uv_picker_row(field_name, text=None):
+                        r = sub.row(align=True)
+                        if text is not None:
+                            r.prop(active_export, field_name, text=text)
+                        else:
+                            r.prop(active_export, field_name)
+                        op = r.operator(HYTALE_OT_pick_bone_into_field.bl_idname, text="", icon="EYEDROPPER")
+                        # v0.12 -- data_path indexado (funciona porque
+                        # obj.path_resolve suporta sintaxe com colchetes em
+                        # CollectionProperty) -- o índice é fixado NA HORA DE
+                        # DESENHAR, então sempre aponta pro item certo mesmo
+                        # que o usuário troque a seleção da lista depois de
+                        # abrir o painel, sem precisar de um operador dedicado
+                        # com IntProperty (diferente de RIG_OT_hytale_ik_
+                        # chain_pick_bone, em rigger/rig.py, que precisa disso
+                        # porque hytale_ik_chains é editado de vários lugares
+                        # ao mesmo tempo -- aqui um data_path simples já basta).
+                        op.data_path = f"data.hytale_texture_picker_exports[{index}]"
+                        op.field = field_name
+
+                    uv_picker_row("uv_offset_source_bone")
+                    uv_picker_row("uv_offset_target_bone", text=tr("panel.texture_picker_target_bone", lang))
+                    # v0.10.13 -- Companion Target Bones: lista (não um bone
+                    # só), então sem o picker de eyedropper de uv_picker_row
+                    # acima -- normalmente preenchido sozinho por "Create
+                    # Texture Picker" a partir dos Companion Bones da entrada
+                    # TEXTURE_PICKER (aba Rig), editável aqui só pra ajuste manual.
+                    sub.prop(
+                        active_export, "uv_offset_target_bones_extra",
+                        text=tr("panel.texture_picker_extra_target_bones", lang),
+                    )
+                    # v0.12.1 -- os 4 campos de calibração (Grid Step/
+                    # Pixels per Step) MUDARAM de lugar de novo (ver
+                    # histórico em exporter.py, EXPORT_OT_hytale_
+                    # blockyanim.draw()) -- moram aqui agora, junto do
+                    # resto dos campos DESTA instância, em vez de ficarem
+                    # escondidos atrás de um índice separado no diálogo
+                    # de Export Animations. Normalmente preenchidos
+                    # sozinhos por "Create Texture Picker" -- editar aqui
+                    # é só pra ajuste fino manual.
+                    calib_row1 = sub.row(align=True)
+                    calib_row1.prop(active_export, "uv_offset_step_x")
+                    calib_row1.prop(active_export, "uv_offset_px_x")
+                    calib_row2 = sub.row(align=True)
+                    calib_row2.prop(active_export, "uv_offset_step_y")
+                    calib_row2.prop(active_export, "uv_offset_px_y")
 
         col = layout.column(align=True)
         col.scale_y = 1.4
@@ -532,7 +603,7 @@ class HYTALE_PT_main(Panel):
                     # v0.10.14 -- mesma lógica de picker_row acima, mas
                     # desenhando num layout QUALQUER (ex.: dentro de um
                     # box.column() de uma sub-seção) em vez de sempre em
-                    # `col` direto -- usado pela UI de MOUTH, reorganizada
+                    # `col` direto -- usado pela UI de TEXTURE_PICKER, reorganizada
                     # em caixas por seção (Bone/Plane/Companions).
                     r = layout.row(align=True)
                     r.prop(item, field_name, text=text)
@@ -623,25 +694,25 @@ class HYTALE_PT_main(Panel):
                     col.label(text=tr("panel.hint_attachments_no_ik", lang), icon="INFO")
                     col.separator()
                     col.prop(item, "collection_override", text=tr("panel.field_collection", lang))
-                elif item.chain_type == "MOUTH":
-                    # v0.10 -- Mouth não cria bone de IK nenhum -- só
-                    # identifica QUAL bone original é a boca, e dispara
-                    # a criação do atlas picker (root.ui/ui.mouth_uv +
+                elif item.chain_type == "TEXTURE_PICKER":
+                    # v0.10 -- Texture Picker não cria bone de IK nenhum -- só
+                    # identifica QUAL bone original é o alvo, e dispara
+                    # a criação do atlas picker (par root.ui/cursor derivado +
                     # plane de referência + driver no material -- ver
-                    # rigger/rig.py, _build_mouth_atlas).
+                    # rigger/rig.py, _build_texture_picker).
                     #
                     # v0.10.14 -- reorganizado em seções (pedido
                     # explícito do usuário: layout anterior ficava tudo
-                    # "achatado" numa coluna só). Mouth Bone/Picker
+                    # "achatado" numa coluna só). Target Bone/Picker
                     # Parent ficam SOLTOS (sem box), mesmo espírito de
                     # Root Bone/Tip Bone em ARM/LEG logo abaixo -- só as
                     # seções realmente OPCIONAIS (Reference Image,
-                    # Companion Bones, Grid Detection) ganham box +
+                    # Companion Bones, Grid) ganham box +
                     # collapsible. Rótulos/hints encurtados -- explicação
                     # técnica completa continua nos comentários de
                     # código e nas tooltips (hover).
-                    picker_row("mouth_bone", tr("panel.field_mouth_bone", lang))
-                    picker_row("mouth_ui_parent_bone", tr("panel.field_mouth_ui_parent_bone", lang))
+                    picker_row("texture_picker_bone", tr("panel.field_texture_picker_bone", lang))
+                    picker_row("texture_picker_ui_parent_bone", tr("panel.field_texture_picker_ui_parent_bone", lang))
                     col.separator()
 
                     # v0.10.15 -- collapsible SEM trava: rodada anterior
@@ -653,100 +724,94 @@ class HYTALE_PT_main(Panel):
                     plane_box = col.box()
                     plane_header = plane_box.row()
                     plane_header.prop(
-                        wm, "hytale_show_mouth_plane",
-                        text=tr("panel.mouth_section_plane", lang),
-                        icon="TRIA_DOWN" if wm.hytale_show_mouth_plane else "TRIA_RIGHT",
+                        wm, "hytale_show_texture_picker_plane",
+                        text=tr("panel.texture_picker_section_plane", lang),
+                        icon="TRIA_DOWN" if wm.hytale_show_texture_picker_plane else "TRIA_RIGHT",
                         emboss=False,
                     )
-                    if wm.hytale_show_mouth_plane:
+                    if wm.hytale_show_texture_picker_plane:
                         plane_col = plane_box.column(align=True)
-                        plane_col.prop(item, "mouth_plane_scale", text=tr("panel.field_mouth_plane_scale", lang))
+                        plane_col.prop(item, "texture_picker_plane_scale", text=tr("panel.field_texture_picker_plane_scale", lang))
                         plane_row = plane_col.row(align=True)
                         plane_row.prop(
-                            item, "mouth_plane_offset_x", text=tr("panel.field_mouth_plane_offset_x", lang)
+                            item, "texture_picker_plane_offset_x", text=tr("panel.field_texture_picker_plane_offset_x", lang)
                         )
                         plane_row.prop(
-                            item, "mouth_plane_offset_y", text=tr("panel.field_mouth_plane_offset_y", lang)
+                            item, "texture_picker_plane_offset_y", text=tr("panel.field_texture_picker_plane_offset_y", lang)
                         )
 
                     # v0.10.13 -- Companion Bones: outras malhas/bones
-                    # que compartilham o atlas de bocas e devem trocar
-                    # de expressão JUNTO com Mouth Bone (ex.: metades
+                    # que compartilham o atlas do target e devem trocar
+                    # de expressão JUNTO com Target Bone (ex.: metades
                     # L/R espelhadas) -- mesmo padrão de lista em loop
                     # que Attachments (attachments_count acima), teto
-                    # bem menor (ver MOUTH_EXTRA_BONES_MAX_COUNT em
+                    # bem menor (ver TEXTURE_PICKER_EXTRA_BONES_MAX_COUNT em
                     # rigger/constants.py). Não criam bone nenhum --
                     # só recebem material+driver de UV, ver
-                    # _apply_mouth_atlas_to_companion em rigger/rig.py.
+                    # _apply_texture_picker_to_companion em rigger/rig.py.
                     companion_box = col.box()
                     companion_header = companion_box.row()
                     companion_header.prop(
-                        wm, "hytale_show_mouth_companions",
-                        text=tr("panel.mouth_section_companions", lang),
-                        icon="TRIA_DOWN" if wm.hytale_show_mouth_companions else "TRIA_RIGHT",
+                        wm, "hytale_show_texture_picker_companions",
+                        text=tr("panel.texture_picker_section_companions", lang),
+                        icon="TRIA_DOWN" if wm.hytale_show_texture_picker_companions else "TRIA_RIGHT",
                         emboss=False,
                     )
-                    if wm.hytale_show_mouth_companions:
+                    if wm.hytale_show_texture_picker_companions:
                         companion_col = companion_box.column(align=True)
                         companion_col.prop(
-                            item, "mouth_extra_bone_count", text=tr("panel.field_mouth_extra_count", lang)
+                            item, "texture_picker_extra_bone_count", text=tr("panel.field_texture_picker_extra_count", lang)
                         )
-                        companion_base_label = tr("panel.field_mouth_extra_bone", lang)
-                        for i in range(1, item.mouth_extra_bone_count + 1):
+                        companion_base_label = tr("panel.field_texture_picker_extra_bone", lang)
+                        for i in range(1, item.texture_picker_extra_bone_count + 1):
                             label = companion_base_label if i == 1 else f"{companion_base_label} {i}"
-                            _picker_row_into(companion_col, f"mouth_extra_bone_{i}", label)
-                        if item.mouth_extra_bone_count == 0:
-                            companion_col.label(text=tr("panel.hint_mouth_companions_empty", lang), icon="INFO")
+                            _picker_row_into(companion_col, f"texture_picker_extra_bone_{i}", label)
+                        if item.texture_picker_extra_bone_count == 0:
+                            companion_col.label(text=tr("panel.hint_texture_picker_companions_empty", lang), icon="INFO")
 
-                    # v0.10.12 -- Manual Grid: bypass TOTAL da detecção
-                    # por alpha -- pro caso em que os ícones de boca
-                    # têm largura visual desigual dentro de células
-                    # uniformes (a banda de alpha de cada um começa/
-                    # termina em pontos diferentes dentro da própria
-                    # célula, então medir a distância entre bandas não
-                    # bate com o pitch real, mesmo ele sendo uniforme
-                    # de verdade no Blockbench). v0.10.15 -- collapsible
-                    # também agora, mesmo padrão das duas seções acima.
+                    # v0.11 -- auto-detecção por alpha removida por
+                    # completo (se provou frágil -- atlas embutido numa
+                    # textura maior sempre dava 1x1, ícones com largura
+                    # visual desigual dentro de células uniformes davam
+                    # medição errada -- ver DEVELOPER_NOTES.md). Grid
+                    # agora é sempre digitado manualmente (números que o
+                    # usuário já vê no Blockbench) -- collapsible mantido,
+                    # mesmo padrão das duas seções acima, mas sem toggle
+                    # nem branch: os 4 campos ficam sempre visíveis aqui
+                    # dentro.
                     grid_box = col.box()
                     grid_header = grid_box.row()
                     grid_header.prop(
-                        wm, "hytale_show_mouth_grid",
-                        text=tr("panel.mouth_section_grid", lang),
-                        icon="TRIA_DOWN" if wm.hytale_show_mouth_grid else "TRIA_RIGHT",
+                        wm, "hytale_show_texture_picker_grid",
+                        text=tr("panel.texture_picker_section_grid", lang),
+                        icon="TRIA_DOWN" if wm.hytale_show_texture_picker_grid else "TRIA_RIGHT",
                         emboss=False,
                     )
-                    if wm.hytale_show_mouth_grid:
+                    if wm.hytale_show_texture_picker_grid:
                         grid_col = grid_box.column(align=True)
-                        grid_col.prop(
-                            item, "mouth_atlas_use_manual_grid",
-                            text=tr("panel.field_mouth_manual_grid", lang),
+                        grid_row = grid_col.row(align=True)
+                        grid_row.prop(
+                            item, "texture_picker_grid_cols", text=tr("panel.field_texture_picker_grid_cols", lang)
                         )
-                        if item.mouth_atlas_use_manual_grid:
-                            grid_row = grid_col.row(align=True)
-                            grid_row.prop(
-                                item, "mouth_atlas_grid_cols", text=tr("panel.field_mouth_grid_cols", lang)
-                            )
-                            grid_row.prop(
-                                item, "mouth_atlas_grid_rows", text=tr("panel.field_mouth_grid_rows", lang)
-                            )
-                            grid_row = grid_col.row(align=True)
-                            grid_row.prop(
-                                item, "mouth_atlas_grid_cell_width",
-                                text=tr("panel.field_mouth_grid_cell_width", lang),
-                            )
-                            grid_row.prop(
-                                item, "mouth_atlas_grid_cell_height",
-                                text=tr("panel.field_mouth_grid_cell_height", lang),
-                            )
-                        else:
-                            grid_col.label(text=tr("panel.hint_mouth_auto_grid", lang), icon="INFO")
+                        grid_row.prop(
+                            item, "texture_picker_grid_rows", text=tr("panel.field_texture_picker_grid_rows", lang)
+                        )
+                        grid_row = grid_col.row(align=True)
+                        grid_row.prop(
+                            item, "texture_picker_grid_cell_width",
+                            text=tr("panel.field_texture_picker_grid_cell_width", lang),
+                        )
+                        grid_row.prop(
+                            item, "texture_picker_grid_cell_height",
+                            text=tr("panel.field_texture_picker_grid_cell_height", lang),
+                        )
 
                     col.separator()
                     action_row = col.row(align=True)
                     action_row.scale_y = 1.3
-                    action_row.operator(RIG_OT_hytale_mouth_atlas_create.bl_idname, icon="IMAGE_DATA")
-                    action_row.operator(RIG_OT_hytale_mouth_atlas_remove.bl_idname, icon="X", text="")
-                    col.label(text=tr("panel.hint_mouth_no_ik", lang), icon="INFO")
+                    action_row.operator(RIG_OT_hytale_texture_picker_create.bl_idname, icon="IMAGE_DATA")
+                    action_row.operator(RIG_OT_hytale_texture_picker_remove.bl_idname, icon="X", text="")
+                    col.label(text=tr("panel.hint_texture_picker_no_ik", lang), icon="INFO")
                     col.separator()
                     col.prop(item, "collection_override", text=tr("panel.field_collection", lang))
                 else:
@@ -1234,26 +1299,34 @@ def register():
     WindowManager.hytale_show_ik_chains = BoolProperty(default=False)
     WindowManager.hytale_show_bone_collections = BoolProperty(default=False)
     WindowManager.hytale_show_templates = BoolProperty(default=False)
-    # v0.10.14/v0.10.15 -- seções opcionais dentro de uma entrada MOUTH
-    # (Reference Image, Companion Bones, Grid Detection) -- mesmo
+    # v0.10.14/v0.10.15 -- seções opcionais dentro de uma entrada TEXTURE_PICKER
+    # (Reference Image, Companion Bones, Grid) -- mesmo
     # espírito das três acima (só estado de UI, não dado do rig), mas
-    # globais entre TODAS as entradas MOUTH/armaturas (não por item da
+    # globais entre TODAS as entradas TEXTURE_PICKER/armaturas (não por item da
     # lista -- é só "estou olhando esse tipo de ajuste ou não" no
     # momento). Default False = fechada. Sem trava/auto-abrir nenhuma
     # (pedido explícito do usuário -- v0.10.14 tinha isso só pra
     # Companion Bones, removido na v0.10.15: usuário decide sozinho,
     # sem comportamento especial por trás).
-    WindowManager.hytale_show_mouth_plane = BoolProperty(default=False)
-    WindowManager.hytale_show_mouth_companions = BoolProperty(default=False)
-    WindowManager.hytale_show_mouth_grid = BoolProperty(default=False)
+    WindowManager.hytale_show_texture_picker_plane = BoolProperty(default=False)
+    WindowManager.hytale_show_texture_picker_companions = BoolProperty(default=False)
+    WindowManager.hytale_show_texture_picker_grid = BoolProperty(default=False)
+    # v0.12.1 -- caixa da aba Export (Object Properties), não da aba Rig
+    # (as três acima) -- mesmo padrão collapsible, chave separada porque
+    # é uma seção diferente do painel (não fica dentro de uma entrada
+    # TEXTURE_PICKER específica). Fechada por padrão -- a maioria dos
+    # personagens não usa Texture Picker, não faz sentido a lista
+    # aparecer sempre expandida.
+    WindowManager.hytale_show_export_texture_picker = BoolProperty(default=False)
     bpy.utils.register_class(HYTALE_PT_main)
 
 
 def unregister():
     bpy.utils.unregister_class(HYTALE_PT_main)
-    del WindowManager.hytale_show_mouth_grid
-    del WindowManager.hytale_show_mouth_companions
-    del WindowManager.hytale_show_mouth_plane
+    del WindowManager.hytale_show_export_texture_picker
+    del WindowManager.hytale_show_texture_picker_grid
+    del WindowManager.hytale_show_texture_picker_companions
+    del WindowManager.hytale_show_texture_picker_plane
     del WindowManager.hytale_show_templates
     del WindowManager.hytale_show_bone_collections
     del WindowManager.hytale_show_ik_chains

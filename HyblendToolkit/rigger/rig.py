@@ -26,7 +26,6 @@ sem duplicar, ver comentário ali). RIG_OT_hytale_mirror_shape (Tarefa D,
 novo) mora na seção de Shapes, logo depois de Shape Edit Mode Enter/
 Finish, de quem ele depende (só funciona com o modo ativo).
 """
-import array
 import math
 import os
 import re
@@ -1428,10 +1427,10 @@ _DEFAULT_BONE_COLLECTION_GRID = (
     (COLL_MAIN_ROOT, 5, 0),
     (COLL_MAIN_TAIL, 6, 0),
     (COLL_ATTACHMENTS, 7, 0),
-    (COLL_MAIN_MOUTH, 8, 0),  # v0.10.5 -- faltava aqui (Mouth Atlas é v0.10, esta grade só tinha
+    (COLL_MAIN_TEXTURE_PICKER, 8, 0),  # v0.10.5 -- faltava aqui (Texture Picker é v0.10, esta grade só tinha
     # sido atualizada até Attachments em v0.9.7); sem isso, armatures NOVOS não ganhavam a entrada
-    # "Mouth" em "Collection Settings"/aba Animation mesmo com a bone collection real sendo criada
-    # normalmente por _build_mouth_atlas -- ver também ensure_mouth_collection_entry logo abaixo,
+    # "Texture Picker" em "Collection Settings"/aba Animation mesmo com a bone collection real sendo criada
+    # normalmente por _build_texture_picker -- ver também ensure_texture_picker_collection_entry logo abaixo,
     # que cobre o mesmo problema pra armatures que já existiam ANTES deste fix (onde este seed
     # abaixo não roda de novo, ver hytale_bone_collections_initialized).
 )
@@ -1470,23 +1469,31 @@ def ensure_default_bone_collections(armature):
     armature.hytale_bone_collections_initialized = True
 
 
-def ensure_mouth_collection_entry(armature):
-    """v0.10.5 -- backfill pra armatures que já existiam ANTES do Mouth
-    ter entrado em _DEFAULT_BONE_COLLECTION_GRID (ver comentário lá).
+def ensure_texture_picker_collection_entry(armature):
+    """v0.10.5 -- backfill pra armatures que já existiam ANTES do UV
+    Animate ter entrado em _DEFAULT_BONE_COLLECTION_GRID (ver comentário lá).
     Nesses armatures, hytale_bone_collections_initialized já é True, então
     ensure_default_bone_collections() é um no-op e a lista NUNCA ganha a
-    entrada "Mouth" sozinha -- diferente das 10 collections originais, que
+    entrada "Texture Picker" sozinha -- diferente das 10 collections originais, que
     por design não voltam se o usuário apagar de propósito (ver comentário
     de ensure_default_bone_collections), aqui a ausência não é uma escolha
-    do usuário: a opção "Mouth" simplesmente não existia na UI pra ele
+    do usuário: a opção "Texture Picker" simplesmente não existia na UI pra ele
     apagar. Corrige só isso, sem tocar em mais nada da lista:
 
-    - só adiciona se já existe pelo menos uma cadeia chain_type == "MOUTH"
-      configurada (ou seja, o usuário está de fato usando Mouth Atlas --
+    - só adiciona se já existe pelo menos uma cadeia chain_type == "TEXTURE_PICKER"
+      configurada (ou seja, o usuário está de fato usando Texture Picker --
       não põe a collection à toa em armatures que nunca vão precisar dela);
-    - só adiciona se NENHUMA entrada com esse nome já existe (idempotente;
-      cobre tanto quem já tem o "Mouth" antigo -- de outra versão -- quanto
-      quem já rodou este mesmo backfill antes);
+    - só adiciona se NENHUMA entrada com o nome ATUAL (COLL_MAIN_TEXTURE_PICKER,
+      "Texture Picker") já existe -- idempotente pra quem já rodou este mesmo
+      backfill antes. v0.11: COLL_MAIN_TEXTURE_PICKER deixou de valer "Mouth"
+      (renomeado junto com chain_type MOUTH -> TEXTURE_PICKER, ver
+      DEVELOPER_NOTES.md) -- por decisão do usuário, SEM migração: um
+      armature de antes da v0.11 que já tinha uma collection "Mouth" NÃO é
+      reconhecido aqui (o comparativo é contra o nome novo), então ganha
+      uma "Texture Picker" adicional na entrada correspondente, deixando a
+      "Mouth" antiga órfã (o usuário decide apagar/renomear/mesclar à
+      mão -- mesmo espírito de "reconfigurar do zero" já adotado pros
+      outros campos MOUTH -> TEXTURE_PICKER);
     - sempre um APPEND no fim da lista (nunca reordena/edita as entradas
       existentes), com show_in_animation_tab no default (True) igual às
       outras 10.
@@ -1495,16 +1502,16 @@ def ensure_mouth_collection_entry(armature):
     de ensure_default_bone_collections(armature) -- mesmo contexto seguro
     pra escrita em dados de ID (ver docstring de ensure_default_bone_
     collections sobre por que isso não pode rodar de dentro de draw())."""
-    has_mouth_chain = any(
-        getattr(item, "chain_type", None) == "MOUTH" for item in getattr(armature, "hytale_ik_chains", [])
+    has_texture_picker_chain = any(
+        getattr(item, "chain_type", None) == "TEXTURE_PICKER" for item in getattr(armature, "hytale_ik_chains", [])
     )
-    if not has_mouth_chain:
+    if not has_texture_picker_chain:
         return
-    already_present = any(item.name == COLL_MAIN_MOUTH for item in armature.hytale_bone_collections)
+    already_present = any(item.name == COLL_MAIN_TEXTURE_PICKER for item in armature.hytale_bone_collections)
     if already_present:
         return
     item = armature.hytale_bone_collections.add()
-    item.name = COLL_MAIN_MOUTH
+    item.name = COLL_MAIN_TEXTURE_PICKER
     item.parent = PARENT_COLLECTION_ROOT
     item.row = 8
     item.column = 0
@@ -1578,18 +1585,18 @@ def _head_spine_bone_names(item):
         # mas continuam ignorados aqui, igual já acontecia com HEAD/SPINE
         # e os slots que sobram além do count escolhido).
         names = [getattr(item, f"attachment_bone_{i}") for i in range(1, item.attachments_count + 1)]
-    elif item.chain_type == "MOUTH":
-        # v0.10.5 -- 2 nomes possíveis agora: mouth_bone (malha/textura)
-        # e mouth_ui_parent_bone (pai do root.ui, só quando diferente
-        # do primeiro -- ver HytaleIKChainItem.mouth_ui_parent_bone).
+    elif item.chain_type == "TEXTURE_PICKER":
+        # v0.10.5 -- 2 nomes possíveis agora: texture_picker_bone (malha/textura)
+        # e texture_picker_ui_parent_bone (pai do root.ui, só quando diferente
+        # do primeiro -- ver HytaleIKChainItem.texture_picker_ui_parent_bone).
         # Duplicado é filtrado pelo dedup abaixo (dict.fromkeys), não
         # tem problema listar os dois quando são iguais.
-        # v0.10.13 -- Companion Bones (mouth_extra_bone_1..N) entram
-        # aqui também, respeitando mouth_extra_bone_count -- mesmo
+        # v0.10.13 -- Companion Bones (texture_picker_extra_bone_1..N) entram
+        # aqui também, respeitando texture_picker_extra_bone_count -- mesmo
         # espírito de ATTACHMENTS logo acima (só os slots dentro do
         # count configurado, nunca além dele).
-        extra_slots = [getattr(item, f"mouth_extra_bone_{i}") for i in range(1, item.mouth_extra_bone_count + 1)]
-        names = [item.mouth_bone, item.mouth_ui_parent_bone] + extra_slots
+        extra_slots = [getattr(item, f"texture_picker_extra_bone_{i}") for i in range(1, item.texture_picker_extra_bone_count + 1)]
+        names = [item.texture_picker_bone, item.texture_picker_ui_parent_bone] + extra_slots
     else:
         return []
     return list(dict.fromkeys(n for n in names if n))
@@ -1733,9 +1740,9 @@ class HytaleIKChainItem(PropertyGroup):
         "(root/tip/pole path -> switchable FK/IK chain) -- only the field labels differ today. 'Tail' has "
         "no IK: it builds a continuous '_Tail' bridge chain (always connected, no gap between segments) "
         "meant to be hooked into physics add-ons. 'Head'/'Spine'/'Attachments' create no bones at all -- "
-        "they just identify existing control bones, for collection organization. 'Mouth' identifies a "
-        "single texture-atlas control bone and builds a UV picker rig (root.ui/ui.mouth_uv + a reference "
-        "atlas plane) for it -- see 'Create Mouth Atlas'",
+        "they just identify existing control bones, for collection organization. 'Texture Picker' identifies a "
+        "single texture-atlas control bone and builds a UV picker rig (a dedicated root.ui/cursor bone "
+        "pair + a reference atlas plane) for it -- see 'Create Texture Picker'",
         items=[
             ("ARM", "Arm", "Two-segment limb (shoulder-arm-forearm-hand pattern) -- IK/FK-switchable chain"),
             ("LEG", "Leg", "Two-segment limb (pelvis-thigh-calf-foot pattern) -- IK/FK-switchable chain"),
@@ -1747,8 +1754,9 @@ class HytaleIKChainItem(PropertyGroup):
             ("ATTACHMENTS", "Attachments", "Identifies specific Attachment control bones (1-5) by name -- "
              "no IK, organizational only. Separate from (and in addition to) the automatic name-based "
              "attachment detection that already happens regardless of this entry"),
-            ("MOUTH", "Mouth", "Identifies a single control bone (e.g. Mouth) whose material is a "
-             "texture-atlas of mouth shapes -- 'Create Mouth Atlas' builds a UV-picker rig for it. No IK"),
+            ("TEXTURE_PICKER", "Texture Picker", "Identifies a single control bone (e.g. a mouth or face bone) whose "
+             "material is a texture atlas of cells (expressions, shapes, etc.) -- 'Create Texture Picker' builds "
+             "a UV-picker rig for it. No IK"),
         ],
         default="ARM",
     )
@@ -1964,126 +1972,111 @@ class HytaleIKChainItem(PropertyGroup):
             default="",
         )
     del _i
-    # v0.10 -- campos exclusivos de MOUTH. Só 1 bone (diferente de
-    # ATTACHMENTS, que aceita vários) -- um personagem tem no máximo uma
-    # boca. Não cria bone nenhum sozinho (mesmo espírito de HEAD/SPINE/
+    # v0.10 -- campos exclusivos de TEXTURE_PICKER (era MOUTH até v0.10,
+    # renomeado na v0.11 -- ver DEVELOPER_NOTES.md). Só 1 bone (diferente de
+    # ATTACHMENTS, que aceita vários) -- um personagem tem no máximo um
+    # picker por entrada. Não cria bone nenhum sozinho (mesmo espírito de HEAD/SPINE/
     # ATTACHMENTS -- ver _head_spine_bone_names) -- quem cria bone é o
-    # botão "Create Mouth Atlas" (RIG_OT_hytale_mouth_atlas_create),
-    # separado do "Create Rig" principal, porque depende de detectar o
-    # grid da textura (pode falhar/precisar rodar de novo independente
+    # botão "Create Texture Picker" (RIG_OT_hytale_texture_picker_create),
+    # separado do "Create Rig" principal, porque depende de digitar o
+    # grid da textura (pode precisar rodar de novo independente
     # do resto do rig).
-    mouth_bone: StringProperty(
-        name="Mouth Bone",
-        description="The bone whose mesh has the mouth texture (all the expressions in one image)" + _HEAD_SPINE_FIELD_HINT,
+    texture_picker_bone: StringProperty(
+        name="Target Bone",
+        description="The bone whose mesh has the texture atlas (e.g. all the mouth expressions in one image)" + _HEAD_SPINE_FIELD_HINT,
         default="",
     )
-    # v0.10.5 -- separado de mouth_bone: testando, apareceu um caso onde
-    # a malha/textura da boca está pesada num bone (ex. "Mouth"), mas o
+    # v0.10.5 -- separado de texture_picker_bone: testando, apareceu um caso onde
+    # a malha/textura fica pesada num bone (ex. "Mouth"), mas o
     # root.ui precisa ser parentado em OUTRO bone (ex. um attachment
     # point dedicado, "Mouth1:Mouth-Attachment") -- nem sempre é o
-    # mesmo bone. Vazio = usa mouth_bone (comportamento de antes,
+    # mesmo bone. Vazio = usa texture_picker_bone (comportamento de antes,
     # continua funcionando pro caso comum onde os dois são iguais).
-    mouth_ui_parent_bone: StringProperty(
+    texture_picker_ui_parent_bone: StringProperty(
         name="Root Bone",
-        description="Only needed if the picker should attach somewhere other than Mouth Bone. Leave "
+        description="Only needed if the picker should attach somewhere other than Target Bone. Leave "
         "empty in most cases" + _HEAD_SPINE_FIELD_HINT,
         default="",
     )
-    mouth_plane_scale: FloatProperty(
+    texture_picker_plane_scale: FloatProperty(
         name="Atlas Plane Scale",
         description="Size of the reference image shown in the viewport for picking. Doesn't affect the "
         "exported animation",
         default=1.0, min=0.001,
     )
     # v0.10.3 -- ajuste fino manual da posição do plane de referência,
-    # em cima do que _build_mouth_atlas já calcula sozinho (offset pela
-    # UV de repouso da malha -- ver _get_mouth_mesh_rest_uv). Precisou
+    # em cima do que _build_texture_picker já calcula sozinho (offset pela
+    # UV de repouso da malha -- ver _get_texture_picker_mesh_rest_uv). Precisou
     # existir porque, testando no Blender, ainda sobrava um resíduo que
     # não bati matematicamente sem ver ao vivo (documentado na conversa
     # com o usuário) -- fica salvo por entrada, então uma vez ajustado
-    # pra um personagem, "Create Mouth Atlas" continua aplicando sem
+    # pra um personagem, "Create Texture Picker" continua aplicando sem
     # precisar repetir o ajuste.
-    mouth_plane_offset_x: FloatProperty(
+    texture_picker_plane_offset_x: FloatProperty(
         name="Atlas Plane Offset X", default=0.0,
         description="Nudge the reference image left/right, if it isn't lined up right",
     )
-    mouth_plane_offset_y: FloatProperty(
+    texture_picker_plane_offset_y: FloatProperty(
         name="Atlas Plane Offset Y", default=0.0,
         description="Nudge the reference image up/down, if it isn't lined up right",
     )
-    # v0.10.12 -- Manual Grid. detect_mouth_atlas_grid (default) escaneia
-    # a imagem INTEIRA procurando bandas 100% transparentes -- funciona
-    # bem pra um atlas DEDICADO (imagem própria só de bocas, como os
-    # personagens padrão do Hytale), mas quebra (sempre devolve grid
-    # 1x1) quando o atlas de bocas está EMBUTIDO dentro de uma textura
-    # maior (ex.: a textura base do personagem inteiro) -- nesse caso
-    # quase nunca existe uma linha/coluna 100% transparente atravessando
-    # a imagem TODA, porque sempre tem pixel opaco de outra parte do
-    # personagem em algum lugar daquela mesma linha/coluna. Além disso,
-    # mesmo restringindo a busca a uma sub-região só da boca, a detecção
-    # por alpha ainda falha quando os ÍCONES têm largura visual
-    # DIFERENTE dentro de células de mesmo tamanho (ex.: uma boca
-    # fechada é mais estreita que uma sorrindo com dentes -- a banda de
-    # alpha de cada uma começa/termina em pontos diferentes dentro da
-    # própria célula, então a distância medida entre bandas não bate
-    # com o pitch real do grid, mesmo ele sendo uniforme de verdade no
-    # Blockbench -- confirmado testando com uma textura real). Manual
-    # Grid pula TODA detecção por imagem -- o usuário informa direto o
-    # tamanho de célula (pitch) e quantas colunas/linhas existem, do
-    # jeito que ele já vê no Blockbench. Não precisa de X/Y de origem --
-    # todo o resto do sistema (driver, Limit Location, plane) já opera
-    # por DESLOCAMENTO relativo à pose de repouso (a célula que a malha
-    # já mostra sem nenhum offset -- ver comentário grande no topo desta
+    # v0.10.12 -- Manual Grid, que virou a ÚNICA forma de informar o
+    # grid (v0.11 removeu de vez a detecção automática por alpha --
+    # decisão de produto, não só técnica: já tinha se provado frágil em
+    # mais de um personagem real -- atlas embutido numa textura maior
+    # sempre dava 1x1, e ícones com largura visual desigual dentro de
+    # células uniformes davam medição errada mesmo restringindo a
+    # região de busca; ver DEVELOPER_NOTES.md/histórico pros detalhes
+    # de como isso foi confirmado. O usuário informa direto o tamanho
+    # de célula (pitch) e quantas colunas/linhas existem, do jeito que
+    # ele já vê no Blockbench. Não precisa de X/Y de origem -- todo o
+    # resto do sistema (driver, Limit Location, plane) já opera por
+    # DESLOCAMENTO relativo à pose de repouso (a célula que a malha já
+    # mostra sem nenhum offset -- ver comentário grande no topo desta
     # seção), nunca por posição absoluta na textura.
-    mouth_atlas_use_manual_grid: BoolProperty(
-        name="Manual Grid",
-        description="Type the cell size and count yourself (from Blockbench) instead of detecting it "
-        "from the texture. Use this if automatic detection isn't finding the shapes correctly",
-        default=False,
-    )
-    mouth_atlas_grid_cols: IntProperty(
+    texture_picker_grid_cols: IntProperty(
         name="Grid Columns",
-        description="How many mouth shapes across (left to right)",
+        description="How many texture-atlas cells across (left to right)",
         default=1, min=1,
     )
-    mouth_atlas_grid_rows: IntProperty(
+    texture_picker_grid_rows: IntProperty(
         name="Grid Rows",
-        description="How many rows of mouth shapes -- usually 1",
+        description="How many rows of texture-atlas cells -- usually 1",
         default=1, min=1,
     )
-    mouth_atlas_grid_cell_width: IntProperty(
+    texture_picker_grid_cell_width: IntProperty(
         name="Cell Width",
-        description="Pixel distance from one mouth shape to the next, as seen in Blockbench",
+        description="Pixel distance from one texture-atlas cell to the next, as seen in Blockbench",
         default=16, min=1,
     )
-    mouth_atlas_grid_cell_height: IntProperty(
+    texture_picker_grid_cell_height: IntProperty(
         name="Cell Height",
-        description="Pixel distance between rows of mouth shapes. Doesn't matter if Rows is 1",
+        description="Pixel distance between rows of texture-atlas cells. Doesn't matter if Rows is 1",
         default=16, min=1,
     )
-    # v0.10.13 -- Companion Bones: pra personagens cuja "boca" é
-    # composta por mais de uma malha/bone que precisam mudar de
+    # v0.10.13 -- Companion Bones: pra personagens cujo alvo animado é
+    # composto por mais de uma malha/bone que precisam mudar de
     # expressão JUNTOS (ex.: metades L/R espelhadas se encontrando no
-    # meio -- caso testado ao vivo, confirmado funcionando). Mouth Bone
+    # meio -- caso testado ao vivo, confirmado funcionando). Target Bone
     # continua sendo o único usado pra detecção de grid/Manual Grid e
     # pro plane de referência (só existe UM picker visual); os
     # companions só recebem material+driver de UV, reaproveitando o
     # MESMO grid/step calculado pro principal -- ver
-    # _apply_mouth_atlas_to_companion. Mesmo mecanismo de lista em loop
+    # _apply_texture_picker_to_companion. Mesmo mecanismo de lista em loop
     # que ATTACHMENTS (attachment_bone_1..N) usa, com teto BEM menor
-    # (MOUTH_EXTRA_BONES_MAX_COUNT -- ver rigger/constants.py), porque
-    # uma boca raramente é feita de mais de 2-3 malhas separadas.
-    mouth_extra_bone_count: IntProperty(
+    # (TEXTURE_PICKER_EXTRA_BONES_MAX_COUNT -- ver rigger/constants.py), porque
+    # raramente são mais de 2-3 malhas separadas.
+    texture_picker_extra_bone_count: IntProperty(
         name="Companion Bones Amount",
-        description=f"How many other bones share this mouth's texture and should move together with it "
-        f"(0-{MOUTH_EXTRA_BONES_MAX_COUNT})",
-        default=0, min=0, max=MOUTH_EXTRA_BONES_MAX_COUNT,
+        description=f"How many other bones share this target's texture and should move together with it "
+        f"(0-{TEXTURE_PICKER_EXTRA_BONES_MAX_COUNT})",
+        default=0, min=0, max=TEXTURE_PICKER_EXTRA_BONES_MAX_COUNT,
     )
-    for _i in range(1, MOUTH_EXTRA_BONES_MAX_COUNT + 1):
-        __annotations__[f"mouth_extra_bone_{_i}"] = StringProperty(
+    for _i in range(1, TEXTURE_PICKER_EXTRA_BONES_MAX_COUNT + 1):
+        __annotations__[f"texture_picker_extra_bone_{_i}"] = StringProperty(
             name="Companion Bone" if _i == 1 else f"Companion Bone {_i}",
             description="Another bone whose mesh shares this same mouth texture (e.g. a mirrored left/"
-            "right half) and should change expression together with Mouth Bone" + _HEAD_SPINE_FIELD_HINT,
+            "right half) and should change expression together with Target Bone" + _HEAD_SPINE_FIELD_HINT,
             default="",
         )
     del _i
@@ -2160,8 +2153,8 @@ class RIG_OT_hytale_ik_chain_add(Operator):
         # como texto fixo; valida contra os valores conhecidos do Enum
         # real (item.chain_type) antes de atribuir, pra nunca deixar a
         # entrada num estado inválido se o menu mandar algo inesperado.
-        item.chain_type = self.chain_type if self.chain_type in {"ARM", "LEG", "TAIL", "HEAD", "SPINE", "ATTACHMENTS", "MOUTH"} else "ARM"
-        prefix = {"ARM": "Arm", "LEG": "Leg", "TAIL": "Tail", "HEAD": "Head", "SPINE": "Spine", "ATTACHMENTS": "Attachments", "MOUTH": "Mouth"}.get(item.chain_type, "Chain")
+        item.chain_type = self.chain_type if self.chain_type in {"ARM", "LEG", "TAIL", "HEAD", "SPINE", "ATTACHMENTS", "TEXTURE_PICKER"} else "ARM"
+        prefix = {"ARM": "Arm", "LEG": "Leg", "TAIL": "Tail", "HEAD": "Head", "SPINE": "Spine", "ATTACHMENTS": "Attachments", "TEXTURE_PICKER": "Texture Picker"}.get(item.chain_type, "Chain")
         item.label = f"{prefix} {len(chains)}"
         # v0.8: pole_angle_preset_name (StringProperty) nasce com default=
         # "ARM" fixo na PROPRIA definição do campo (ver HytaleIKChainItem)
@@ -2221,8 +2214,8 @@ class RIG_MT_hytale_ik_chain_add_menu(Menu):
             RIG_OT_hytale_ik_chain_add.bl_idname, text="Attachments", icon="LINKED"
         ).chain_type = "ATTACHMENTS"
         layout.operator(
-            RIG_OT_hytale_ik_chain_add.bl_idname, text="Mouth", icon="IMAGE_DATA"
-        ).chain_type = "MOUTH"
+            RIG_OT_hytale_ik_chain_add.bl_idname, text="Texture Picker", icon="IMAGE_DATA"
+        ).chain_type = "TEXTURE_PICKER"
 
 
 class RIG_OT_hytale_ik_chain_remove(Operator):
@@ -2324,8 +2317,8 @@ class RIG_OT_hytale_ik_chain_set_count(Operator):
     def execute(self, context):
         armature = context.active_object.data
         chains = armature.hytale_ik_chains
-        chain_type = self.chain_type if self.chain_type in {"ARM", "LEG", "TAIL", "HEAD", "SPINE", "ATTACHMENTS", "MOUTH"} else "ARM"
-        prefix = {"ARM": "Arm", "LEG": "Leg", "TAIL": "Tail", "HEAD": "Head", "SPINE": "Spine", "ATTACHMENTS": "Attachments", "MOUTH": "Mouth"}.get(chain_type, "Chain")
+        chain_type = self.chain_type if self.chain_type in {"ARM", "LEG", "TAIL", "HEAD", "SPINE", "ATTACHMENTS", "TEXTURE_PICKER"} else "ARM"
+        prefix = {"ARM": "Arm", "LEG": "Leg", "TAIL": "Tail", "HEAD": "Head", "SPINE": "Spine", "ATTACHMENTS": "Attachments", "TEXTURE_PICKER": "Texture Picker"}.get(chain_type, "Chain")
         while len(chains) < self.count:
             item = chains.add()
             item.chain_type = chain_type
@@ -2388,14 +2381,14 @@ class RIG_OT_hytale_ik_chain_pick_bone(Operator):
             # em vez de 5 nomes escritos na mão -- acompanha o teto
             # automaticamente se ele mudar.
             *{f"attachment_bone_{i}" for i in range(1, ATTACHMENTS_MAX_COUNT + 1)},
-            # v0.10 -- campo de MOUTH, mesmo picker genérico.
-            "mouth_bone",
-            # v0.10.5 -- segundo campo de MOUTH (pai do root.ui).
-            "mouth_ui_parent_bone",
+            # v0.10 -- campo de TEXTURE_PICKER, mesmo picker genérico.
+            "texture_picker_bone",
+            # v0.10.5 -- segundo campo de TEXTURE_PICKER (pai do root.ui).
+            "texture_picker_ui_parent_bone",
             # v0.10.13 -- Companion Bones, mesmo esquema de
             # ATTACHMENTS_MAX_COUNT acima (gerado a partir do teto em
             # constants.py, não escrito na mão).
-            *{f"mouth_extra_bone_{i}" for i in range(1, MOUTH_EXTRA_BONES_MAX_COUNT + 1)},
+            *{f"texture_picker_extra_bone_{i}" for i in range(1, TEXTURE_PICKER_EXTRA_BONES_MAX_COUNT + 1)},
         }
         if self.field not in allowed_fields:
             self.report({"WARNING"}, f"Unknown field '{self.field}'.")
@@ -2531,7 +2524,7 @@ class RIG_OT_hytale_ik_chain_load_defaults(Operator):
 _CHAIN_TYPE_ICON = {
     "ARM": "CON_KINEMATIC", "LEG": "CON_KINEMATIC", "TAIL": "PHYSICS",
     "HEAD": "USER", "SPINE": "BONE_DATA", "ATTACHMENTS": "LINKED",
-    "MOUTH": "IMAGE_DATA",
+    "TEXTURE_PICKER": "IMAGE_DATA",
 }
 
 
@@ -2906,7 +2899,7 @@ class RIG_OT_hytale_validate_rig(Operator):
             # TAMBÉM o "_CTRL" correspondente, que é o bone que
             # realmente é usado por _apply_bone_collection_overrides (ver
             # fix "bug: ia o bone original, tinha que ir o _CTRL").
-            if item.chain_type in ("HEAD", "SPINE", "ATTACHMENTS", "MOUTH"):
+            if item.chain_type in ("HEAD", "SPINE", "ATTACHMENTS", "TEXTURE_PICKER"):
                 for name in _head_spine_bone_names(item):
                     if bones.get(name) is None:
                         problems.append(f"{item.chain_type.title()} '{label}': bone '{name}' not found on this armature.")
@@ -2916,15 +2909,18 @@ class RIG_OT_hytale_validate_rig(Operator):
                             f"'{name + SUFFIX_CTRL}' doesn't -- Create Rig hasn't run yet, or this bone is "
                             f"excluded from the generic ORG->CTRL loop."
                         )
-            # v0.10 -- checagem extra, só pra MOUTH: o cursor/root da UI
-            # (ver _build_mouth_atlas) só existe DEPOIS de "Create Mouth
-            # Atlas" -- diferente do "_CTRL" acima (criado por "Create
+            # v0.10 -- checagem extra, só pra TEXTURE_PICKER: o cursor/root da UI
+            # (ver _build_texture_picker) só existe DEPOIS de "Create
+            # Texture Picker" -- diferente do "_CTRL" acima (criado por "Create
             # Rig"), então é um aviso separado, não um erro (rodar
-            # "Create Mouth Atlas" resolve, sem precisar mexer no bone).
-            if item.chain_type == "MOUTH" and item.mouth_bone:
-                if bones.get(BONE_MOUTH_CURSOR) is None:
+            # "Create Texture Picker" resolve, sem precisar mexer no bone).
+            # v0.12 -- nome do cursor agora é DERIVADO por instância (ver
+            # _texture_picker_cursor_name), não mais um nome fixo.
+            if item.chain_type == "TEXTURE_PICKER" and item.texture_picker_bone:
+                cursor_name = _texture_picker_cursor_name(item.texture_picker_bone.strip())
+                if bones.get(cursor_name) is None:
                     problems.append(
-                        f"Mouth '{label}': '{BONE_MOUTH_CURSOR}' not found -- 'Create Mouth Atlas' hasn't "
+                        f"Texture Picker '{label}': '{cursor_name}' not found -- 'Create Texture Picker' hasn't "
                         f"been run yet for this entry."
                     )
 
@@ -3106,46 +3102,47 @@ class RIG_OT_hytale_clear_generated(Operator):
                 bpy.data.meshes.remove(mesh, do_unlink=True)
             purged += 1
 
-        # v0.10 -- Mouth Atlas não é feito de bone PROP_RIG_LAYER só (o
+        # v0.10 -- Texture Picker não é feito de bone PROP_RIG_LAYER só (o
         # plane de referência e os nodes injetados no material real da
         # boca não são bone nenhum, o loop acima não alcança) -- limpa
         # à parte, reaproveitando a mesma função do botão dedicado
-        # (RIG_OT_hytale_mouth_atlas_remove), pra "Remove Generated"
+        # (RIG_OT_hytale_texture_picker_remove), pra "Remove Generated"
         # também deixar a boca no estado "nunca gerado", consistente com
-        # o resto. Roda pra TODA entrada MOUTH da lista, não só a ativa.
-        mouth_cleaned = 0
+        # o resto. Roda pra TODA entrada TEXTURE_PICKER da lista, não só a ativa.
+        texture_picker_cleaned = 0
         for item in obj.data.hytale_ik_chains:
-            if item.chain_type == "MOUTH" and item.mouth_bone:
-                if _remove_mouth_atlas(obj, item):
-                    mouth_cleaned += 1
+            if item.chain_type == "TEXTURE_PICKER" and item.texture_picker_bone:
+                if _remove_texture_picker(obj, item):
+                    texture_picker_cleaned += 1
 
         self.report(
             {"INFO"},
             f"Removed {removed} generated bone(s) and {removed_collections} bone collection(s) under "
             f"Main; purged {purged} cached widget object(s) "
             f"(next 'Create Rig' re-loads them from {WIDGETS_LIBRARY_FILENAME})"
-            + (f"; cleaned {mouth_cleaned} Mouth Atlas setup(s)." if mouth_cleaned else "."),
+            + (f"; cleaned {texture_picker_cleaned} Texture Picker setup(s)." if texture_picker_cleaned else "."),
         )
         return {"FINISHED"}
 
 
 # ---------------------------------------------------------------------------
-# Mouth Atlas (chain_type MOUTH) -- picker de UV por atlas de textura
+# Texture Picker (chain_type TEXTURE_PICKER) -- picker de UV por atlas de textura
 # ---------------------------------------------------------------------------
 #
 # Sistema separado do "Create Rig" principal (RIG_OT_hytale_generate_rig,
-# logo abaixo) -- roda por conta própria (RIG_OT_hytale_mouth_atlas_create),
+# logo abaixo) -- roda por conta própria (RIG_OT_hytale_texture_picker_create),
 # porque depende de detectar o grid de uma textura específica (pode
 # falhar por personagem, ou precisar rodar de novo isolado sem
 # regenerar o resto do rig). Precisa que "Create Rig" já tenha rodado
-# antes (o bone "<mouth_bone>_CTRL" tem que existir) -- ver
-# RIG_OT_hytale_mouth_atlas_create.poll.
+# antes (o bone "<texture_picker_bone>_CTRL" tem que existir) -- ver
+# RIG_OT_hytale_texture_picker_create.poll.
 #
-# Contrato com exporter.py (ver HYTALE_export_bone_settings/
+# Contrato com exporter.py (ver HYTALE_texture_picker_export_item/
 # sample_uv_offset_px lá, confirmado lendo o exporter.py real):
 # 'shapeUvOffset' é escrito em PIXELS CRUS, relativo à pose de repouso,
 # reamostrando round(loc/step)*px direto da Location (pose, local) do
-# bone BONE_MOUTH_CURSOR ("ui.mouth_uv"). O driver do Mapping node
+# bone cursor desta instância (nome derivado, ver _texture_picker_cursor_name
+# -- ex. "ui.Mouth.picker"). O driver do Mapping node
 # abaixo usa A MESMA fórmula (só dividindo por atlas_w/atlas_h no
 # final, pra virar fração de UV em vez de pixel cru) -- garante que o
 # que o usuário VÊ no shader bate 1:1 com o que sai no export, em vez
@@ -3163,139 +3160,47 @@ class RIG_OT_hytale_clear_generated(Operator):
 # O plane de referência segue a MESMA convenção -- canto (0,0, na malha)
 # = a MESMA célula de repouso, não o centro do plane.
 #
-# v0.10.12 -- Manual Grid (item.mouth_atlas_use_manual_grid +
-# mouth_atlas_grid_cols/_rows/_cell_width/_cell_height): a detecção
-# automática abaixo (detect_mouth_atlas_grid) escaneia a imagem
-# INTEIRA e assume que ela É o atlas de bocas -- funciona bem pros
-# personagens padrão do Hytale (textura própria e dedicada só de
-# bocas), mas sempre devolve grid 1x1 quando o atlas está EMBUTIDO
-# dentro de uma textura maior (ex.: a textura base do personagem
-# inteiro), porque nunca existe uma linha/coluna 100% transparente
-# atravessando a imagem TODA -- sempre sobra pixel opaco de outra
-# parte do personagem em algum lugar daquela mesma linha/coluna,
-# mesmo a região da boca em si tendo transparência de verdade entre
-# as expressões. Além disso, mesmo restringindo a busca a uma
-# sub-região só da boca (tentativa anterior, removida -- ver histórico
-# de chat/changelog), a detecção por alpha ainda falha quando os
-# ÍCONES têm largura visual DIFERENTE dentro de células de mesmo
-# tamanho -- a banda de alpha de cada um começa/termina em pontos
-# diferentes dentro da própria célula, então a distância medida entre
-# bandas não bate com o pitch real, mesmo ele sendo uniforme de
-# verdade no Blockbench (confirmado testando com uma textura real:
-# espaçamento medido veio 14/18/18px em vez do pitch real de 16px
-# constante). Manual Grid pula TODA detecção por imagem nesse caso --
-# ver HytaleIKChainItem.mouth_atlas_use_manual_grid.
-
-_ALPHA_THRESHOLD = 0.02  # abaixo disso, pixel conta como "vazio" (fundo transparente do atlas)
-
-
-def _find_bands(flags):
-    """Devolve [(start, end)] pra cada sequência contínua de True em
-    `flags` -- usado tanto por linha quanto por coluna na detecção do
-    grid (ver detect_mouth_atlas_grid)."""
-    bands = []
-    start = None
-    for i, v in enumerate(flags):
-        if v and start is None:
-            start = i
-        elif not v and start is not None:
-            bands.append((start, i - 1))
-            start = None
-    if start is not None:
-        bands.append((start, len(flags) - 1))
-    return bands
+# v0.11 -- a detecção automática de grid por alpha (detect_mouth_atlas_
+# grid/_find_bands/_median_spacing, que ficavam aqui) foi REMOVIDA por
+# completo -- já tinha se provado frágil em mais de um personagem real
+# (atlas embutido numa textura maior sempre dava 1x1; ícones com
+# largura visual desigual dentro de células uniformes davam medição
+# errada mesmo restringindo a região de busca -- ver DEVELOPER_NOTES.md
+# pro histórico). Manual Grid (texture_picker_grid_cols/_rows/_cell_width/
+# _cell_height em HytaleIKChainItem) é agora o ÚNICO jeito de informar
+# o grid -- decisão de produto, não só técnica: o layout do atlas é uma
+# propriedade fixa e já conhecida (o usuário sabe os números de cabeça,
+# vendo no Blockbench), não precisava de detecção nenhuma.
+#
+# v0.12 -- múltiplas instâncias independentes (ver DEVELOPER_NOTES.md/
+# prompt_uv_animate.md, ponto 2). Antes, root.ui/ui.texture_picker eram
+# NOMES FIXOS (BONE_UI_ROOT/BONE_TEXTURE_PICKER_CURSOR, constants.py) --
+# uma segunda entrada TEXTURE_PICKER reaproveitava o MESMO bone físico
+# em vez de criar o seu próprio, e armature.hytale_export_settings era
+# um PointerProperty (valor único) -- rodar "Create Texture Picker" numa
+# segunda entrada sobrescrevia a calibração da primeira sem avisar. Os
+# dois nomes agora são DERIVADOS a partir do texture_picker_bone (o bone
+# alvo, que já É único por definição -- é um bone real da armature, não
+# dá pra duas entradas apontarem pro mesmo sem ser exatamente a mesma
+# instância), e o export virou armature.hytale_texture_picker_exports
+# (CollectionProperty, exporter.py) -- uma entrada por instância,
+# encontrada/criada por uv_offset_target_bone (ver _build_texture_picker
+# mais abaixo).
 
 
-def _median_spacing(starts, total_px, count):
-    """Espaçamento típico (MEDIANA das distâncias entre começos
-    consecutivos) entre `count` células ao longo de `total_px` pixels.
-    Mediana (não média) pra uma célula anormalmente larga/estreita
-    (sprite cortado/incompleto nesse personagem específico) não puxar o
-    valor pro lado errado. count <= 1 não tem espaçamento nenhum pra
-    medir -- cai pro tamanho total como célula única."""
-    if count <= 1 or len(starts) < 2:
-        return float(total_px)
-    diffs = sorted(starts[i + 1] - starts[i] for i in range(len(starts) - 1))
-    mid = len(diffs) // 2
-    med = diffs[mid] if len(diffs) % 2 else (diffs[mid - 1] + diffs[mid]) / 2.0
-    return round(med)
+def _texture_picker_ui_root_name(texture_picker_bone_name):
+    """Nome do bone root.ui desta instância -- prefixo fixo
+    (BONE_UI_ROOT_PREFIX) + nome do bone alvo, único por natureza."""
+    return f"{BONE_UI_ROOT_PREFIX}{texture_picker_bone_name}"
 
 
-def detect_mouth_atlas_grid(image):
-    """Detecta o grid do atlas (colunas/linhas/tamanho de célula em
-    pixels) só a partir do canal alpha -- sem assumir divisão limpa da
-    imagem (confirmado contra um atlas real: colunas ~17-22px, linhas
-    ~9-10px, nenhum dos dois divide as dimensões totais igualmente).
-    Não depende de PIL/numpy -- só bpy.types.Image.pixels, lido de uma
-    vez com foreach_get (bem mais rápido que indexar .pixels[i] um por
-    um em Python puro).
-
-    Processo: (1) soma alpha por LINHA pra achar as bandas de linha
-    (grupos de linhas com pelo menos 1 pixel não-transparente, separadas
-    por linhas 100% transparentes) -- isso dá num_rows; (2) dentro da
-    banda de linha com MAIS colunas detectadas (a mais "completa" --
-    protege contra uma linha com sprite faltando nesse personagem
-    específico), repete o mesmo processo por COLUNA -- isso dá
-    num_cols.
-
-    Só funciona bem pra um atlas DEDICADO (textura própria só de
-    bocas) -- ver comentário grande no topo desta seção pros dois
-    jeitos como isso pode falhar, e HytaleIKChainItem.
-    mouth_atlas_use_manual_grid pro fallback manual.
-
-    Devolve dict {atlas_w, atlas_h, num_cols, num_rows, cell_w_px,
-    cell_h_px}, ou None se a imagem não tiver conteúdo detectável (sem
-    alpha, ou 100% transparente/opaca de um jeito que não forma bandas
-    -- chamador decide como avisar)."""
-    w, h = image.size
-    if w <= 0 or h <= 0:
-        return None
-
-    flat = array.array("f", (0.0,)) * (w * h * 4)
-    try:
-        image.pixels.foreach_get(flat)
-    except RuntimeError:
-        return None  # imagem sem pixels carregados (arquivo faltando, etc.)
-
-    row_has_content = [False] * h
-    for y in range(h):
-        row_base = y * w * 4
-        for x in range(w):
-            if flat[row_base + x * 4 + 3] > _ALPHA_THRESHOLD:
-                row_has_content[y] = True
-                break
-
-    row_bands = _find_bands(row_has_content)
-    if not row_bands:
-        return None
-    num_rows = len(row_bands)
-    cell_h_px = _median_spacing([b[0] for b in row_bands], h, num_rows)
-
-    best_cols = []
-    for y0, y1 in row_bands:
-        col_has_content = [False] * w
-        for x in range(w):
-            col_offset = x * 4
-            for y in range(y0, y1 + 1):
-                if flat[y * w * 4 + col_offset + 3] > _ALPHA_THRESHOLD:
-                    col_has_content[x] = True
-                    break
-        cols = _find_bands(col_has_content)
-        if len(cols) > len(best_cols):
-            best_cols = cols
-    if not best_cols:
-        return None
-    num_cols = len(best_cols)
-    cell_w_px = _median_spacing([b[0] for b in best_cols], w, num_cols)
-
-    return {
-        "atlas_w": w, "atlas_h": h,
-        "num_cols": num_cols, "num_rows": num_rows,
-        "cell_w_px": cell_w_px, "cell_h_px": cell_h_px,
-    }
+def _texture_picker_cursor_name(texture_picker_bone_name):
+    """Nome do bone cursor (o que o usuário arrasta) desta instância --
+    mesmo princípio de _texture_picker_ui_root_name acima."""
+    return f"{BONE_TEXTURE_PICKER_CURSOR_PREFIX}{texture_picker_bone_name}{BONE_TEXTURE_PICKER_CURSOR_SUFFIX}"
 
 
-def _find_mouth_mesh_object(armature_obj, mouth_bone_name):
+def _find_texture_picker_mesh_object(armature_obj, texture_picker_bone_name):
     """Acha o Object de malha que representa a boca -- não pelo NOME do
     objeto (não confiável, pode ter sido renomeado/duplicado), mas pelo
     Vertex Group: todo mesh de peça/attachment é anexado com um vertex
@@ -3306,7 +3211,7 @@ def _find_mouth_mesh_object(armature_obj, mouth_bone_name):
     for obj in bpy.data.objects:
         if obj.type != "MESH":
             continue
-        if mouth_bone_name not in obj.vertex_groups:
+        if texture_picker_bone_name not in obj.vertex_groups:
             continue
         if any(mod.type == "ARMATURE" and mod.object == armature_obj for mod in obj.modifiers):
             return obj
@@ -3331,36 +3236,36 @@ def _find_image_texture_node(material):
     return next((n for n in nodes if n.type == "TEX_IMAGE" and n.image is not None), None)
 
 
-def _ensure_mouth_material_uv_offset(mesh_obj):
+def _ensure_texture_picker_material_uv_offset(mesh_obj):
     """Garante 'UV Map -> Mapping -> Image Texture' no material real da
     boca (hoje o material montado por importer.py NÃO tem Mapping
     nenhum -- Image Texture liga direto no Base Color, ver
     build_flat_material_from_image) -- devolve o node Mapping pronto
-    pra receber os drivers de _apply_mouth_atlas_driver.
+    pra receber os drivers de _apply_texture_picker_driver.
 
     Se o material for COMPARTILHADO (material.users > 1 -- outro objeto
     usando o MESMO datablock) E ainda não for uma cópia NOSSA já
     rastreada, faz uma cópia própria ANTES de mexer, senão o offset de
     UV da boca vazaria pra qualquer outro mesh que por acaso use o
     mesmo material. Idempotente (procura os nodes pelo NOME fixo --
-    MOUTH_ATLAS_MAPPING_NODE_NAME/_UVMAP_NODE_NAME -- antes de criar de
+    TEXTURE_PICKER_MAPPING_NODE_NAME/_UVMAP_NODE_NAME -- antes de criar de
     novo).
 
     v0.10.16 -- a cópia agora recebe um NOME legível (sufixo
-    MOUTH_MATERIAL_COPY_SUFFIX, ex. "dark_bunny.mouth_MouthAtlasCopy"
+    TEXTURE_PICKER_MATERIAL_COPY_SUFFIX, ex. "dark_bunny.mouth_TexturePickerCopy"
     em vez do ".001" genérico que o Blender daria sozinho) e uma custom
-    property (PROP_MOUTH_MATERIAL_ORIGINAL) marcando o nome do material
-    ORIGINAL de onde ela veio -- é assim que _revert_mouth_material_uv_
-    offset ("Remove Mouth Atlas") sabe restaurar o material original no
+    property (PROP_TEXTURE_PICKER_MATERIAL_ORIGINAL) marcando o nome do material
+    ORIGINAL de onde ela veio -- é assim que _revert_texture_picker_material_uv_offset
+    ("Remove Texture Picker") sabe restaurar o material original no
     slot e apagar a cópia depois, em vez de deixá-la presa pra sempre no
     arquivo.
 
     v0.10.17 -- a condição de cópia passou a EXIGIR também "ainda não é
-    uma cópia nossa" (checa PROP_MOUTH_MATERIAL_ORIGINAL). Sem isso,
+    uma cópia nossa" (checa PROP_TEXTURE_PICKER_MATERIAL_ORIGINAL). Sem isso,
     quando um Companion Bone passa a compartilhar a MESMA cópia que o
-    principal (ver _apply_mouth_atlas_to_companion), users da cópia
+    principal (ver _apply_texture_picker_to_companion), users da cópia
     fica > 1 (principal + companion, os dois NOSSOS, de propósito) --
-    e cada vez que "Create Mouth Atlas" rodasse de novo, essa função
+    e cada vez que "Create Texture Picker" rodasse de novo, essa função
     copiaria de novo, sem fim (".001", ".002"...). Agora, uma vez que o
     material já é uma cópia rastreada, fica assim (idempotente de
     verdade), não importa quantas das nossas próprias malhas apontem
@@ -3373,20 +3278,20 @@ def _ensure_mouth_material_uv_offset(mesh_obj):
     material = mesh_obj.data.materials[0]
     # v0.10.17 -- a condição de cópia agora é "users>1 E ainda não é uma
     # cópia NOSSA já rastreada" -- sem o segundo checar, rodar "Create
-    # Mouth Atlas" de novo depois de um companion passar a compartilhar
-    # esta MESMA cópia (ver _apply_mouth_atlas_to_companion) faria
+    # Texture Picker" de novo depois de um companion passar a compartilhar
+    # esta MESMA cópia (ver _apply_texture_picker_to_companion) faria
     # users>1 continuar verdadeiro pra sempre (principal + companion, os
     # dois nossos, intencionalmente compartilhando) -- e cada execução
     # copiaria de novo, gerando ".001", ".002"... sem fim. A property
-    # PROP_MOUTH_MATERIAL_ORIGINAL só existe em materiais que ESTE
+    # PROP_TEXTURE_PICKER_MATERIAL_ORIGINAL só existe em materiais que ESTE
     # sistema já criou por cópia -- se ela já está lá, o material já
     # está "resolvido" (seja usado por 1 ou várias das NOSSAS malhas),
     # não precisa copiar de novo.
-    if material.users > 1 and PROP_MOUTH_MATERIAL_ORIGINAL not in material.keys():
+    if material.users > 1 and PROP_TEXTURE_PICKER_MATERIAL_ORIGINAL not in material.keys():
         original_name = material.name
         material = material.copy()
-        material.name = original_name + MOUTH_MATERIAL_COPY_SUFFIX
-        material[PROP_MOUTH_MATERIAL_ORIGINAL] = original_name
+        material.name = original_name + TEXTURE_PICKER_MATERIAL_COPY_SUFFIX
+        material[PROP_TEXTURE_PICKER_MATERIAL_ORIGINAL] = original_name
         mesh_obj.data.materials[0] = material
 
     tex_node = _find_image_texture_node(material)
@@ -3397,17 +3302,17 @@ def _ensure_mouth_material_uv_offset(mesh_obj):
     nodes = material.node_tree.nodes
     links = material.node_tree.links
 
-    mapping_node = nodes.get(MOUTH_ATLAS_MAPPING_NODE_NAME)
+    mapping_node = nodes.get(TEXTURE_PICKER_MAPPING_NODE_NAME)
     if mapping_node is None:
         mapping_node = nodes.new("ShaderNodeMapping")
-        mapping_node.name = MOUTH_ATLAS_MAPPING_NODE_NAME
-        mapping_node.label = "Hytale Mouth UV Offset"
+        mapping_node.name = TEXTURE_PICKER_MAPPING_NODE_NAME
+        mapping_node.label = "Hytale Texture Picker Offset"
     mapping_node.location = (tex_node.location.x - 300, tex_node.location.y)
 
-    uv_node = nodes.get(MOUTH_ATLAS_UVMAP_NODE_NAME)
+    uv_node = nodes.get(TEXTURE_PICKER_UVMAP_NODE_NAME)
     if uv_node is None:
         uv_node = nodes.new("ShaderNodeUVMap")
-        uv_node.name = MOUTH_ATLAS_UVMAP_NODE_NAME
+        uv_node.name = TEXTURE_PICKER_UVMAP_NODE_NAME
     uv_node.location = (mapping_node.location.x - 200, mapping_node.location.y)
     if mesh_obj.data.uv_layers:
         uv_node.uv_map = mesh_obj.data.uv_layers[0].name
@@ -3418,7 +3323,7 @@ def _ensure_mouth_material_uv_offset(mesh_obj):
     return mapping_node, image
 
 
-def _apply_mouth_atlas_driver(mapping_node, axis_index, armature_obj, step, px_per_step, atlas_size_px):
+def _apply_texture_picker_driver(mapping_node, axis_index, armature_obj, step, px_per_step, atlas_size_px, cursor_bone_name):
     """Cria (substituindo qualquer driver anterior no mesmo eixo) o
     driver de Mapping.inputs['Location'][axis_index] -- MESMA fórmula
     que exporter.py usa em sample_uv_offset_px (round(loc/step)*px),
@@ -3426,7 +3331,13 @@ def _apply_mouth_atlas_driver(mapping_node, axis_index, armature_obj, step, px_p
     (o que o Mapping node espera) em vez de pixel cru (o que o export
     espera). Ver comentário grande no topo desta seção sobre por que
     NÃO uso floor()/índice aqui -- precisa bater exatamente com o
-    exporter, que não é meu arquivo pra alinhar do outro lado."""
+    exporter, que não é meu arquivo pra alinhar do outro lado.
+
+    v0.12 -- cursor_bone_name agora é parâmetro (nome derivado por
+    instância, ver _texture_picker_cursor_name) em vez do antigo
+    BONE_TEXTURE_PICKER_CURSOR fixo -- Companion Bones passam o nome do
+    cursor do PRINCIPAL aqui (companions não têm cursor próprio,
+    reaproveitam o do principal -- ver _apply_texture_picker_to_companion)."""
     socket = mapping_node.inputs["Location"]
     socket.driver_remove("default_value", axis_index)
     fcurve = socket.driver_add("default_value", axis_index)
@@ -3441,14 +3352,14 @@ def _apply_mouth_atlas_driver(mapping_node, axis_index, armature_obj, step, px_p
     target = var.targets[0]
     target.id_type = "OBJECT"
     target.id = armature_obj
-    target.data_path = f'pose.bones["{BONE_MOUTH_CURSOR}"].location[{axis_index}]'
+    target.data_path = f'pose.bones["{cursor_bone_name}"].location[{axis_index}]'
 
 
-def _apply_mouth_atlas_to_companion(armature_obj, companion_bone_name, grid, step_x, step_y, primary_material):
-    """v0.10.13 -- Companion Bones (HytaleIKChainItem.mouth_extra_bone_
-    1..N): aplica o MESMO tratamento de material que o Mouth Bone
-    principal recebe (_ensure_mouth_material_uv_offset +
-    _apply_mouth_atlas_driver) numa malha COMPANION -- outra malha/bone
+def _apply_texture_picker_to_companion(armature_obj, companion_bone_name, grid, step_x, step_y, primary_material, cursor_bone_name):
+    """v0.10.13 -- Companion Bones (HytaleIKChainItem.texture_picker_extra_bone_
+    1..N): aplica o MESMO tratamento de material que o Target Bone
+    principal recebe (_ensure_texture_picker_material_uv_offset +
+    _apply_texture_picker_driver) numa malha COMPANION -- outra malha/bone
     que compartilha o atlas de bocas e deve trocar de expressão junto
     (ex.: metade R de uma boca dividida em L/R). Reaproveita o `grid`/
     `step_x`/`step_y` já calculados pro principal (não detecta/redetecta
@@ -3456,10 +3367,13 @@ def _apply_mouth_atlas_to_companion(armature_obj, companion_bone_name, grid, ste
     mexerem em sincronia, então não faz sentido detectar de novo pra
     cada companion (e detectar de novo correria o risco de dar um grid
     LIGEIRAMENTE diferente, por menor imperfeição na textura de cada
-    lado -- pior que reaproveitar).
+    lado -- pior que reaproveitar). v0.12: 'cursor_bone_name' também é
+    reaproveitado do principal (nome derivado desta instância, ver
+    _texture_picker_cursor_name) -- companion nunca tem cursor próprio,
+    só material+driver, sempre lendo do MESMO bone que o usuário arrasta.
 
     v0.10.17 -- CORRIGIDO: antes, cada companion sempre rodava seu
-    PRÓPRIO _ensure_mouth_material_uv_offset (própria cópia, se
+    PRÓPRIO _ensure_texture_picker_material_uv_offset (própria cópia, se
     precisasse) -- funcionava, mas gerava cópias REDUNDANTES quando o
     companion e o principal originalmente compartilhavam o MESMO
     material (ex.: textura base do personagem inteiro, usada por
@@ -3480,8 +3394,8 @@ def _apply_mouth_atlas_to_companion(armature_obj, companion_bone_name, grid, ste
 
     Devolve (True, None) se aplicado com sucesso, ou (False, mensagem)
     -- mensagem sempre não-fatal, o chamador decide se reporta como
-    aviso (ver _build_mouth_atlas) sem cancelar o resto."""
-    mesh_obj = _find_mouth_mesh_object(armature_obj, companion_bone_name)
+    aviso (ver _build_texture_picker) sem cancelar o resto."""
+    mesh_obj = _find_texture_picker_mesh_object(armature_obj, companion_bone_name)
     if mesh_obj is None:
         return False, (
             f"companion bone '{companion_bone_name}': no mesh found with a matching vertex group + "
@@ -3494,10 +3408,10 @@ def _apply_mouth_atlas_to_companion(armature_obj, companion_bone_name, grid, ste
     if current_material is primary_material:
         return True, None  # já é a mesma malha/já foi resolvido numa passada anterior -- nada a fazer
 
-    primary_original_name = primary_material.get(PROP_MOUTH_MATERIAL_ORIGINAL, primary_material.name)
+    primary_original_name = primary_material.get(PROP_TEXTURE_PICKER_MATERIAL_ORIGINAL, primary_material.name)
     if current_material.name == primary_original_name:
         # Companion ainda aponta pro mesmo material que o PRINCIPAL
-        # apontava antes de _ensure_mouth_material_uv_offset decidir
+        # apontava antes de _ensure_texture_picker_material_uv_offset decidir
         # copiar (ou não) -- reaproveita a MESMA cópia/material que o
         # principal já resolveu, em vez de rodar o próprio
         # copy-on-write (ver comentário grande acima).
@@ -3506,7 +3420,7 @@ def _apply_mouth_atlas_to_companion(armature_obj, companion_bone_name, grid, ste
 
     # Companion tem um material genuinamente DIFERENTE do principal --
     # segue o fluxo normal (própria cópia se precisar, próprio driver).
-    mapping_node, image = _ensure_mouth_material_uv_offset(mesh_obj)
+    mapping_node, image = _ensure_texture_picker_material_uv_offset(mesh_obj)
     if mapping_node is None or image is None:
         return False, f"companion bone '{companion_bone_name}': '{mesh_obj.name}' has no Image Texture material."
     if tuple(image.size) != (grid["atlas_w"], grid["atlas_h"]):
@@ -3521,21 +3435,21 @@ def _apply_mouth_atlas_to_companion(armature_obj, companion_bone_name, grid, ste
         # errada (bone companion errado, ou texturas desalinhadas).
         return False, (
             f"companion bone '{companion_bone_name}': texture '{image.name}' is "
-            f"{image.size[0]}x{image.size[1]}px, but Mouth Bone's texture is "
+            f"{image.size[0]}x{image.size[1]}px, but Target Bone's texture is "
             f"{grid['atlas_w']}x{grid['atlas_h']}px -- skipping (companion must use the same texture/size)."
         )
-    _apply_mouth_atlas_driver(mapping_node, 0, armature_obj, step_x, grid["cell_w_px"], grid["atlas_w"])
-    _apply_mouth_atlas_driver(mapping_node, 1, armature_obj, step_y, -grid["cell_h_px"], grid["atlas_h"])
+    _apply_texture_picker_driver(mapping_node, 0, armature_obj, step_x, grid["cell_w_px"], grid["atlas_w"], cursor_bone_name)
+    _apply_texture_picker_driver(mapping_node, 1, armature_obj, step_y, -grid["cell_h_px"], grid["atlas_h"], cursor_bone_name)
     return True, None
 
 
-def _strip_mouth_material_nodes(material):
-    """Núcleo do que _revert_mouth_material_uv_offset fazia sozinho
+def _strip_texture_picker_material_nodes(material):
+    """Núcleo do que _revert_texture_picker_material_uv_offset fazia sozinho
     antes da v0.10.16 -- remove os nodes Mapping/UV Map injetados por
-    _ensure_mouth_material_uv_offset, relincando o Image Texture direto
-    no Base Color (estado de antes de 'Create Mouth Atlas'). Só usado
+    _ensure_texture_picker_material_uv_offset, relincando o Image Texture direto
+    no Base Color (estado de antes de 'Create Texture Picker'). Só usado
     hoje pro caso "material editado DIRETO, sem cópia" (users==1 desde
-    o início) -- quando HOUVE cópia, _revert_mouth_material_uv_offset
+    o início) -- quando HOUVE cópia, _revert_texture_picker_material_uv_offset
     simplesmente descarta a cópia inteira (não precisa desfazer nodes
     de um material que vai ser apagado mesmo). Devolve True se algo foi
     de fato removido."""
@@ -3543,8 +3457,8 @@ def _strip_mouth_material_nodes(material):
         return False
     did_something = False
     nodes = material.node_tree.nodes
-    mapping_node = nodes.get(MOUTH_ATLAS_MAPPING_NODE_NAME)
-    uv_node = nodes.get(MOUTH_ATLAS_UVMAP_NODE_NAME)
+    mapping_node = nodes.get(TEXTURE_PICKER_MAPPING_NODE_NAME)
+    uv_node = nodes.get(TEXTURE_PICKER_UVMAP_NODE_NAME)
     if mapping_node is not None:
         tex_node = _find_image_texture_node(material)
         if tex_node is not None:
@@ -3559,16 +3473,16 @@ def _strip_mouth_material_nodes(material):
     return did_something
 
 
-def _revert_mouth_material_uv_offset(mesh_obj):
-    """v0.10.13 -- extraído de dentro de _remove_mouth_atlas (que
-    aplicava isso só pro material do Mouth Bone principal) pra ser
+def _revert_texture_picker_material_uv_offset(mesh_obj):
+    """v0.10.13 -- extraído de dentro de _remove_texture_picker (que
+    aplicava isso só pro material do Target Bone principal) pra ser
     reaproveitado também pros materiais de Companion Bones.
 
     v0.10.16 -- agora recebe o MESH (não só o material), porque
     restaurar o material original exige reatribuir o SLOT
     (mesh_obj.data.materials[0] = ...), não só mexer nos nodes de
-    dentro. Dois casos, pela custom property PROP_MOUTH_MATERIAL_ORIGINAL
-    (gravada por _ensure_mouth_material_uv_offset só quando ela
+    dentro. Dois casos, pela custom property PROP_TEXTURE_PICKER_MATERIAL_ORIGINAL
+    (gravada por _ensure_texture_picker_material_uv_offset só quando ela
     PRECISOU copiar o material por users > 1 -- ver lá):
 
     1. O material atual É uma cópia rastreada (tem a property) -- acha
@@ -3581,11 +3495,11 @@ def _revert_mouth_material_uv_offset(mesh_obj):
        fora nesse meio tempo, cai pro caso 2 (só desfaz os nodes da
        cópia mesmo, já que não tem pra onde voltar).
     2. Sem cópia rastreada (material editado direto, users==1 desde o
-       início) -- só desfaz os nodes (ver _strip_mouth_material_nodes),
+       início) -- só desfaz os nodes (ver _strip_texture_picker_material_nodes),
        comportamento de sempre.
 
     Seguro chamar em qualquer malha, mesmo que nunca tenha passado por
-    _ensure_mouth_material_uv_offset (nesse caso é um no-op). Devolve
+    _ensure_texture_picker_material_uv_offset (nesse caso é um no-op). Devolve
     True se algo foi de fato removido/revertido."""
     if not mesh_obj.data.materials:
         return False
@@ -3593,7 +3507,7 @@ def _revert_mouth_material_uv_offset(mesh_obj):
     if material is None:
         return False
 
-    original_name = material.get(PROP_MOUTH_MATERIAL_ORIGINAL)
+    original_name = material.get(PROP_TEXTURE_PICKER_MATERIAL_ORIGINAL)
     if original_name:
         original_material = bpy.data.materials.get(original_name)
         if original_material is not None:
@@ -3605,48 +3519,48 @@ def _revert_mouth_material_uv_offset(mesh_obj):
         # restaurar a atribuição, mas a property fica órfã na cópia;
         # remove ela e cai pro caso "só desfaz os nodes" abaixo, pra
         # não deixar a cópia com um driver/Mapping funcionando à toa.
-        del material[PROP_MOUTH_MATERIAL_ORIGINAL]
+        del material[PROP_TEXTURE_PICKER_MATERIAL_ORIGINAL]
 
-    return _strip_mouth_material_nodes(material)
+    return _strip_texture_picker_material_nodes(material)
 
 
-def _apply_mouth_atlas_visibility_driver(plane_obj, armature_obj):
+def _apply_texture_picker_visibility_driver(plane_obj, armature_obj):
     """Driver simples em Object.hide_viewport ('Disable in Viewport', o
     olho no Outliner / caixa em Object Properties > Visibility) do plane
-    de referência do Mouth Atlas, ligado à visibilidade da bone
-    collection "Mouth" (COLL_MAIN_MOUTH) do MESMO armature -- pedido
-    explícito do usuário: desativar a collection "Mouth" (checkbox da
-    aba Animation ou do painel nativo "Bone Collections") já esconde o
-    plane sozinho, sem precisar escondê-lo à mão toda vez.
+    de referência do Texture Picker, ligado à visibilidade da bone
+    collection "Texture Picker" (COLL_MAIN_TEXTURE_PICKER) do MESMO armature --
+    pedido explícito do usuário: desativar a collection "Texture Picker"
+    (checkbox da aba Animation ou do painel nativo "Bone Collections")
+    já esconde o plane sozinho, sem precisar escondê-lo à mão toda vez.
 
-    `collections_all["Mouth"].is_visible` é o toggle PRÓPRIO da
+    `collections_all["Texture Picker"].is_visible` é o toggle PRÓPRIO da
     collection (não a visibilidade efetiva considerando ancestrais --
-    pedido foi "driver simples", e Mouth não costuma ter uma collection
-    pai além de Main, que não tem toggle de visibilidade próprio hoje).
-    hide_viewport é o INVERSO de is_visible (True = escondido), por
-    isso a expressão nega a variável."""
+    pedido foi "driver simples", e Texture Picker não costuma ter uma
+    collection pai além de Main, que não tem toggle de visibilidade
+    próprio hoje). hide_viewport é o INVERSO de is_visible (True =
+    escondido), por isso a expressão nega a variável."""
     plane_obj.driver_remove("hide_viewport")
     fcurve = plane_obj.driver_add("hide_viewport")
     driver = fcurve.driver
     driver.type = "SCRIPTED"
-    driver.expression = "not mouth_coll_visible"
+    driver.expression = "not texture_picker_coll_visible"
     for existing_var in list(driver.variables):
         driver.variables.remove(existing_var)
     var = driver.variables.new()
-    var.name = "mouth_coll_visible"
+    var.name = "texture_picker_coll_visible"
     var.type = "SINGLE_PROP"
     target = var.targets[0]
     target.id_type = "ARMATURE"
     target.id = armature_obj.data
-    target.data_path = f'collections_all["{COLL_MAIN_MOUTH}"].is_visible'
+    target.data_path = f'collections_all["{COLL_MAIN_TEXTURE_PICKER}"].is_visible'
 
 
-def _get_mouth_mesh_rest_uv(mesh_obj):
+def _get_texture_picker_mesh_rest_uv(mesh_obj):
     """UV 'de repouso' que a malha da boca já tinha ANTES de qualquer
     Mapping node -- a que o .blockymodel/.bbmodel original trouxe,
     apontando pra UMA célula específica do atlas (normalmente a boca
     fechada de referência). Usada só pra posicionar o plane de
-    referência (ver _build_mouth_atlas_plane_mesh) de um jeito que
+    referência (ver _build_texture_picker_plane_mesh) de um jeito que
     funcione pra QUALQUER personagem sem hardcode de "qual célula é a
     primeira" -- lê a média de todos os loops de UV da malha (a malha
     inteira aponta pra uma região pequena única do atlas, o normal pra
@@ -3661,14 +3575,14 @@ def _get_mouth_mesh_rest_uv(mesh_obj):
     return (sum(c.x for c in coords) / len(coords), sum(c.y for c in coords) / len(coords))
 
 
-def _build_mouth_atlas_plane_mesh(mesh_name, plane_w, plane_h, rest_uv):
+def _build_texture_picker_plane_mesh(mesh_name, plane_w, plane_h, rest_uv):
     """Malha do plane de referência: um quad só, UV 0..1 cobrindo o
     atlas INTEIRO sem nenhum offset (mostra a textura completa, é o que
     o usuário usa como mapa visual pra escolher a célula).
 
     v0.10.2 -- CORRIGIDO: a origem (0,0,0) da malha NÃO fica mais no
     canto cru da imagem -- fica exatamente em cima de `rest_uv` (ver
-    _get_mouth_mesh_rest_uv), a célula que a malha real da boca já
+    _get_texture_picker_mesh_rest_uv), a célula que a malha real da boca já
     mostra sem nenhum offset. É isso que faz Location=(0,0) do cursor
     (= delta exportado (0,0) = "sem offset nenhum", ver comentário
     grande no topo da seção) coincidir visualmente com o ponto certo
@@ -3704,7 +3618,7 @@ def _build_mouth_atlas_plane_mesh(mesh_name, plane_w, plane_h, rest_uv):
     return mesh
 
 
-def _ensure_mouth_atlas_reference_material(material_name, image):
+def _ensure_texture_picker_reference_material(material_name, image):
     """Material simples (sem Mapping, sem drivers) só pra mostrar o
     atlas INTEIRO no plane de referência -- Image Texture -> Base
     Color/Alpha, mesmo espírito 'flat' do material que importer.py
@@ -3743,70 +3657,65 @@ def _ensure_mouth_atlas_reference_material(material_name, image):
     return material
 
 
-def _build_mouth_atlas(context, armature_obj, item):
-    """Núcleo de 'Create Mouth Atlas': detecta o grid da textura,
-    cria root.ui/ui.mouth_uv, o plane de referência, e injeta o driver
-    de UV no material real da boca -- idempotente (rodar de novo só
-    atualiza o que já existe, não duplica nada, mesmo espírito do resto
-    do rigger). Devolve (True, mensagem) ou (False, mensagem de erro).
+def _build_texture_picker(context, armature_obj, item):
+    """Núcleo de 'Create Texture Picker': lê o grid da textura (Manual Grid),
+    cria root.ui/cursor DESTA INSTÂNCIA (nomes derivados, ver
+    _texture_picker_ui_root_name/_texture_picker_cursor_name -- v0.12,
+    multi-instância), o plane de referência, e injeta o driver de UV no
+    material real do alvo -- idempotente (rodar de novo só atualiza o
+    que já existe, não duplica nada, mesmo espírito do resto do
+    rigger). Devolve (True, mensagem) ou (False, mensagem de erro).
 
     Precisa ser chamado em Object Mode (troca de modo internamente
     conforme necessário -- Edit Mode pra criar os bones, Pose Mode pra
     constraint/custom shape/cor)."""
-    mouth_bone_name = (item.mouth_bone or "").strip()
-    if not mouth_bone_name:
-        return False, "No Mouth Bone set on this entry."
-    # v0.10.5 -- separado de mouth_bone (ver comentário no campo,
-    # HytaleIKChainItem.mouth_ui_parent_bone): o bone que o root.ui é
+    texture_picker_bone_name = (item.texture_picker_bone or "").strip()
+    if not texture_picker_bone_name:
+        return False, "No Target Bone set on this entry."
+    # v0.12 -- nomes DERIVADOS por instância, a partir do bone alvo (que
+    # já É único por definição -- ver comentário grande no topo desta
+    # seção). Substituem os antigos BONE_UI_ROOT/BONE_TEXTURE_PICKER_
+    # CURSOR fixos.
+    ui_root_name = _texture_picker_ui_root_name(texture_picker_bone_name)
+    cursor_name = _texture_picker_cursor_name(texture_picker_bone_name)
+    # v0.10.5 -- separado de texture_picker_bone (ver comentário no campo,
+    # HytaleIKChainItem.texture_picker_ui_parent_bone): o bone que o root.ui é
     # parentado em cima pode ser diferente do bone que tem a
-    # malha/textura -- vazio cai pra mouth_bone_name (comportamento de
+    # malha/textura -- vazio cai pra texture_picker_bone_name (comportamento de
     # antes).
-    ui_parent_bone_name = (item.mouth_ui_parent_bone or "").strip() or mouth_bone_name
-    mouth_ctrl_name = ui_parent_bone_name + SUFFIX_CTRL
-    if armature_obj.data.bones.get(mouth_ctrl_name) is None:
-        return False, f"'{mouth_ctrl_name}' not found -- run 'Create Rig' first."
+    ui_parent_bone_name = (item.texture_picker_ui_parent_bone or "").strip() or texture_picker_bone_name
+    texture_picker_ctrl_name = ui_parent_bone_name + SUFFIX_CTRL
+    if armature_obj.data.bones.get(texture_picker_ctrl_name) is None:
+        return False, f"'{texture_picker_ctrl_name}' not found -- run 'Create Rig' first."
 
-    mesh_obj = _find_mouth_mesh_object(armature_obj, mouth_bone_name)
+    mesh_obj = _find_texture_picker_mesh_object(armature_obj, texture_picker_bone_name)
     if mesh_obj is None:
         return False, (
-            f"No mesh found with a '{mouth_bone_name}' vertex group + Armature modifier on this "
-            f"Armature -- is the mouth attachment imported and attached?"
+            f"No mesh found with a '{texture_picker_bone_name}' vertex group + Armature modifier on this "
+            f"Armature -- is the attachment/mesh imported and attached?"
         )
 
-    mapping_node, image = _ensure_mouth_material_uv_offset(mesh_obj)
+    mapping_node, image = _ensure_texture_picker_material_uv_offset(mesh_obj)
     if mapping_node is None or image is None:
         return False, f"'{mesh_obj.name}' has no material with an Image Texture -- nothing to drive."
     # v0.10.17 -- guarda o material RESULTANTE do principal (já pode ser
-    # uma cópia, se _ensure_mouth_material_uv_offset precisou copiar por
+    # uma cópia, se _ensure_texture_picker_material_uv_offset precisou copiar por
     # users>1) -- passado pro companion loop mais abaixo, pra ele poder
     # reaproveitar essa MESMA cópia em vez de gerar a própria (ver
-    # _apply_mouth_atlas_to_companion).
+    # _apply_texture_picker_to_companion).
     primary_material = mesh_obj.data.materials[0]
 
-    # v0.10.12 -- Manual Grid: se o usuário já sabe o pitch/contagem de
-    # verdade (visto no Blockbench), pula a detecção por alpha por
-    # completo -- ver docstring do campo em HytaleIKChainItem.
-    # mouth_atlas_use_manual_grid pro motivo (ícones com largura visual
-    # desigual dentro de células uniformes confundem a detecção por
-    # banda de alpha).
-    if item.mouth_atlas_use_manual_grid:
-        grid = {
-            "atlas_w": image.size[0], "atlas_h": image.size[1],
-            "num_cols": item.mouth_atlas_grid_cols, "num_rows": item.mouth_atlas_grid_rows,
-            "cell_w_px": item.mouth_atlas_grid_cell_width, "cell_h_px": item.mouth_atlas_grid_cell_height,
-        }
-    else:
-        grid = detect_mouth_atlas_grid(image)
-        if grid is None:
-            return False, (
-                f"Couldn't detect a grid on '{image.name}' (no transparent gaps found between shapes) -- "
-                f"the atlas needs an alpha channel with empty space around each mouth shape. If the "
-                f"mouth atlas is embedded inside a larger texture instead of being its own dedicated "
-                f"image, or the mouth shapes have uneven visual widths, turn on 'Manual Grid' (you "
-                f"already know the exact cell size/count from Blockbench) and set the values there."
-            )
+    # v0.11 -- auto-detecção removida por completo (ver comentário
+    # grande no topo desta seção); Manual Grid é agora o ÚNICO caminho,
+    # sempre lido direto de HytaleIKChainItem.texture_picker_grid_cols/
+    # _rows/_cell_width/_cell_height.
+    grid = {
+        "atlas_w": image.size[0], "atlas_h": image.size[1],
+        "num_cols": item.texture_picker_grid_cols, "num_rows": item.texture_picker_grid_rows,
+        "cell_w_px": item.texture_picker_grid_cell_width, "cell_h_px": item.texture_picker_grid_cell_height,
+    }
 
-    plane_w = item.mouth_plane_scale
+    plane_w = item.texture_picker_plane_scale
     plane_h = plane_w * (grid["atlas_h"] / grid["atlas_w"])
     # v0.10.2 -- CORRIGIDO (era plane_w/num_cols, divisão limpa -- só
     # bate se o grid dividir a imagem uniformemente, o que já
@@ -3822,72 +3731,76 @@ def _build_mouth_atlas(context, armature_obj, item):
     step_x = grid["cell_w_px"] * units_per_px
     step_y = -(grid["cell_h_px"] * units_per_px)  # negativo -- linha seguinte = Location mais negativa
 
-    # --- Edit Mode: root.ui / ui.mouth_uv ---------------------------------
+    # --- Edit Mode: root.ui / cursor (nomes derivados desta instância) -----
     prev_mode = armature_obj.mode
     bpy.ops.object.mode_set(mode="EDIT")
     edit_bones = armature_obj.data.edit_bones
-    mouth_ctrl = edit_bones.get(mouth_ctrl_name)
-    if mouth_ctrl is None:
+    texture_picker_ctrl = edit_bones.get(texture_picker_ctrl_name)
+    if texture_picker_ctrl is None:
         bpy.ops.object.mode_set(mode="OBJECT")
         if prev_mode not in ("OBJECT", "EDIT"):
             bpy.ops.object.mode_set(mode=prev_mode)
-        return False, f"'{mouth_ctrl_name}' not found in Edit Mode -- unexpected, please report this."
+        return False, f"'{texture_picker_ctrl_name}' not found in Edit Mode -- unexpected, please report this."
 
-    ui_root, ui_root_is_new = create_bone_like(edit_bones, mouth_ctrl, BONE_UI_ROOT)
+    ui_root, ui_root_is_new = create_bone_like(edit_bones, texture_picker_ctrl, ui_root_name)
     if ui_root_is_new:
-        ui_root.parent = mouth_ctrl
+        ui_root.parent = texture_picker_ctrl
         ui_root.use_connect = False
         # v0.10.1 -- testado no Blender: sem esse offset, root.ui nasce
-        # bem em cima da boca (mesma posição do Mouth_CTRL). Desloca
+        # bem em cima do target (mesma posição do texture_picker_ctrl). Desloca
         # HEAD e TAIL pelo eixo local X do próprio bone recém-copiado
         # (preserva comprimento/orientação, só translada) -- não é a
         # Location de Pose Mode (essa fica livre pra o usuário/handler
         # nenhum canal usar), é a posição de REPOUSO mesmo.
         local_x = ui_root.matrix.to_3x3().col[0].normalized()
         local_y = ui_root.matrix.to_3x3().col[1].normalized()
-        offset = local_x * MOUTH_UI_OFFSET_X + local_y * MOUTH_UI_OFFSET_Y
+        offset = local_x * TEXTURE_PICKER_UI_OFFSET_X + local_y * TEXTURE_PICKER_UI_OFFSET_Y
         ui_root.head += offset
         ui_root.tail += offset
         ui_root[PROP_RIG_LAYER] = "UI-CTRL"
 
-    cursor, cursor_is_new = create_bone_like(edit_bones, ui_root, BONE_MOUTH_CURSOR)
+    cursor, cursor_is_new = create_bone_like(edit_bones, ui_root, cursor_name)
     if cursor_is_new:
         cursor.parent = ui_root
         cursor.use_connect = False
         # Bone bem curto -- só existe pra ter uma Location arrastável,
         # não representa nenhum comprimento real (o widget é achatado,
-        # ver WGT_MOUTH_CURSOR).
+        # ver WGT_TEXTURE_PICKER_CURSOR).
         direction = (cursor.tail - cursor.head)
         length = direction.length or 1.0
         cursor.tail = cursor.head + (direction / length) * min(0.05, plane_w * 0.15)
         cursor[PROP_RIG_LAYER] = "UI-CTRL"
 
-    coll_mouth = ensure_bone_collection(armature_obj.data, COLL_MAIN_MOUTH, parent=ensure_bone_collection(armature_obj.data, COLL_MAIN))
-    coll_mouth.assign(ui_root)
-    coll_mouth.assign(cursor)
+    coll_texture_picker = ensure_bone_collection(armature_obj.data, COLL_MAIN_TEXTURE_PICKER, parent=ensure_bone_collection(armature_obj.data, COLL_MAIN))
+    coll_texture_picker.assign(ui_root)
+    coll_texture_picker.assign(cursor)
 
     bpy.ops.object.mode_set(mode="OBJECT")
 
     # --- Cor + Limit Location + widget (precisa de Bone/PoseBone "de verdade", fora do Edit Mode) ---
-    # v0.10.7 -- cores diferentes por bone agora (BONE_COLOR_OVERRIDES já
-    # tem a entrada certa pra cada um -- ver constants.py), não a mesma
-    # pros dois.
-    for name in (BONE_UI_ROOT, BONE_MOUTH_CURSOR):
+    # v0.10.7 -- cores diferentes por bone (BONE_COLOR_UI_ROOT/
+    # BONE_COLOR_UI_CURSOR, constants.py), não a mesma pros dois.
+    #
+    # v0.12 -- atribuição DIRETA (não mais via BONE_COLOR_OVERRIDES.get(name)):
+    # os dois nomes agora são derivados por instância, uma chave FIXA no
+    # dict nunca bateria com o bone de verdade -- ver comentário em
+    # constants.py, BONE_COLOR_OVERRIDES. Já sabemos qual papel cada bone
+    # tem aqui (ui_root vs cursor), não precisa de lookup nenhum.
+    for name, palette in ((ui_root_name, BONE_COLOR_UI_ROOT), (cursor_name, BONE_COLOR_UI_CURSOR)):
         bone = armature_obj.data.bones.get(name)
-        palette = BONE_COLOR_OVERRIDES.get(name)
-        if bone is not None and palette is not None:
+        if bone is not None:
             normal, select, active = palette
             bone.color.palette = "CUSTOM"
             bone.color.custom.normal = normal
             bone.color.custom.select = select
             bone.color.custom.active = active
 
-    pose_cursor = armature_obj.pose.bones.get(BONE_MOUTH_CURSOR)
+    pose_cursor = armature_obj.pose.bones.get(cursor_name)
     if pose_cursor is not None:
-        con = pose_cursor.constraints.get(CONSTRAINT_MOUTH_UV_LIMIT)
+        con = pose_cursor.constraints.get(CONSTRAINT_TEXTURE_PICKER_LIMIT)
         if con is None:
             con = pose_cursor.constraints.new("LIMIT_LOCATION")
-            con.name = CONSTRAINT_MOUTH_UV_LIMIT
+            con.name = CONSTRAINT_TEXTURE_PICKER_LIMIT
         con.owner_space = "LOCAL"
         # v0.10.2 -- CORRIGIDO testando no Blender: linhas = Location Y
         # (não Z como eu tinha assumido -- a orientação real do bone
@@ -3908,9 +3821,9 @@ def _build_mouth_atlas(context, armature_obj, item):
         # em si "vazava" pra fora do grid antes de snapar de volta).
         con.use_transform_limit = True
 
-        missing_widgets = ensure_widget_objects({WGT_MOUTH_CURSOR, WGT_UI_ROOT})
-        if WGT_MOUTH_CURSOR not in missing_widgets:
-            pose_cursor.custom_shape = bpy.data.objects.get(WGT_MOUTH_CURSOR)
+        missing_widgets = ensure_widget_objects({WGT_TEXTURE_PICKER_CURSOR, WGT_UI_ROOT})
+        if WGT_TEXTURE_PICKER_CURSOR not in missing_widgets:
+            pose_cursor.custom_shape = bpy.data.objects.get(WGT_TEXTURE_PICKER_CURSOR)
             pose_cursor.use_custom_shape_bone_size = False
             pose_cursor.custom_shape_scale_xyz = (
                 min(0.05, plane_w * 0.15), min(0.05, plane_w * 0.15), min(0.05, plane_w * 0.15),
@@ -3921,7 +3834,7 @@ def _build_mouth_atlas(context, armature_obj, item):
         # padrão) -- mesmo esquema do cursor acima, só que maior (é o
         # "quadro" que contém o cursor, faz sentido ficar visualmente
         # maior que ele).
-        pose_ui_root = armature_obj.pose.bones.get(BONE_UI_ROOT)
+        pose_ui_root = armature_obj.pose.bones.get(ui_root_name)
         if pose_ui_root is not None and WGT_UI_ROOT not in missing_widgets:
             pose_ui_root.custom_shape = bpy.data.objects.get(WGT_UI_ROOT)
             pose_ui_root.use_custom_shape_bone_size = False
@@ -3931,14 +3844,14 @@ def _build_mouth_atlas(context, armature_obj, item):
             pose_ui_root.custom_shape_wire_width = 2.0  # v0.10.8 -- pedido pelo usuário
 
     # --- Plane de referência (Object novo, malha + material próprios) ----
-    plane_name = mouth_bone_name + MOUTH_ATLAS_PLANE_SUFFIX
-    material_name = mouth_bone_name + MOUTH_ATLAS_MATERIAL_SUFFIX
-    reference_material = _ensure_mouth_atlas_reference_material(material_name, image)
-    rest_uv = _get_mouth_mesh_rest_uv(mesh_obj)
+    plane_name = texture_picker_bone_name + TEXTURE_PICKER_PLANE_SUFFIX
+    material_name = texture_picker_bone_name + TEXTURE_PICKER_MATERIAL_SUFFIX
+    reference_material = _ensure_texture_picker_reference_material(material_name, image)
+    rest_uv = _get_texture_picker_mesh_rest_uv(mesh_obj)
 
     plane_obj = bpy.data.objects.get(plane_name)
     if plane_obj is None:
-        mesh = _build_mouth_atlas_plane_mesh(plane_name + "_mesh", plane_w, plane_h, rest_uv)
+        mesh = _build_texture_picker_plane_mesh(plane_name + "_mesh", plane_w, plane_h, rest_uv)
         plane_obj = bpy.data.objects.new(plane_name, mesh)
         for coll in mesh_obj.users_collection or [context.collection]:
             coll.objects.link(plane_obj)
@@ -3947,7 +3860,7 @@ def _build_mouth_atlas(context, armature_obj, item):
         # Já existe (rodando de novo) -- só atualiza o tamanho/UV
         # reconstruindo a malha, mantendo o Object como está.
         old_mesh = plane_obj.data
-        plane_obj.data = _build_mouth_atlas_plane_mesh(plane_name + "_mesh", plane_w, plane_h, rest_uv)
+        plane_obj.data = _build_texture_picker_plane_mesh(plane_name + "_mesh", plane_w, plane_h, rest_uv)
         if old_mesh.users == 0:
             bpy.data.meshes.remove(old_mesh)
         if not plane_obj.data.materials:
@@ -3973,17 +3886,17 @@ def _build_mouth_atlas(context, armature_obj, item):
     # pra tail, mais o meu compensando errado na mesma direção em vez
     # de na oposta) -- bate com o resíduo de ~0.125m reportado
     # (2x o comprimento do root.ui).
-    ui_root_data_bone = armature_obj.data.bones.get(BONE_UI_ROOT)
+    ui_root_data_bone = armature_obj.data.bones.get(ui_root_name)
     plane_obj.parent = armature_obj
     plane_obj.parent_type = "BONE"
-    plane_obj.parent_bone = BONE_UI_ROOT
+    plane_obj.parent_bone = ui_root_name
     if ui_root_data_bone is not None:
         plane_obj.matrix_parent_inverse = Matrix.Translation((0.0, -ui_root_data_bone.length, 0.0))
-    # v0.10.3 -- ajuste fino manual (mouth_plane_offset_x/_y), em cima do
+    # v0.10.3 -- ajuste fino manual (texture_picker_plane_offset_x/_y), em cima do
     # offset automático já embutido na malha (ver rest_uv/
-    # _get_mouth_mesh_rest_uv acima) -- default (0,0), não muda nada
+    # _get_texture_picker_mesh_rest_uv acima) -- default (0,0), não muda nada
     # até o usuário preencher algo em "Atlas Plane Offset X/Y".
-    plane_obj.location = (item.mouth_plane_offset_x, item.mouth_plane_offset_y, 0.0)
+    plane_obj.location = (item.texture_picker_plane_offset_x, item.texture_picker_plane_offset_y, 0.0)
     plane_obj.rotation_euler = Euler((math.radians(-90.0), 0.0, 0.0), "XYZ")
     plane_obj.scale = (1.0, 1.0, 1.0)
 
@@ -3995,35 +3908,35 @@ def _build_mouth_atlas(context, armature_obj, item):
     # addon (4.5, ver blender_manifest.toml), cobre EEVEE Next e Cycles.
     plane_obj.visible_shadow = False
 
-    # v0.10.9 -- visibilidade do plane amarrada à bone collection "Mouth"
+    # v0.10.9 -- visibilidade do plane amarrada à bone collection "Texture Picker"
     # (pedido explícito): desativar a collection esconde o plane junto.
-    _apply_mouth_atlas_visibility_driver(plane_obj, armature_obj)
+    _apply_texture_picker_visibility_driver(plane_obj, armature_obj)
 
-    # --- Drivers de UV no material REAL da boca ---------------------------
+    # --- Drivers de UV no material REAL do alvo ---------------------------
     # Índice 0 = X (colunas), 1 = Y (linhas) -- ver comentário sobre eixos
     # na Limit Location acima.
-    _apply_mouth_atlas_driver(mapping_node, 0, armature_obj, step_x, grid["cell_w_px"], grid["atlas_w"])
-    _apply_mouth_atlas_driver(mapping_node, 1, armature_obj, step_y, -grid["cell_h_px"], grid["atlas_h"])
+    _apply_texture_picker_driver(mapping_node, 0, armature_obj, step_x, grid["cell_w_px"], grid["atlas_w"], cursor_name)
+    _apply_texture_picker_driver(mapping_node, 1, armature_obj, step_y, -grid["cell_h_px"], grid["atlas_h"], cursor_name)
 
     # --- Companion Bones (v0.10.13) -- outras malhas/bones que devem trocar
-    # de expressão JUNTO com o Mouth Bone principal (ex.: metade R de uma
+    # de expressão JUNTO com o Target Bone principal (ex.: metade R de uma
     # boca dividida em L/R) -- mesmo grid/step do principal. v0.10.17: se o
     # companion compartilhava o MESMO material original do principal, agora
     # reaproveita a cópia já resolvida (sem driver próprio -- desnecessário,
     # o material já é compartilhado); só ganha cópia+driver PRÓPRIO se tiver
-    # uma textura genuinamente diferente (ver _apply_mouth_atlas_to_companion).
+    # uma textura genuinamente diferente (ver _apply_texture_picker_to_companion).
     # Best-effort: um companion que falhar (mesh não encontrada, textura
     # de tamanho diferente, etc.) vira aviso na mensagem final, NUNCA
-    # cancela o resto -- nem o Mouth Bone principal, nem os outros
+    # cancela o resto -- nem o Target Bone principal, nem os outros
     # companions.
     configured_companions = [
-        raw_name.strip() for i in range(1, item.mouth_extra_bone_count + 1)
-        if (raw_name := getattr(item, f"mouth_extra_bone_{i}", "")).strip()
+        raw_name.strip() for i in range(1, item.texture_picker_extra_bone_count + 1)
+        if (raw_name := getattr(item, f"texture_picker_extra_bone_{i}", "")).strip()
     ]
     companion_warnings = []
     for companion_name in configured_companions:
-        ok_companion, warn_msg = _apply_mouth_atlas_to_companion(
-            armature_obj, companion_name, grid, step_x, step_y, primary_material
+        ok_companion, warn_msg = _apply_texture_picker_to_companion(
+            armature_obj, companion_name, grid, step_x, step_y, primary_material, cursor_name
         )
         if not ok_companion:
             companion_warnings.append(warn_msg)
@@ -4031,11 +3944,26 @@ def _build_mouth_atlas(context, armature_obj, item):
     # --- Calibração automática do exporter (só escreve VALORES aqui -- a lógica de
     # múltiplos target bones que lê uv_offset_target_bones_extra mora em exporter.py,
     # sample_action(); editada junto nesta sessão pra suportar Companion Bones, ver
-    # HYTALE_export_bone_settings.uv_offset_target_bones_extra) ---
-    settings = armature_obj.data.hytale_export_settings
-    settings.export_uv_offset = True
-    settings.uv_offset_source_bone = BONE_MOUTH_CURSOR
-    settings.uv_offset_target_bone = mouth_bone_name
+    # HYTALE_texture_picker_export_item.uv_offset_target_bones_extra) ---
+    #
+    # v0.12 -- armature.hytale_export_settings virou armature.hytale_
+    # texture_picker_exports (CollectionProperty, uma entrada por
+    # instância -- ver exporter.py). Acha a entrada desta instância pelo
+    # uv_offset_target_bone (== texture_picker_bone_name, único por
+    # natureza -- é um bone real da armature); cria uma nova se ainda não
+    # existir. Idempotente, mesmo espírito do resto de _build_texture_picker:
+    # rodar de novo só ATUALIZA a entrada existente, nunca duplica.
+    exports = armature_obj.data.hytale_texture_picker_exports
+    export_entry = None
+    for existing_entry in exports:
+        if existing_entry.uv_offset_target_bone == texture_picker_bone_name:
+            export_entry = existing_entry
+            break
+    if export_entry is None:
+        export_entry = exports.add()
+        armature_obj.data.hytale_texture_picker_exports_index = len(exports) - 1
+    export_entry.uv_offset_source_bone = cursor_name
+    export_entry.uv_offset_target_bone = texture_picker_bone_name
     # v0.10.13 -- lista de companions vai pro export TODA, independente
     # do resultado acima (Blender-side): o contrato de export só se
     # importa com o NOME do bone ser válido/exportável (exporter.py
@@ -4044,27 +3972,25 @@ def _build_mouth_atlas(context, armature_obj, item):
     # preview ter sido montado com sucesso aqui. Um companion com mesh
     # temporariamente faltando ainda é um nome de bone legítimo pra
     # receber o shapeUvOffset quando a malha for corrigida depois.
-    settings.uv_offset_target_bones_extra = ",".join(configured_companions)
+    export_entry.uv_offset_target_bones_extra = ",".join(configured_companions)
     # v0.10.10 -- RESTAURADO: exporter.py mudou (uv_offset_step_x/px_x/
-    # step_y/px_y viraram campo de verdade de HYTALE_export_bone_settings,
-    # não mais Property do Operator -- ver DEVELOPER_NOTES.md) -- agora
-    # isso persiste e o diálogo de export lê direto daqui, sem precisar
-    # copiar nada na mão.
-    settings.uv_offset_step_x = step_x
-    settings.uv_offset_px_x = grid["cell_w_px"]
-    settings.uv_offset_step_y = step_y
-    settings.uv_offset_px_y = -grid["cell_h_px"]
+    # step_y/px_y viraram campo de verdade persistido, não mais Property
+    # do Operator -- ver DEVELOPER_NOTES.md) -- agora isso persiste e o
+    # diálogo de export lê direto daqui, sem precisar copiar nada na mão.
+    export_entry.uv_offset_step_x = step_x
+    export_entry.uv_offset_px_x = grid["cell_w_px"]
+    export_entry.uv_offset_step_y = step_y
+    export_entry.uv_offset_px_y = -grid["cell_h_px"]
 
     if prev_mode not in ("OBJECT", "EDIT"):
         bpy.ops.object.mode_set(mode=prev_mode)
 
-    grid_source = "set manually" if item.mouth_atlas_use_manual_grid else "detected"
     message = (
-        f"Mouth Atlas ready: {grid['num_cols']}x{grid['num_rows']} grid {grid_source} on '{image.name}' "
+        f"Texture Picker ready: {grid['num_cols']}x{grid['num_rows']} grid on '{image.name}' "
         f"({grid['atlas_w']}x{grid['atlas_h']}px atlas, {grid['cell_w_px']:.0f}x{grid['cell_h_px']:.0f}px "
         f"per cell), rest UV=({rest_uv[0]:.4f}, {rest_uv[1]:.4f}). Export calibration written "
-        f"automatically (Grid Step X={step_x:.6f}, Y={step_y:.6f}). Drag '{BONE_MOUTH_CURSOR}' in Pose "
-        f"Mode over the reference plane to pick a mouth shape."
+        f"automatically (Grid Step X={step_x:.6f}, Y={step_y:.6f}). Drag '{cursor_name}' in Pose "
+        f"Mode over the reference plane to pick a cell."
     )
     if configured_companions:
         applied_count = len(configured_companions) - len(companion_warnings)
@@ -4074,25 +4000,30 @@ def _build_mouth_atlas(context, armature_obj, item):
     return True, message
 
 
-def _remove_mouth_atlas(armature_obj, item):
-    """Desfaz _build_mouth_atlas pra esta entrada -- remove root.ui/
-    ui.mouth_uv (Edit Mode), o plane de referência (Object + malha,
+def _remove_texture_picker(armature_obj, item):
+    """Desfaz _build_texture_picker pra esta entrada -- remove o par
+    root.ui/cursor DESTA instância (nomes derivados, Edit Mode), o plane de referência (Object + malha,
     material fica em bpy.data caso outra boca reuse a mesma imagem),
     e os nodes Mapping/UV Map injetados no material real (relinka o
     Image Texture direto no Base Color, restaurando o estado de antes
-    de 'Create Mouth Atlas'). Seguro chamar mesmo se nada foi gerado
+    de 'Create Texture Picker'). Seguro chamar mesmo se nada foi gerado
     ainda (idempotente -- cada passo confere antes de mexer). Devolve
     True se algo foi de fato removido, False se já estava limpo."""
-    mouth_bone_name = (item.mouth_bone or "").strip()
-    if not mouth_bone_name:
+    texture_picker_bone_name = (item.texture_picker_bone or "").strip()
+    if not texture_picker_bone_name:
         return False
     did_something = False
+    # v0.12 -- nomes derivados por instância (ver _texture_picker_ui_root_
+    # name/_texture_picker_cursor_name), não mais os antigos BONE_UI_ROOT/
+    # BONE_TEXTURE_PICKER_CURSOR fixos.
+    ui_root_name = _texture_picker_ui_root_name(texture_picker_bone_name)
+    cursor_name = _texture_picker_cursor_name(texture_picker_bone_name)
 
-    if armature_obj.data.bones.get(BONE_UI_ROOT) is not None or armature_obj.data.bones.get(BONE_MOUTH_CURSOR) is not None:
+    if armature_obj.data.bones.get(ui_root_name) is not None or armature_obj.data.bones.get(cursor_name) is not None:
         prev_mode = armature_obj.mode
         bpy.ops.object.mode_set(mode="EDIT")
         edit_bones = armature_obj.data.edit_bones
-        for name in (BONE_MOUTH_CURSOR, BONE_UI_ROOT):  # filho antes do pai
+        for name in (cursor_name, ui_root_name):  # filho antes do pai
             bone = edit_bones.get(name)
             if bone is not None:
                 edit_bones.remove(bone)
@@ -4101,7 +4032,7 @@ def _remove_mouth_atlas(armature_obj, item):
         if prev_mode not in ("OBJECT", "EDIT"):
             bpy.ops.object.mode_set(mode=prev_mode)
 
-    plane_name = mouth_bone_name + MOUTH_ATLAS_PLANE_SUFFIX
+    plane_name = texture_picker_bone_name + TEXTURE_PICKER_PLANE_SUFFIX
     plane_obj = bpy.data.objects.get(plane_name)
     if plane_obj is not None:
         mesh = plane_obj.data
@@ -4110,27 +4041,27 @@ def _remove_mouth_atlas(armature_obj, item):
             bpy.data.meshes.remove(mesh, do_unlink=True)
         did_something = True
 
-    mesh_obj = _find_mouth_mesh_object(armature_obj, mouth_bone_name)
+    mesh_obj = _find_texture_picker_mesh_object(armature_obj, texture_picker_bone_name)
     if mesh_obj is not None and mesh_obj.data.materials:
-        if _revert_mouth_material_uv_offset(mesh_obj):
+        if _revert_texture_picker_material_uv_offset(mesh_obj):
             did_something = True
 
     # v0.10.13 -- Companion Bones: desfaz o material de cada um também
-    # (mesmo helper compartilhado, ver _revert_mouth_material_uv_offset).
-    # Varre TODOS os slots possíveis (1..MOUTH_EXTRA_BONES_MAX_COUNT),
-    # não só até item.mouth_extra_bone_count ATUAL -- se o usuário
-    # rodou "Create Mouth Atlas" com count=3 e depois reduziu pra 1
+    # (mesmo helper compartilhado, ver _revert_texture_picker_material_uv_offset).
+    # Varre TODOS os slots possíveis (1..TEXTURE_PICKER_EXTRA_BONES_MAX_COUNT),
+    # não só até item.texture_picker_extra_bone_count ATUAL -- se o usuário
+    # rodou "Create Texture Picker" com count=3 e depois reduziu pra 1
     # antes de clicar "Remove", os companions 2/3 ainda têm driver
-    # sobrando no material deles (os campos mouth_extra_bone_2/_3
+    # sobrando no material deles (os campos texture_picker_extra_bone_2/_3
     # continuam com o nome salvo, só saem de vista na UI -- reduzir o
-    # count não limpa o texto do campo). _revert_mouth_material_uv_offset
+    # count não limpa o texto do campo). _revert_texture_picker_material_uv_offset
     # é no-op em qualquer material que nunca recebeu o tratamento, então
     # varrer o teto inteiro é seguro/barato (só 8 slots).
     #
     # v0.10.17 -- ORDEM IMPORTA aqui: principal SEMPRE revertido ANTES
     # do loop de companions (linha acima). Desde v0.10.17, um companion
     # pode compartilhar o MESMO datablock de material que o principal
-    # (ver _apply_mouth_atlas_to_companion) -- reverter o principal
+    # (ver _apply_texture_picker_to_companion) -- reverter o principal
     # primeiro só reatribui O SLOT DELE, sem apagar a cópia ainda
     # (material.users > 0 nesse momento, porque o(s) companion(s) ainda
     # apontam pra ela). Só quando o ÚLTIMO a soltar a referência (seja
@@ -4138,32 +4069,40 @@ def _remove_mouth_atlas(armature_obj, item):
     # e a cópia é apagada de verdade -- funciona sozinho por contagem
     # de referência, sem precisar de nenhuma lógica especial "é
     # compartilhado, cuidado" aqui.
-    for i in range(1, MOUTH_EXTRA_BONES_MAX_COUNT + 1):
-        companion_name = (getattr(item, f"mouth_extra_bone_{i}", "") or "").strip()
+    for i in range(1, TEXTURE_PICKER_EXTRA_BONES_MAX_COUNT + 1):
+        companion_name = (getattr(item, f"texture_picker_extra_bone_{i}", "") or "").strip()
         if not companion_name:
             continue
-        companion_mesh = _find_mouth_mesh_object(armature_obj, companion_name)
+        companion_mesh = _find_texture_picker_mesh_object(armature_obj, companion_name)
         if companion_mesh is not None and companion_mesh.data.materials:
-            if _revert_mouth_material_uv_offset(companion_mesh):
+            if _revert_texture_picker_material_uv_offset(companion_mesh):
                 did_something = True
 
-    settings = armature_obj.data.hytale_export_settings
-    if settings.export_uv_offset and settings.uv_offset_target_bone == mouth_bone_name:
-        settings.export_uv_offset = False
-        settings.uv_offset_target_bones_extra = ""
-        did_something = True
+    # v0.12 -- remove a entrada CORRESPONDENTE de armature.hytale_
+    # texture_picker_exports (CollectionProperty, uma por instância) em
+    # vez de resetar um toggle único -- ver exporter.py,
+    # HYTALE_texture_picker_export_item.
+    exports = armature_obj.data.hytale_texture_picker_exports
+    for export_index, export_entry in enumerate(exports):
+        if export_entry.uv_offset_target_bone == texture_picker_bone_name:
+            exports.remove(export_index)
+            armature_obj.data.hytale_texture_picker_exports_index = max(
+                0, min(armature_obj.data.hytale_texture_picker_exports_index, len(exports) - 1)
+            )
+            did_something = True
+            break
 
     return did_something
 
 
-class RIG_OT_hytale_mouth_atlas_create(Operator):
-    """Botão 'Create Mouth Atlas' -- ver _build_mouth_atlas pra lógica
-    de verdade. Opera sobre a entrada MOUTH ATIVA da lista
+class RIG_OT_hytale_texture_picker_create(Operator):
+    """Botão 'Create Texture Picker' -- ver _build_texture_picker pra lógica
+    de verdade. Opera sobre a entrada TEXTURE_PICKER ATIVA da lista
     (armature.hytale_ik_chains_index)."""
 
-    bl_idname = "armature.hytale_mouth_atlas_create"
-    bl_label = "Create Mouth Atlas"
-    bl_description = "Detect the mouth texture atlas grid and build a UV-picker rig for it (root.ui/ui.mouth_uv + reference plane)"
+    bl_idname = "armature.hytale_texture_picker_create"
+    bl_label = "Create Texture Picker"
+    bl_description = "Build a texture-atlas UV-picker rig for it (a dedicated root.ui/cursor bone pair + reference plane) from the Manual Grid values"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -4176,14 +4115,14 @@ class RIG_OT_hytale_mouth_atlas_create(Operator):
         if not (0 <= index < len(armature.hytale_ik_chains)):
             return False
         item = armature.hytale_ik_chains[index]
-        if item.chain_type != "MOUTH" or not item.mouth_bone:
-            cls.poll_message_set("Set a Mouth Bone on this entry first.")
+        if item.chain_type != "TEXTURE_PICKER" or not item.texture_picker_bone:
+            cls.poll_message_set("Set a Target Bone on this entry first.")
             return False
         # v0.10.6 -- travava o clique, mas só avisava DEPOIS (execute
         # já fazia essa mesma checagem e cancelava com report -- agora
         # o botão nem fica clicável, mais claro pro usuário). Mesmo
-        # fallback de ui_parent_bone_name que _build_mouth_atlas usa.
-        ui_parent_bone_name = (item.mouth_ui_parent_bone or "").strip() or item.mouth_bone.strip()
+        # fallback de ui_parent_bone_name que _build_texture_picker usa.
+        ui_parent_bone_name = (item.texture_picker_ui_parent_bone or "").strip() or item.texture_picker_bone.strip()
         ctrl_name = ui_parent_bone_name + SUFFIX_CTRL
         if armature.bones.get(ctrl_name) is None:
             cls.poll_message_set(f"'{ctrl_name}' not found -- run 'Create Rig' first.")
@@ -4194,18 +4133,18 @@ class RIG_OT_hytale_mouth_atlas_create(Operator):
         obj = context.active_object
         armature = obj.data
         item = armature.hytale_ik_chains[armature.hytale_ik_chains_index]
-        ok, message = _build_mouth_atlas(context, obj, item)
+        ok, message = _build_texture_picker(context, obj, item)
         self.report({"INFO"} if ok else {"ERROR"}, message)
         return {"FINISHED"} if ok else {"CANCELLED"}
 
 
-class RIG_OT_hytale_mouth_atlas_remove(Operator):
-    """Botão ao lado de 'Create Mouth Atlas' -- desfaz pra esta entrada
-    (ver _remove_mouth_atlas)."""
+class RIG_OT_hytale_texture_picker_remove(Operator):
+    """Botão ao lado de 'Create Texture Picker' -- desfaz pra esta entrada
+    (ver _remove_texture_picker)."""
 
-    bl_idname = "armature.hytale_mouth_atlas_remove"
-    bl_label = "Remove Mouth Atlas"
-    bl_description = "Remove the generated Mouth Atlas rig (root.ui/ui.mouth_uv, reference plane, material driver) for this entry"
+    bl_idname = "armature.hytale_texture_picker_remove"
+    bl_label = "Remove Texture Picker"
+    bl_description = "Remove the generated Texture Picker rig (root.ui/cursor bone pair, reference plane, material driver) for this entry"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -4215,14 +4154,14 @@ class RIG_OT_hytale_mouth_atlas_remove(Operator):
             return False
         armature = obj.data
         index = armature.hytale_ik_chains_index
-        return 0 <= index < len(armature.hytale_ik_chains) and armature.hytale_ik_chains[index].chain_type == "MOUTH"
+        return 0 <= index < len(armature.hytale_ik_chains) and armature.hytale_ik_chains[index].chain_type == "TEXTURE_PICKER"
 
     def execute(self, context):
         obj = context.active_object
         armature = obj.data
         item = armature.hytale_ik_chains[armature.hytale_ik_chains_index]
-        removed = _remove_mouth_atlas(obj, item)
-        self.report({"INFO"}, "Mouth Atlas removed." if removed else "Nothing to remove.")
+        removed = _remove_texture_picker(obj, item)
+        self.report({"INFO"}, "Texture Picker removed." if removed else "Nothing to remove.")
         return {"FINISHED"}
 
 
@@ -4264,8 +4203,8 @@ class RIG_OT_hytale_generate_rig(Operator):
         # Settings" antes (draw() não pode escrever em dados de ID --
         # ver interface.py; aqui, dentro de execute(), é seguro).
         ensure_default_bone_collections(armature)
-        ensure_mouth_collection_entry(armature)  # v0.10.5 -- backfill p/ armatures já
-        # inicializados antes do Mouth existir na grade default, ver docstring da função
+        ensure_texture_picker_collection_entry(armature)  # v0.10.5 -- backfill p/ armatures já
+        # inicializados antes do Texture Picker existir na grade default, ver docstring da função
 
         # "Pra baixo" (usado no fallback do Foot_IK) precisa ser
         # convertido do espaço mundo pro espaço local do Armature -- as
@@ -4900,15 +4839,15 @@ class RIG_OT_hytale_generate_rig(Operator):
         caminho real de edit bones ORG (root -> ... -> tip). Cadeias
         TAIL são resolvidas à parte, por _resolve_tail_chains -- não
         usam IK/pole nenhum. v0.9 (Etapa 2, ampliado na 2.7 pra incluir
-        ATTACHMENTS; v0.10 pra incluir MOUTH): HEAD/SPINE/ATTACHMENTS/
-        MOUTH também ficam de fora daqui -- não criam bone nenhum, não
+        ATTACHMENTS; v0.10 pra incluir TEXTURE_PICKER): HEAD/SPINE/ATTACHMENTS/
+        TEXTURE_PICKER também ficam de fora daqui -- não criam bone nenhum, não
         têm root/tip/pole (ver _head_spine_bone_names/
         _apply_bone_collection_overrides), então tentar resolvê-los
         como uma cadeia de IK quebraria (campos vazios/sem sentido pra
         eles)."""
         resolved = []
         for item in armature.hytale_ik_chains:
-            if item.chain_type in ("TAIL", "HEAD", "SPINE", "ATTACHMENTS", "MOUTH"):
+            if item.chain_type in ("TAIL", "HEAD", "SPINE", "ATTACHMENTS", "TEXTURE_PICKER"):
                 continue
             label = item.label or item.root_bone or "(sem nome)"
             if not item.root_bone or not item.tip_bone:
@@ -5834,7 +5773,7 @@ class RIG_OT_hytale_generate_rig(Operator):
         # (Head, Spine ou Attachments).
         _organizational_defaults = {
             "HEAD": COLL_MAIN_HEAD, "SPINE": COLL_MAIN_SPINE, "ATTACHMENTS": COLL_ATTACHMENTS,
-            "MOUTH": COLL_MAIN_MOUTH,
+            "TEXTURE_PICKER": COLL_MAIN_TEXTURE_PICKER,
         }
         for item in armature.hytale_ik_chains:
             if item.chain_type not in _organizational_defaults:
@@ -6223,13 +6162,13 @@ def _template_source(list_func, name):
 #
 # v0.10.9 -- ERA só os campos genéricos de Arm/Leg/Tail (root_bone/
 # tip_bone/pole_bone/...) -- nunca foi atualizada quando HEAD/SPINE
-# (v0.9, Etapa 2) e depois ATTACHMENTS/MOUTH (v0.9.8/v0.10) ganharam
+# (v0.9, Etapa 2) e depois ATTACHMENTS/TEXTURE_PICKER (v0.9.8/v0.10) ganharam
 # campos PRÓPRIOS (neck_bone_*/head_bone/head_end_bone/pelvis_bone/
-# spine_bone_*/attachment_bone_*/mouth_bone/mouth_ui_parent_bone/
-# mouth_plane_offset_*). Bug relatado: "salvo um template com Head/
+# spine_bone_*/attachment_bone_*/texture_picker_bone/texture_picker_ui_parent_bone/
+# texture_picker_plane_offset_*). Bug relatado: "salvo um template com Head/
 # Spine configurados e os nomes de bone somem" -- chain_type e label
 # salvavam normal (estavam na lista), mas TODOS os nomes de bone
-# específicos de Head/Spine/Attachments/Mouth eram descartados no
+# específicos de Head/Spine/Attachments/UV_Animate eram descartados no
 # save, silenciosamente (getattr só rodava pros campos desta tupla).
 # Lista completa dos nomes de campo por chain_type, pra referência (ver
 # HytaleIKChainItem pros valores default de cada um):
@@ -6241,15 +6180,15 @@ def _template_source(list_func, name):
 #   HEAD:        neck_count, neck_bone_1..5, head_bone, head_end_bone
 #   SPINE:       spine_count, pelvis_bone, spine_bone_1..4
 #   ATTACHMENTS: attachments_count, attachment_bone_1..ATTACHMENTS_MAX_COUNT
-#   MOUTH:       mouth_bone, mouth_ui_parent_bone, mouth_plane_scale, mouth_plane_offset_x/_y,
-#                mouth_atlas_use_manual_grid, mouth_atlas_grid_cols/_rows/_cell_width/_cell_height,
-#                mouth_extra_bone_count, mouth_extra_bone_1..MOUTH_EXTRA_BONES_MAX_COUNT
+#   TEXTURE_PICKER:  texture_picker_bone, texture_picker_ui_parent_bone, texture_picker_plane_scale, texture_picker_plane_offset_x/_y,
+#                texture_picker_grid_cols/_rows/_cell_width/_cell_height,
+#                texture_picker_extra_bone_count, texture_picker_extra_bone_1..TEXTURE_PICKER_EXTRA_BONES_MAX_COUNT
 # (parent_override e label são comuns a todos os tipos.)
 #
-# v0.10.11 -- mouth_plane_scale (Atlas Plane Scale) tinha ficado de fora
+# v0.10.11 -- texture_picker_plane_scale (Atlas Plane Scale) tinha ficado de fora
 # da correção acima por descuido -- mesmo bug, mesma causa raiz (campo
 # existe em HytaleIKChainItem mas não estava nesta tupla): salvar um
-# template com uma entrada MOUTH configurada descartava silenciosamente
+# template com uma entrada TEXTURE_PICKER configurada descartava silenciosamente
 # o valor calibrado, voltando pro default (1.0) ao recarregar.
 _IK_CHAIN_JSON_FIELDS = (
     "chain_type", "label", "root_bone", "tip_bone", "pole_bone", "parent_override", "side",
@@ -6259,10 +6198,10 @@ _IK_CHAIN_JSON_FIELDS = (
     "head_bone", "head_end_bone",
     "spine_count", "pelvis_bone", "spine_bone_1", "spine_bone_2", "spine_bone_3", "spine_bone_4",
     "attachments_count", *(f"attachment_bone_{i}" for i in range(1, ATTACHMENTS_MAX_COUNT + 1)),
-    "mouth_bone", "mouth_ui_parent_bone", "mouth_plane_scale", "mouth_plane_offset_x", "mouth_plane_offset_y",
-    "mouth_atlas_use_manual_grid", "mouth_atlas_grid_cols", "mouth_atlas_grid_rows",
-    "mouth_atlas_grid_cell_width", "mouth_atlas_grid_cell_height",
-    "mouth_extra_bone_count", *(f"mouth_extra_bone_{i}" for i in range(1, MOUTH_EXTRA_BONES_MAX_COUNT + 1)),
+    "texture_picker_bone", "texture_picker_ui_parent_bone", "texture_picker_plane_scale", "texture_picker_plane_offset_x", "texture_picker_plane_offset_y",
+    "texture_picker_grid_cols", "texture_picker_grid_rows",
+    "texture_picker_grid_cell_width", "texture_picker_grid_cell_height",
+    "texture_picker_extra_bone_count", *(f"texture_picker_extra_bone_{i}" for i in range(1, TEXTURE_PICKER_EXTRA_BONES_MAX_COUNT + 1)),
 )
 
 # Bones utilitários (não derivam de nenhuma cadeia IK) que também

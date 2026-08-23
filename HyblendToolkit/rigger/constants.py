@@ -60,7 +60,7 @@ COLL_MAIN_LEG_L = "Leg L"
 COLL_MAIN_LEG_R = "Leg R"
 COLL_MAIN_ROOT = "Root"
 COLL_MAIN_TAIL = "Tail"  # v0.7 -- bones _Tail (ver SUFFIX_TAIL), sempre visível (mesmo espírito de Arm/Leg/etc.)
-COLL_MAIN_MOUTH = "Mouth"  # v0.10 -- chain_type MOUTH (Mouth Atlas), mesmo espírito organizacional de COLL_MAIN_HEAD/SPINE
+COLL_MAIN_TEXTURE_PICKER = "Texture Picker"  # v0.10 -- chain_type MOUTH, renomeado TEXTURE_PICKER na v0.11 (Texture Picker), mesmo espírito organizacional de COLL_MAIN_HEAD/SPINE
 
 # Todo nome de bone collection que o PRÓPRIO "Create Rig" já cria/
 # gerencia sozinho -- usado por RIG_OT_hytale_collection_template_save
@@ -73,7 +73,7 @@ RESERVED_MAIN_COLLECTION_NAMES = {
     COLL_HYTALE_EXPORT, COLL_INTERNAL, COLL_ORG, COLL_MCH, COLL_MCH_IK, COLL_CTRL, COLL_CTRL_IK,
     COLL_ATTACHMENTS_IMPORTED, COLL_FACE, COLL_MAIN, COLL_ATTACHMENTS, COLL_MAIN_HEAD, COLL_MAIN_SPINE,
     COLL_MAIN_BODY, COLL_MAIN_ARM_L, COLL_MAIN_ARM_R, COLL_MAIN_LEG_L, COLL_MAIN_LEG_R, COLL_MAIN_ROOT,
-    COLL_MAIN_TAIL, COLL_MAIN_MOUTH,
+    COLL_MAIN_TAIL, COLL_MAIN_TEXTURE_PICKER,
 }
 
 # v0.9 (Tarefa B, split de rigger.py): SUFFIX_MCH/SUFFIX_CTRL/SUFFIX_IK
@@ -179,56 +179,74 @@ ROOT_MASTER_PARENT = ORIGIN_ORG_NAME + SUFFIX_CTRL  # "Origin_CTRL" -- parent do
 ROOT_SPINE_LENGTH = 0.5             # comprimento (head->tail) do root.spine_CTRL
 ORIGIN_FALLBACK_LENGTH = 0.3        # comprimento do ORG "Origin" quando precisa ser criado -- ver _ensure_origin_bone
 
-# v0.10 -- Mouth Atlas (chain_type MOUTH). BONE_UI_ROOT é o pai de
-# qualquer bone "de interface" (não deforma malha nenhuma, não existe no
-# jogo, só existe pra dar ao usuário um jeito visual de escolher algo) --
-# hoje só o cursor da boca usa, mas o nome já é genérico o bastante pra
-# outro picker parecido no futuro (ex.: um atlas de sobrancelha) reusar a
-# mesma raiz sem precisar de outro bone "root.*" dedicado. Parentado
-# direto no `<mouth_bone>_CTRL` (não deriva de nenhum ORG por sufixo,
-# mesmo espírito de BONE_ROOT_MASTER acima) -- ver _build_mouth_atlas.
-BONE_UI_ROOT = "root.ui"
-# Cursor que o usuário arrasta sobre o Mouth Atlas Plane -- a Location
-# dele (local, dentro de BONE_UI_ROOT) dirige o driver do Mapping node
-# da boca E é reamostrada pelo exporter.py pra escrever 'shapeUvOffset'
-# (ver UV_OFFSET_SOURCE_BONE_DEFAULT em exporter.py -- o nome aqui
-# precisa continuar batendo com aquele default).
-BONE_MOUTH_CURSOR = "ui.mouth_uv"
-# Offset (Blender units, ao longo do eixo LOCAL X do Mouth_CTRL) que
-# root.ui recebe na hora de ser criado, pra não nascer bem em cima da
-# boca -- mesma escala de "0.5" já usada em outro bone utilitário deste
+# v0.10 -- Texture Picker (chain_type TEXTURE_PICKER, era MOUTH até v0.10).
+# BONE_UI_ROOT_PREFIX é o prefixo do pai de qualquer bone "de interface"
+# (não deforma malha nenhuma, não existe no jogo, só existe pra dar ao
+# usuário um jeito visual de escolher algo) -- hoje só o cursor do
+# Texture Picker usa, mas o prefixo já é genérico o bastante pra outro
+# picker parecido no futuro (ex.: um atlas de sobrancelha) reusar a
+# mesma convenção sem precisar de outro esquema de nome "root.*"
+# dedicado.
+#
+# v0.12 -- ERAM strings FIXAS (BONE_UI_ROOT = "root.ui", BONE_
+# TEXTURE_PICKER_CURSOR = "ui.texture_picker") -- funcionava pra UMA
+# instância de Texture Picker só; uma segunda entrada reaproveitava o
+# MESMO bone físico em vez de criar o seu próprio (bug real, ver
+# DEVELOPER_NOTES.md/prompt_uv_animate.md ponto 2). Agora só os
+# PREFIXO/SUFIXO ficam fixos aqui -- o nome de verdade é montado por
+# instância em rig.py (_texture_picker_ui_root_name/_texture_picker_
+# cursor_name), usando o nome do texture_picker_bone (o bone alvo, que
+# já É único por definição -- é um bone real da armature) como parte do
+# nome. Parentado direto no `<texture_picker_bone>_CTRL` (não deriva de
+# nenhum ORG por sufixo, mesmo espírito de BONE_ROOT_MASTER acima) --
+# ver _build_texture_picker.
+BONE_UI_ROOT_PREFIX = "root.ui."
+# Cursor que o usuário arrasta sobre o Texture Picker Plane -- a Location
+# dele (local, dentro do root.ui desta instância) dirige o driver do
+# Mapping node do target E é reamostrada pelo exporter.py pra escrever
+# 'shapeUvOffset' (ver UV_OFFSET_SOURCE_BONE_DEFAULT em exporter.py --
+# esse default só cobre o caso sem nenhuma instância ainda configurada;
+# cada instância de verdade grava o PRÓPRIO nome derivado em
+# HYTALE_texture_picker_export_item.uv_offset_source_bone).
+BONE_TEXTURE_PICKER_CURSOR_PREFIX = "ui."
+BONE_TEXTURE_PICKER_CURSOR_SUFFIX = ".picker"
+# Offset (Blender units, ao longo do eixo LOCAL X do texture_picker_ctrl) que
+# root.ui recebe na hora de ser criado, pra não nascer bem em cima do
+# target -- mesma escala de "0.5" já usada em outro bone utilitário deste
 # arquivo (ver ROOT_SPINE_LENGTH), testado/confirmado no Blender.
-MOUTH_UI_OFFSET_X = 0.5
+TEXTURE_PICKER_UI_OFFSET_X = 0.5
 # v0.10.2 -- testado no Blender: root.ui também precisa subir/afastar
-# no eixo local Y do bone (comprimento do Mouth_CTRL), além do X --
+# no eixo local Y do bone (comprimento do texture_picker_ctrl), além do X --
 # um offset só não bastava.
-MOUTH_UI_OFFSET_Y = 0.2
+TEXTURE_PICKER_UI_OFFSET_Y = 0.2
 # Sufixo do objeto de malha (plane de referência) e do material dedicado
-# criados por _build_mouth_atlas -- nunca aparecem sozinhos, sempre
-# prefixados pelo nome do mouth_bone (ex.: "Mouth_Atlas_Plane").
-MOUTH_ATLAS_PLANE_SUFFIX = "_Atlas_Plane"
-MOUTH_ATLAS_MATERIAL_SUFFIX = "_Atlas_Reference_MAT"
-# v0.10.16 -- sufixo da CÓPIA que _ensure_mouth_material_uv_offset faz
-# do material real da boca, quando ele está compartilhado (material.
+# criados por _build_texture_picker -- nunca aparecem sozinhos, sempre
+# prefixados pelo nome do texture_picker_bone (ex.: "Mouth_Atlas_Plane" pra
+# um bone chamado "Mouth").
+TEXTURE_PICKER_PLANE_SUFFIX = "_Atlas_Plane"
+TEXTURE_PICKER_MATERIAL_SUFFIX = "_Atlas_Reference_MAT"
+# v0.10.16 -- sufixo da CÓPIA que _ensure_texture_picker_material_uv_offset faz
+# do material real do target, quando ele está compartilhado (material.
 # users > 1) -- sem isso, Blender nomeia a cópia sozinho com o sufixo
 # genérico ".001", difícil de identificar depois só olhando a lista de
 # materiais. Prefixado pelo nome do material ORIGINAL (ex.:
-# "dark_bunny.mouth_MouthAtlasCopy"). PROP_MOUTH_MATERIAL_ORIGINAL é a
+# "dark_bunny.mouth_TexturePickerCopy"). PROP_TEXTURE_PICKER_MATERIAL_ORIGINAL é a
 # custom property (no material da CÓPIA) que guarda o nome do material
-# ORIGINAL de onde ela veio -- é assim que "Remove Mouth Atlas" sabe
+# ORIGINAL de onde ela veio -- é assim que "Remove Texture Picker" sabe
 # pra qual material voltar e que a cópia pode ser apagada (ver
-# _revert_mouth_material_uv_offset em rig.py).
-MOUTH_MATERIAL_COPY_SUFFIX = "_MouthAtlasCopy"
-PROP_MOUTH_MATERIAL_ORIGINAL = "hytale_mouth_original_material"
-# Nomes fixos dos nodes injetados no material REAL da boca (não no plane
+# _revert_texture_picker_material_uv_offset em rig.py).
+TEXTURE_PICKER_MATERIAL_COPY_SUFFIX = "_TexturePickerCopy"
+PROP_TEXTURE_PICKER_MATERIAL_ORIGINAL = "hytale_texture_picker_original_material"
+# Nomes fixos dos nodes injetados no material REAL do target (não no plane
 # de referência, que usa um material próprio simples/sem Mapping) --
 # procurados por nome (nodes.get(...)) pra idempotência, mesmo espírito
 # de CONSTRAINT_FK_ROT etc. acima.
-MOUTH_ATLAS_MAPPING_NODE_NAME = "Hytale_Mouth_UV_Mapping"
-MOUTH_ATLAS_UVMAP_NODE_NAME = "Hytale_Mouth_UV_Map"
-# Limit Location do BONE_MOUTH_CURSOR -- trava o arrasto dentro da área
-# do atlas detectado (0..num_cols-1 células em X, 0..num_rows-1 em Y).
-CONSTRAINT_MOUTH_UV_LIMIT = "Hytale_Mouth_UV_Limit"
+TEXTURE_PICKER_MAPPING_NODE_NAME = "Hytale_Texture_Picker_Mapping"
+TEXTURE_PICKER_UVMAP_NODE_NAME = "Hytale_Texture_Picker_UV_Map"
+# Limit Location do bone cursor (nome derivado por instância -- ver
+# _texture_picker_cursor_name em rig.py) -- trava o arrasto dentro da área
+# do grid informado (0..num_cols-1 células em X, 0..num_rows-1 em Y).
+CONSTRAINT_TEXTURE_PICKER_LIMIT = "Hytale_Texture_Picker_Limit"
 
 # Bone utilitário que guarda TODAS as custom properties de FK/IK switch
 # (uma por cadeia -- ver _switch_property_name) -- fica acima da cabeça,
@@ -325,14 +343,14 @@ ATTACHMENTS_MAX_COUNT = 25
 
 # v0.10.13 -- mesmo mecanismo/motivo de ATTACHMENTS_MAX_COUNT acima
 # (Blender não permite lista genuinamente ilimitada de StringProperty
-# dentro de um PropertyGroup -- os campos mouth_extra_bone_1..N em
+# dentro de um PropertyGroup -- os campos texture_picker_extra_bone_1..N em
 # rig.py são gerados num loop usando este número), mas pra "Companion
-# Bones Amount" do chain_type MOUTH -- bones extras que compartilham o
-# mesmo atlas/cursor de UV que o Mouth Bone principal e devem se mexer
+# Bones Amount" do chain_type TEXTURE_PICKER -- bones extras que compartilham o
+# mesmo atlas/cursor de UV que o Target Bone principal e devem se mexer
 # JUNTOS (ex.: metades L/R espelhadas). Teto bem menor que Attachments
-# de propósito -- uma boca raramente é feita de mais de 2-3 malhas
+# de propósito -- o alvo animado raramente é feito de mais de 2-3 malhas
 # separadas, diferente de attachment points (que podem ser muitos).
-MOUTH_EXTRA_BONES_MAX_COUNT = 8
+TEXTURE_PICKER_EXTRA_BONES_MAX_COUNT = 8
 
 WGT_FK_RING = "WGT_hytale_fk_ring"          # bones _CTRL genéricos (FK)
 WGT_IK_BOX = "WGT_hytale_ik_box"            # ponta de cadeia IK (mão/pé -- o _IK que tem o switch)
@@ -345,8 +363,8 @@ WGT_HEAD = "WGT_hytale_head"                # Head_CTRL
 WGT_ORIGIN = "WGT_hytale_origin"            # Origin_CTRL (gerado do ORG "Origin" pelo loop padrão -- ver override abaixo)
 WGT_PROPERTIES = "WGT_hytale_properties"    # bone PROPERTIES (ver BONE_PROPERTIES) -- override abaixo
 WGT_ATTACHMENT = "WGT_hytale_attachment"    # qualquer _CTRL de attachment (is_attachment_bone) -- antes caía no WGT_FK_RING genérico
-WGT_MOUTH_CURSOR = "WGT_hytale_mouth_cursor"  # v0.10 -- mira achatada, widget dedicado do BONE_MOUTH_CURSOR (ui.mouth_uv)
-WGT_UI_ROOT = "WGT_hytale_ui_root"  # v0.10.4 -- widget do BONE_UI_ROOT (root.ui) -- hoje só o Mouth Atlas usa
+WGT_TEXTURE_PICKER_CURSOR = "WGT_hytale_texture_picker_cursor"  # v0.10 -- mira achatada, widget dedicado do bone cursor (nome derivado por instância, ver rig.py)
+WGT_UI_ROOT = "WGT_hytale_ui_root"  # v0.10.4 -- widget do bone root.ui (nome derivado por instância, ver rig.py) -- hoje só o Texture Picker usa
 
 # WIDGET_NAME_OVERRIDES fica definido mais abaixo, depois de
 # HEAD_COLLECTION_ROOT (ele referencia essa constante -- ver o comentário
@@ -417,12 +435,19 @@ WIDGET_NAME_OVERRIDES = {
     HEAD_COLLECTION_ROOT: WGT_HEAD,
     ROOT_MASTER_PARENT: WGT_ORIGIN,
     BONE_PROPERTIES: WGT_PROPERTIES,
-    # v0.10 -- Mouth Atlas: _build_mouth_atlas cria/atribui esses dois bones
-    # fora do loop genérico org->_CTRL, então esta entrada é só documentação
-    # (o widget é atribuído direto lá) -- mantida aqui pra quem for procurar
-    # "que shape esse bone usa" não precisar abrir dois arquivos.
-    BONE_MOUTH_CURSOR: WGT_MOUTH_CURSOR,
-    BONE_UI_ROOT: WGT_UI_ROOT,
+    # v0.10 -- Texture Picker: _build_texture_picker cria/atribui esses dois bones
+    # fora do loop genérico org->_CTRL, então nunca passam por este dict
+    # de qualquer forma (o widget é atribuído direto lá).
+    #
+    # v0.12 -- as entradas BONE_TEXTURE_PICKER_CURSOR/BONE_UI_ROOT que
+    # existiam aqui foram REMOVIDAS: os dois nomes agora são DERIVADOS
+    # por instância (um bone por entrada, ver _texture_picker_ui_root_
+    # name/_texture_picker_cursor_name em rig.py), então uma chave FIXA
+    # aqui nunca bateria com o nome de verdade do bone -- ficaria morta,
+    # nunca lida por nenhum lookup por nome exato. _build_texture_picker
+    # já não dependia deste dict pra esses dois bones (atribuição direta,
+    # ver comentário acima) -- então removê-las não muda comportamento
+    # nenhum, só tira uma entrada que nunca mais faria sentido existir.
 }
 
 # Ajustes finos de Translation/Rotation/Scale do custom shape, por bone --
@@ -465,7 +490,7 @@ BONE_COLOR_SPINE = ((0.0, 0.7961, 0.0), (0.0, 0.8471, 0.0), (0.5765, 1.0, 0.498)
 BONE_COLOR_ATTACHMENT = ((0.8471, 0.8471, 0.8471), (0.898, 0.898, 0.898), (1.0, 1.0, 1.0))
 BONE_COLOR_PROPERTIES = ((0.1451, 0.5137, 1.0), (0.1608, 0.4667, 1.0), (0.3373, 0.502, 1.0))  # #2583FF / #2977FF / #5680FF
 # v0.10.7 -- cores dedicadas pedidas pelo usuário (hex convertido pra
-# 0..1): root.ui = amarelo, ui.mouth_uv = vermelho -- diferente uma da
+# 0..1): root.ui = amarelo, cursor = vermelho -- diferente uma da
 # outra de propósito (cursor precisa se destacar do "quadro" que ele
 # fica dentro). Substituem o antigo BONE_COLOR_UI (magenta único pros
 # dois).
@@ -484,8 +509,12 @@ BONE_COLOR_OVERRIDES = {
     **{name: BONE_COLOR_SPINE for name in SPINE_COLLECTION_BONES},
     "Neck" + SUFFIX_CTRL: BONE_COLOR_SPINE,  # Neck_CTRL -- só entrou no grupo verde nesta atualização
     BONE_PROPERTIES: BONE_COLOR_PROPERTIES,
-    BONE_UI_ROOT: BONE_COLOR_UI_ROOT,
-    BONE_MOUTH_CURSOR: BONE_COLOR_UI_CURSOR,
+    # v0.12 -- BONE_UI_ROOT/BONE_TEXTURE_PICKER_CURSOR REMOVIDAS daqui
+    # (mesmo motivo do comentário em WIDGET_NAME_OVERRIDES, acima): os
+    # dois nomes agora são derivados por instância, uma chave fixa nunca
+    # bateria com o bone de verdade. _build_texture_picker já colore
+    # esses dois bones direto (BONE_COLOR_UI_ROOT/BONE_COLOR_UI_CURSOR),
+    # sem depender deste dict.
 }
 BODY_COLLECTION_BONES = [BONE_ROOT_SPINE, BONE_ROOT_MASTER, BONE_ROOT_PELVIS]
 ROOT_COLLECTION_BONES = [ROOT_MASTER_PARENT]

@@ -117,8 +117,8 @@ from .common import (
 # originais (os que têm o mesmo nome exato dos nodes do .blockymodel).
 # Isso funciona não importa o que mais existir no rig.
 EXPORT_COLLECTION_NAME_DEFAULT = "Hytale Export"
-UV_OFFSET_SOURCE_BONE_DEFAULT = "ui.mouth_uv"
-UV_OFFSET_TARGET_BONE_DEFAULT = "Mouth"
+UV_OFFSET_SOURCE_BONE_DEFAULT = "ui.texture_picker"
+UV_OFFSET_TARGET_BONE_DEFAULT = ""
 
 # Sufixos de fallback, usados SÓ se a Bone Collection acima não existir na
 # armature (pra não travar o export de quem ainda não configurou a
@@ -135,18 +135,31 @@ def is_original_bone_name(name):
 
 # ---------------------------------------------------------------------------
 # Configurações de export persistentes na Armature (Object Data) -- "Export
-# Bone Collection" e "Export UV Offset" (on/off + quais bones) NÃO são mais
-# properties efêmeras do diálogo do operador de export: são guardadas aqui,
-# no dado da própria Armature, e editadas pelo painel do interface.py (aba
-# Export), pra não precisar reconfigurar toda vez que você abre o diálogo
-# de export.
+# Bone Collection" NÃO é mais property efêmera do diálogo do operador de
+# export: é guardada aqui, no dado da própria Armature, e editada pelo
+# painel do interface.py (aba Export), pra não precisar reconfigurar toda
+# vez que você abre o diálogo de export.
 #
-# Registradas aqui (não em interface.py, nem em common.py) seguindo
+# Registrada aqui (não em interface.py, nem em common.py) seguindo
 # EXATAMENTE o mesmo padrão que rigger.py já usa pra hytale_ik_chains:
 # quem é DONO da lógica registra o dado direto no tipo Armature;
 # interface.py só desenha (igual ele já faz pra hytale_ik_chains, lendo
 # armature.hytale_ik_chains sem redefinir nada). Ver DEVELOPER_NOTES.md.
-class HYTALE_export_bone_settings(PropertyGroup):
+#
+# v0.12 -- ERA HYTALE_export_bone_settings, um PointerProperty (valor
+# único) que também guardava export_uv_offset/uv_offset_source_bone/
+# _target_bone(s_extra)/_step_x/_px_x/_step_y/_px_y -- funcionava pra UMA
+# instância de Texture Picker só; rodar "Create Texture Picker" numa
+# segunda entrada (chain_type TEXTURE_PICKER) sobrescrevia a calibração
+# da primeira sem avisar (bone alvo errado ou conversão de pixel
+# calibrada pro tamanho errado no export). Os campos de UV Offset saíram
+# daqui e viraram HYTALE_texture_picker_export_item (ver abaixo),
+# guardado numa CollectionProperty (armature.hytale_texture_picker_
+# exports) -- uma entrada por instância, sem limite. Esta classe (agora
+# HYTALE_export_settings) ficou só com o que é DE VERDADE global à
+# Armature inteira (a Bone Collection de export -- não faz sentido "por
+# instância", só existe UM conjunto de bones exportáveis).
+class HYTALE_export_settings(PropertyGroup):
     export_collection_name: StringProperty(
         name="Export Bone Collection",
         description=(
@@ -158,26 +171,26 @@ class HYTALE_export_bone_settings(PropertyGroup):
         ),
         default=EXPORT_COLLECTION_NAME_DEFAULT,
     )
-    export_uv_offset: BoolProperty(
-        name="Export UV Offset (atlas texture, e.g. Mouth)",
-        description=(
-            "Samples a control bone's Location each frame, snaps it to a "
-            "grid, and writes the result as raw atlas-pixel deltas into "
-            "the 'shapeUvOffset' channel of a target bone -- e.g. a Mouth "
-            "bone driven by a texture-atlas UV picker rig. This does NOT "
-            "read the material/shader -- it reproduces the same snap-to-"
-            "grid math directly from the control bone's Location, so it "
-            "must match whatever math your driver uses. The grid "
-            "calibration itself (Grid Step/Pixels per Step) lives in "
-            "the export dialog's Advanced Options, further down"
-        ),
-        default=False,
-    )
+
+
+# v0.12 -- item da lista armature.hytale_texture_picker_exports (uma
+# entrada por instância de Texture Picker configurada no rigger --
+# ver DEVELOPER_NOTES.md/prompt_uv_animate.md, ponto 2, "múltiplas
+# instâncias independentes"). Cada entrada é totalmente independente:
+# seu próprio bone de controle, seu próprio alvo (+ companions), sua
+# própria calibração de grid -- exportar uma não interfere na outra.
+# 'name' (StringProperty herdada de PropertyGroup, sempre existe)
+# guarda o mesmo valor de uv_offset_target_bone, só pra UIList/
+# template_list ter algo pra mostrar por padrão sem draw_item custom
+# (ver HYTALE_UL_texture_picker_exports abaixo) -- mantida em sincronia
+# sempre que uv_offset_target_bone muda (ver RIG_OT_hytale_texture_
+# picker_create/_remove em rigger/rig.py, que são quem escreve aqui).
+class HYTALE_texture_picker_export_item(PropertyGroup):
     uv_offset_source_bone: StringProperty(
         name="UV Control Bone",
         description=(
             "Name of the helper bone whose Location drives the atlas "
-            "picker (e.g. 'ui.mouth_uv'). This bone itself is NOT "
+            "picker (e.g. 'ui.texture_picker'). This bone itself is NOT "
             "exported -- only its Location is sampled"
         ),
         default=UV_OFFSET_SOURCE_BONE_DEFAULT,
@@ -187,32 +200,34 @@ class HYTALE_export_bone_settings(PropertyGroup):
         description=(
             "Exact name of the real game bone to attach the "
             "'shapeUvOffset' channel to -- must be one of the exportable "
-            "bones (e.g. 'Mouth')"
+            "bones (e.g. 'Mouth', or any other atlas-driven part)"
         ),
         default=UV_OFFSET_TARGET_BONE_DEFAULT,
     )
-    # v0.10.13 -- Companion targets (rigger's "Mouth Amount" --
-    # HytaleIKChainItem.mouth_extra_bone_1..N in rigger/rig.py). Some
-    # characters have their "mouth" split across more than one mesh/bone
-    # (e.g. mirrored L/R halves meeting in the middle) that need the
-    # SAME expression change at the SAME time -- this field lets the
-    # SAME shapeUvOffset delta be written to more bones besides the
-    # primary uv_offset_target_bone. Comma-separated exact bone names
-    # (same name-space as uv_offset_target_bone -- raw Blender bone
-    # names, matched against the exportable set the same way). A name
-    # that isn't exportable is warned and skipped individually -- it
-    # does NOT cancel the primary target or the other companions (see
-    # sample_action()). Written automatically by 'Create Mouth Atlas'
-    # (rigger/rig.py, _build_mouth_atlas) from the companion bones
-    # configured on the active MOUTH entry -- normally you don't need
-    # to type here by hand.
+    # v0.10.13 -- Companion targets (rigger's "Companion Bones Amount" --
+    # HytaleIKChainItem.texture_picker_extra_bone_1..N in rigger/rig.py). Some
+    # characters have their animated part (mouth, face, etc.) split across
+    # more than one mesh/bone (e.g. mirrored L/R halves meeting in the
+    # middle) that need the SAME expression change at the SAME time --
+    # this field lets the SAME shapeUvOffset delta be written to more
+    # bones besides the primary uv_offset_target_bone. Comma-separated
+    # exact bone names (same name-space as uv_offset_target_bone -- raw
+    # Blender bone names, matched against the exportable set the same
+    # way). A name that isn't exportable is warned and skipped
+    # individually -- it does NOT cancel the primary target or the other
+    # companions (see sample_action()). Written automatically by 'Create
+    # Texture Picker' (rigger/rig.py, _build_texture_picker) from the companion
+    # bones configured on that entry -- normally you don't need to type
+    # here by hand. Companion Bones stay WITHIN this same instance/entry --
+    # they don't need their own list entry, they share this one's
+    # calibration (see step_x/px_x/step_y/px_y below).
     uv_offset_target_bones_extra: StringProperty(
         name="Companion Target Bones (shapeUvOffset)",
         description=(
             "Comma-separated extra bone names that receive the exact same 'shapeUvOffset' data as "
-            "Target Bone above -- for characters whose mouth is split across more than one mesh/bone "
-            "(e.g. mirrored left/right halves) that must change expression together. Usually filled "
-            "automatically by 'Create Mouth Atlas' from the Companion Bones configured on the MOUTH "
+            "Target Bone above -- for characters whose animated part is split across more than one "
+            "mesh/bone (e.g. mirrored left/right halves) that must change expression together. Usually "
+            "filled automatically by 'Create Texture Picker' from the Companion Bones configured on this "
             "entry, not typed here directly"
         ),
         default="",
@@ -220,12 +235,13 @@ class HYTALE_export_bone_settings(PropertyGroup):
     # v0.6.5 -- MOVIDOS de EXPORT_OT_hytale_blockyanim pra cá (eram
     # Property de Operator, não persistiam com o arquivo -- resetavam
     # pro default toda vez que o diálogo de export abria, então o
-    # Rigger (Mouth Atlas, "Create Mouth Atlas") não tinha como
-    # pré-preencher isso de verdade por mais que calculasse os valores
-    # certos). Mesmos nomes/defaults/descriptions de antes -- só troca
-    # de dono, de Operator (sessão) pra PropertyGroup (persistido na
-    # Armature). Ver sample_action(), que já busca esta PropertyGroup
-    # (bone_settings) bem perto de onde sample_uv_offset_px é chamado.
+    # Rigger (Texture Picker, "Create Texture Picker") não tinha como
+    # pré-preencher isso de verdade). v0.12: junto com o resto desta
+    # classe, movidos de novo -- da PointerProperty única (HYTALE_
+    # export_bone_settings) pra este item de CollectionProperty, uma
+    # calibração própria por instância. Ver sample_action(), que agora
+    # itera armature.hytale_texture_picker_exports inteira em vez de ler
+    # um conjunto fixo de campos.
     uv_offset_step_x: FloatProperty(
         name="Grid Step X",
         description=(
@@ -254,21 +270,108 @@ class HYTALE_export_bone_settings(PropertyGroup):
     )
 
 
-def get_export_bone_settings(armature_obj):
+def get_export_settings(armature_obj):
     """Atalho pra armature_obj.data.hytale_export_settings (o painel do
     interface.py lê/escreve o mesmo caminho direto, sem passar por esta
     função -- ela existe só pro lado do exporter.py, que MAIS de um lugar
     neste arquivo precisa ler). Fallback pro próprio default da
     PropertyGroup se, por algum motivo (addon-standalone sem o resto do
     pacote, ordem de registro), a Armature ainda não tiver esse dado --
-    nunca trava o export por causa disso."""
+    nunca trava o export por causa disso.
+
+    v0.12 -- ERA get_export_bone_settings; renomeada porque só devolve
+    export_collection_name agora (os campos de UV Offset saíram daqui,
+    ver get_texture_picker_exports abaixo)."""
     data = getattr(armature_obj, "data", None)
     settings = getattr(data, "hytale_export_settings", None)
     if settings is None:
         # Instância "solta" (não vinculada a nenhuma Armature real) só
         # pra fornecer os defaults -- nunca é lida/gravada de verdade.
-        settings = HYTALE_export_bone_settings()
+        settings = HYTALE_export_settings()
     return settings
+
+
+def get_texture_picker_exports(armature_obj):
+    """Atalho pra armature_obj.data.hytale_texture_picker_exports (a
+    CollectionProperty de HYTALE_texture_picker_export_item -- uma
+    entrada por instância de Texture Picker). Devolve uma lista/coleção
+    vazia (nunca None) se a Armature ainda não tiver esse dado, mesmo
+    espírito de get_export_settings -- chamador não precisa checar None
+    antes de iterar."""
+    data = getattr(armature_obj, "data", None)
+    exports = getattr(data, "hytale_texture_picker_exports", None)
+    return exports if exports is not None else []
+
+
+# ---------------------------------------------------------------------------
+# UIList + Add/Remove pra armature.hytale_texture_picker_exports (aba
+# Export do interface.py) -- mesmo padrão que RIG_UL_hytale_ik_chains/
+# RIG_OT_hytale_ik_chain_add/_remove já usam em rigger/rig.py pra
+# hytale_ik_chains: quem é DONO do dado registra o UIList/operadores
+# aqui, interface.py só desenha via template_list(). Normalmente esta
+# lista é preenchida sozinha por "Create Texture Picker" (rigger/rig.py,
+# _build_texture_picker) -- Add/Remove aqui existem pra ajuste manual
+# (ex.: apontar uma instância pra um bone/armature externo que não passou
+# pelo rigger) e pra sincronizar com "Remove Texture Picker"/"Remove
+# Generated Bones" no lado do rigger.
+# ---------------------------------------------------------------------------
+
+
+class HYTALE_UL_texture_picker_exports(bpy.types.UIList):
+    bl_idname = "HYTALE_UL_texture_picker_exports"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
+        row.label(text=item.uv_offset_target_bone or "(no target bone)", icon="IMAGE_DATA")
+
+
+class EXPORT_OT_texture_picker_export_add(Operator):
+    """Adiciona uma instância vazia à lista (uso manual -- normalmente
+    'Create Texture Picker', no rigger, já adiciona/atualiza a entrada
+    certa sozinho)."""
+
+    bl_idname = "armature.hytale_texture_picker_export_add"
+    bl_label = "Add Texture Picker Export"
+    bl_description = "Add a manual Texture Picker export entry to the list"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == "ARMATURE"
+
+    def execute(self, context):
+        armature = context.active_object.data
+        exports = armature.hytale_texture_picker_exports
+        item = exports.add()
+        item.uv_offset_source_bone = UV_OFFSET_SOURCE_BONE_DEFAULT
+        armature.hytale_texture_picker_exports_index = len(exports) - 1
+        return {"FINISHED"}
+
+
+class EXPORT_OT_texture_picker_export_remove(Operator):
+    """Remove uma instância da lista pelo índice (padrão: a ativa)."""
+
+    bl_idname = "armature.hytale_texture_picker_export_remove"
+    bl_label = "Remove Texture Picker Export"
+    bl_description = "Remove the selected Texture Picker export entry from the list"
+    bl_options = {"REGISTER", "UNDO"}
+
+    index: IntProperty(default=-1)
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == "ARMATURE" and len(obj.data.hytale_texture_picker_exports) > 0
+
+    def execute(self, context):
+        armature = context.active_object.data
+        exports = armature.hytale_texture_picker_exports
+        index = self.index if self.index >= 0 else armature.hytale_texture_picker_exports_index
+        if 0 <= index < len(exports):
+            exports.remove(index)
+            armature.hytale_texture_picker_exports_index = max(0, min(armature.hytale_texture_picker_exports_index, len(exports) - 1))
+        return {"FINISHED"}
 
 
 def exported_bone_name(armature_obj, name):
@@ -333,7 +436,7 @@ def quantize_quaternion(q, step):
 
 
 def sample_uv_offset_px(control_pbone, opts):
-    """Lê a Location (pose, local) do bone de controle (ex.: 'ui.mouth_uv')
+    """Lê a Location (pose, local) do bone de controle (ex.: 'ui.texture_picker')
     e reproduz em Python a MESMA matemática de snap-to-grid que o driver do
     Mapping node do usuário já faz no shader -- só que devolvendo pixels
     crus (o que o .blockyanim espera pro shapeUvOffset), não a fração de UV
@@ -756,8 +859,10 @@ def sample_action(context, obj, action, exportable_names, rest_by_bone, rest_loc
             # mas o campo TEM que existir, mesmo vazio -- a ausência total
             # da chave é a suspeita mais forte pro import falhar dentro do
             # próprio jogo (o parser do Blockbench é tolerante a isso, o
-            # do jogo pode não ser). "shapeUvOffset" É populado quando
-            # Export UV Offset está ligado (ver sample_uv_offset_px).
+            # do jogo pode não ser). "shapeUvOffset" É populado se este
+            # bone for alvo de alguma entrada em hytale_texture_picker_
+            # exports (ver sample_uv_offset_px, e o setup de uv_entries
+            # logo abaixo).
             "shapeVisible": [],
             "shapeUvOffset": [],
         }
@@ -772,55 +877,73 @@ def sample_action(context, obj, action, exportable_names, rest_by_bone, rest_loc
     quat_samples = {name: [] for name in exportable_names}
     scale_samples = {name: [] for name in exportable_names}
 
-    last_sampled_uv = {}
     last_raw_quat = {}
     zero_vec = Vector((0.0, 0.0, 0.0))
     identity_scale = Vector((1.0, 1.0, 1.0))
     identity_quat = Quaternion((1.0, 0.0, 0.0, 0.0))
 
-    bone_settings = get_export_bone_settings(obj)
-
-    uv_control_pbone = None
-    uv_target_bones = []
-    if bone_settings.export_uv_offset:
-        uv_control_pbone = obj.pose.bones.get(bone_settings.uv_offset_source_bone)
-        if uv_control_pbone is None:
+    # v0.12 -- itera armature.hytale_texture_picker_exports inteira (uma
+    # entrada por instância de Texture Picker, ver HYTALE_texture_picker_
+    # export_item em cima) em vez de ler um conjunto fixo de campos de uma
+    # PointerProperty única -- cada instância é resolvida/validada aqui
+    # UMA vez (fora do loop de frames), com seu próprio control bone,
+    # lista de target bones (principal + companions) e estado de dedupe
+    # ("last_sampled"), pra várias instâncias independentes exportarem no
+    # mesmo arquivo sem pisar uma na outra. Uma entrada com problema
+    # (bone de controle ou alvo principal não encontrado) é avisada e
+    # PULADA -- não cancela as outras entradas da lista.
+    #
+    # opts.export_texture_picker (checkbox por exportação, não persiste
+    # com o arquivo -- ver EXPORT_OT_hytale_blockyanim.draw()): lista
+    # VAZIA aqui, sem nem entrar no loop, se estiver desligado -- desliga
+    # 'shapeUvOffset' pra ESTA exportação sem apagar nenhuma instância
+    # configurada (as instâncias em si continuam salvas na Armature).
+    uv_entries = []
+    for uv_item in get_texture_picker_exports(obj) if opts.export_texture_picker else ():
+        control_pbone = obj.pose.bones.get(uv_item.uv_offset_source_bone)
+        if control_pbone is None:
             opts.report(
                 {"WARNING"},
-                f"UV Offset: bone de controle '{bone_settings.uv_offset_source_bone}' não "
-                f"encontrado no Armature -- pulando shapeUvOffset na Action "
-                f"'{action.name}'.",
+                f"Texture Picker: bone de controle '{uv_item.uv_offset_source_bone}' não "
+                f"encontrado no Armature -- pulando esta instância (alvo "
+                f"'{uv_item.uv_offset_target_bone}') na Action '{action.name}'.",
             )
-        elif bone_settings.uv_offset_target_bone not in node_animations:
+            continue
+        if uv_item.uv_offset_target_bone not in node_animations:
             opts.report(
                 {"WARNING"},
-                f"UV Offset: bone alvo '{bone_settings.uv_offset_target_bone}' não está "
-                f"entre os bones exportáveis -- pulando shapeUvOffset na Action "
+                f"Texture Picker: bone alvo '{uv_item.uv_offset_target_bone}' não está "
+                f"entre os bones exportáveis -- pulando esta instância na Action "
                 f"'{action.name}'.",
             )
-            uv_control_pbone = None
-        else:
-            # v0.10.13 -- Companion targets: mesmo delta gravado em mais
-            # de um bone (ver comentário grande em
-            # HYTALE_export_bone_settings.uv_offset_target_bones_extra).
-            # Nome que não é exportável é avisado e IGNORADO individual-
-            # mente -- não cancela o alvo principal nem os outros
-            # companions (diferente do alvo principal, cuja ausência
-            # cancela o canal inteiro, ver elif acima).
-            uv_target_bones = [bone_settings.uv_offset_target_bone]
-            for extra_name in (bone_settings.uv_offset_target_bones_extra or "").split(","):
-                extra_name = extra_name.strip()
-                if not extra_name or extra_name in uv_target_bones:
-                    continue  # vazio, ou duplicado do principal/de outro companion já aceito
-                if extra_name not in node_animations:
-                    opts.report(
-                        {"WARNING"},
-                        f"UV Offset: bone extra '{extra_name}' não está entre os bones "
-                        f"exportáveis -- pulando esse alvo (os outros continuam) na Action "
-                        f"'{action.name}'.",
-                    )
-                    continue
-                uv_target_bones.append(extra_name)
+            continue
+        # v0.10.13 -- Companion targets: mesmo delta gravado em mais de um
+        # bone dentro da MESMA instância (ver comentário grande em
+        # HYTALE_texture_picker_export_item.uv_offset_target_bones_extra).
+        # Nome que não é exportável é avisado e IGNORADO individualmente --
+        # não cancela o alvo principal nem os outros companions DESTA
+        # instância (diferente do alvo principal, cuja ausência cancela a
+        # instância inteira, ver acima).
+        target_bones = [uv_item.uv_offset_target_bone]
+        for extra_name in (uv_item.uv_offset_target_bones_extra or "").split(","):
+            extra_name = extra_name.strip()
+            if not extra_name or extra_name in target_bones:
+                continue  # vazio, ou duplicado do principal/de outro companion já aceito
+            if extra_name not in node_animations:
+                opts.report(
+                    {"WARNING"},
+                    f"Texture Picker: bone extra '{extra_name}' não está entre os bones "
+                    f"exportáveis -- pulando esse alvo (os outros continuam) na Action "
+                    f"'{action.name}'.",
+                )
+                continue
+            target_bones.append(extra_name)
+        uv_entries.append({
+            "control_pbone": control_pbone,
+            "target_bones": target_bones,
+            "settings": uv_item,  # sample_uv_offset_px só lê step_x/px_x/step_y/px_y -- o item já tem esses 4 campos
+            "last_sampled": None,  # dedupe é POR INSTÂNCIA agora -- cada uma tem seu próprio último valor amostrado
+        })
 
     for frame in frames:
         is_edge_frame = frame == frames[0] or frame == frames[-1]
@@ -919,12 +1042,19 @@ def sample_action(context, obj, action, exportable_names, rest_by_bone, rest_loc
             if opts.export_scale:
                 scale_samples[name].append((hytale_time, scale))
 
-        if uv_control_pbone is not None:
-            # v0.6.5 -- 'bone_settings' (não 'opts'/self do Operator):
-            # os 4 campos de calibração moraram no Operator antes, agora
-            # moram aqui (persistido na Armature) -- ver
-            # HYTALE_export_bone_settings.
-            px_x, px_y = sample_uv_offset_px(uv_control_pbone, bone_settings)
+        # v0.12 -- itera TODAS as instâncias resolvidas (uv_entries, ver
+        # setup acima) -- cada uma lê seu PRÓPRIO control_pbone e escreve
+        # no(s) seu(s) PRÓPRIO(s) target_bones, com dedupe independente
+        # (uv_entry["last_sampled"]) por instância. Antes (v0.11 e antes)
+        # só existia UMA instância possível por armature, então isso era
+        # um bloco único fora de loop -- ver DEVELOPER_NOTES.md.
+        for uv_entry in uv_entries:
+            # v0.6.5 -- 'settings' (não 'opts'/self do Operator): os 4
+            # campos de calibração moraram no Operator antes, depois
+            # numa PointerProperty única na Armature; agora moram no
+            # item da CollectionProperty desta instância -- ver
+            # HYTALE_texture_picker_export_item.
+            px_x, px_y = sample_uv_offset_px(uv_entry["control_pbone"], uv_entry["settings"])
 
             # Dedupe por igualdade EXATA (não por epsilon/RDP) -- o valor
             # já é discreto (snap-to-grid), então dois frames iguais em
@@ -934,18 +1064,24 @@ def sample_action(context, obj, action, exportable_names, rest_by_bone, rest_loc
             # sentido pra um offset de atlas em degraus -- por isso esse
             # canal continua com seu próprio dedupe simples, independente.
             #
-            # v0.10.13 -- dedupe agora é UM valor só (não mais por bone
-            # alvo): todo bone em uv_target_bones lê do MESMO
-            # uv_control_pbone, então o valor amostrado é idêntico pra
-            # todos no mesmo frame -- se não mudou pro principal, não
-            # mudou pra nenhum companion também, não faz sentido rastrear
-            # por bone.
+            # v0.10.13 -- dedupe é UM valor só por instância (não por bone
+            # alvo dentro dela): todo bone em target_bones desta instância
+            # lê do MESMO control_pbone, então o valor amostrado é
+            # idêntico pra todos no mesmo frame -- se não mudou pro
+            # principal, não mudou pra nenhum companion dele também, não
+            # faz sentido rastrear por bone. v0.12: o dedupe em si passou
+            # a viver DENTRO do dict de cada uv_entry (uv_entry[
+            # "last_sampled"]) em vez de um dict global só -- cada
+            # instância tem sua própria "última amostra", senão a
+            # instância B "roubaria" o dedupe da instância A no mesmo
+            # frame (bug ficaria: mudar só a boca não escreveria o
+            # primeiro frame da mão se os dois valores calharem iguais).
             write_uv = True
-            if not is_edge_frame and last_sampled_uv.get("_shared") == (px_x, px_y):
+            if not is_edge_frame and uv_entry["last_sampled"] == (px_x, px_y):
                 write_uv = False
-            last_sampled_uv["_shared"] = (px_x, px_y)
+            uv_entry["last_sampled"] = (px_x, px_y)
             if write_uv:
-                for target_name in uv_target_bones:
+                for target_name in uv_entry["target_bones"]:
                     node_animations[target_name]["shapeUvOffset"].append(
                         {
                             "time": hytale_time,
@@ -1194,10 +1330,27 @@ class EXPORT_OT_hytale_blockyanim(Operator):
 
     show_optimization: BoolProperty(name="Optimization", default=False)
     show_stretch: BoolProperty(name="Stretch Animation", default=False)
-    show_uv: BoolProperty(name="Mouth / UV Animation", default=False)
+    show_uv: BoolProperty(name="Texture Picker", default=False)
     show_rig: BoolProperty(name="Rig Setup", default=False)
     show_format: BoolProperty(name="File Format", default=False)
     show_reexport: BoolProperty(name="Re-Export", default=False)
+    # v0.12.2 -- checkbox por exportação (não persiste com o arquivo --
+    # mesmo espírito de 'Bake Parent Scale into Children' dentro de
+    # Stretch Animation). Fica DENTRO da caixa colapsável show_uv (ver
+    # draw()) -- configurar as instâncias em si fica na aba Export do
+    # Object Properties; este liga/desliga só decide se ESTA exportação
+    # inclui shapeUvOffset ou não, sem apagar nenhuma instância.
+    export_texture_picker: BoolProperty(
+        name="Export Texture Picker",
+        description=(
+            "Include 'shapeUvOffset' data for every configured Texture "
+            "Picker instance (see the 'Hytale Export' panel in Object "
+            "Properties to add/edit/remove instances). Turn off to skip "
+            "this channel for this export only, without deleting any "
+            "configured instance"
+        ),
+        default=True,
+    )
 
     # ---------------- Avançado (cada categoria colapsa por conta própria,
     # ver draw() -- não existe mais um "Advanced Options" único envolvendo
@@ -1387,9 +1540,12 @@ class EXPORT_OT_hytale_blockyanim(Operator):
     # HYTALE_export_bone_settings (persistido na Armature) -- eram
     # Property de Operator aqui, resetavam pro default toda vez que
     # este diálogo abria (não persistiam com o arquivo), o que
-    # impedia o Rigger (Mouth Atlas) de pré-preencher isso de verdade.
-    # draw()/sample_action() abaixo agora leem/escrevem via
-    # get_export_bone_settings(obj) em vez de 'self'.
+    # impedia o Rigger (Texture Picker) de pré-preencher isso de verdade.
+    # v0.12 -- moveram de novo, agora pra HYTALE_texture_picker_export_item
+    # (uma calibração por INSTÂNCIA, dentro de armature.hytale_texture_
+    # picker_exports). draw() abaixo mostra os 4 campos da entrada ATIVA
+    # da lista (hytale_texture_picker_exports_index); sample_action() já
+    # itera a lista inteira sozinho.
 
     unit_scale: FloatProperty(
         name="Blender Units per Game Unit",
@@ -1550,37 +1706,48 @@ class EXPORT_OT_hytale_blockyanim(Operator):
             scale_col.prop(self, "scale_zero_epsilon")
             scale_col.prop(self, "bake_scale_hierarchy")
 
+        # v0.12 -- CORRIGIDO (feedback do usuário, testando o painel de
+        # verdade): antes esta seção era uma caixa colapsável mostrando
+        # os 4 campos de calibração da entrada ATIVA de armature.hytale_
+        # texture_picker_exports (por índice) -- com múltiplas instâncias
+        # isso ficou confuso (o usuário não tem como saber, só olhando
+        # este diálogo, qual instância está "ativa" sem ir conferir a
+        # aba Export do Object Properties antes). Os 4 campos (Grid
+        # Step/Pixels per Step) MUDARAM de lugar -- moraram aqui (v0.6.5),
+        # depois em HYTALE_export_bone_settings persistido na Armature
+        # (v0.10.10), agora vivem 100% na aba Export do Object
+        # Properties (interface.py), junto com o resto dos campos de
+        # CADA instância (Source/Target/Companion Bones) -- um lugar só
+        # por instância, sem ambiguidade de "qual está selecionada".
+        #
+        # v0.12.2 -- CORRIGIDO de novo (feedback do usuário, mesma
+        # sessão): a primeira tentativa de correção acima trocou a
+        # caixa colapsável por um único checkbox solto -- destoava
+        # visualmente do resto do diálogo (Optimization/Stretch
+        # Animation/Rig Setup/File Format/Re-Export são TODAS caixas
+        # colapsáveis, um checkbox solto no meio delas quebrava o
+        # padrão). Voltou a ser colapsável (mesma estrutura exata das
+        # outras -- layout.prop com TRIA_DOWN/TRIA_RIGHT + box()), só
+        # que o conteúdo de dentro ficou simples: o checkbox por
+        # exportação (mesmo espírito de 'Bake Parent Scale into
+        # Children' dentro de Stretch Animation acima) + um label
+        # pequeno com a contagem, em vez da contagem ir dentro do
+        # texto do próprio checkbox.
         layout.prop(
             self, "show_uv",
             icon="TRIA_DOWN" if self.show_uv else "TRIA_RIGHT",
             emboss=False,
         )
         if self.show_uv:
-            # v0.6.5 -- os 4 campos de calibração (Grid Step/Pixels per
-            # Step) AGORA vivem em HYTALE_export_bone_settings
-            # (persistido na Armature, igual export_uv_offset/
-            # uv_offset_source_bone/_target_bone) -- não mais Property
-            # deste Operator. Por isso lê/escreve via
-            # get_export_bone_settings(obj) em vez de 'self' -- e por
-            # isso PRECISA da Armature ativa aqui (igual invoke() já
-            # faz); sem Armature ativa não tem onde gravar, só mostra
-            # aviso.
-            obj = context.active_object
-            bone_settings = get_export_bone_settings(obj) if obj is not None and obj.type == "ARMATURE" else None
             uv_box = layout.box()
-            uv_box.label(
-                text="Turn on/pick bones in the 'Hytale Export' panel (Object Properties)",
-                icon="INFO",
+            configured_count = (
+                len(get_texture_picker_exports(context.active_object))
+                if context.active_object is not None and context.active_object.type == "ARMATURE"
+                else 0
             )
-            if bone_settings is None:
-                uv_box.label(text="No Armature active -- can't edit grid calibration.", icon="ERROR")
-            else:
-                uv_row1 = uv_box.row(align=True)
-                uv_row1.prop(bone_settings, "uv_offset_step_x")
-                uv_row1.prop(bone_settings, "uv_offset_px_x")
-                uv_row2 = uv_box.row(align=True)
-                uv_row2.prop(bone_settings, "uv_offset_step_y")
-                uv_row2.prop(bone_settings, "uv_offset_px_y")
+            uv_box.prop(self, "export_texture_picker")
+            count_row = uv_box.row()
+            count_row.label(text=f"{configured_count} instance(s) configured.")
 
         layout.prop(
             self, "show_rig",
@@ -1628,8 +1795,8 @@ class EXPORT_OT_hytale_blockyanim(Operator):
             return {"CANCELLED"}
         os.makedirs(self.directory, exist_ok=True)
 
-        bone_settings = get_export_bone_settings(obj)
-        collection_name = bone_settings.export_collection_name
+        export_settings = get_export_settings(obj)
+        collection_name = export_settings.export_collection_name
 
         collection_names = bones_in_collection(obj, collection_name)
         if collection_names is not None:
@@ -1737,7 +1904,11 @@ def menu_func_export(self, context):
 
 
 classes = (
-    HYTALE_export_bone_settings,
+    HYTALE_export_settings,
+    HYTALE_texture_picker_export_item,
+    HYTALE_UL_texture_picker_exports,
+    EXPORT_OT_texture_picker_export_add,
+    EXPORT_OT_texture_picker_export_remove,
     HYTALE_action_export_item,
     HYTALE_UL_action_export_list,
     HYTALE_OT_select_all_actions,
@@ -1748,12 +1919,20 @@ classes = (
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-    Armature.hytale_export_settings = PointerProperty(type=HYTALE_export_bone_settings)
+    Armature.hytale_export_settings = PointerProperty(type=HYTALE_export_settings)
+    # v0.12 -- CollectionProperty (uma entrada por instância de Texture
+    # Picker) + índice do item ativo -- mesmo padrão de
+    # Armature.hytale_ik_chains/_index em rigger/rig.py. Ver
+    # HYTALE_texture_picker_export_item e get_texture_picker_exports.
+    Armature.hytale_texture_picker_exports = CollectionProperty(type=HYTALE_texture_picker_export_item)
+    Armature.hytale_texture_picker_exports_index = IntProperty(default=0)
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
 
 
 def unregister():
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
+    del Armature.hytale_texture_picker_exports_index
+    del Armature.hytale_texture_picker_exports
     del Armature.hytale_export_settings
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

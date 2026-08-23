@@ -58,9 +58,9 @@ TRANSLATIONS = {
     "panel.hint_export_none": "Selecione/ative uma Armature para exportar",
     "panel.hint_export_target": "Exportando de:",
     "panel.export_settings_box": "Configurações de Export",
-    "panel.mouth_animation": "Animação da Boca",
+    "panel.export_texture_picker": "Texture Picker",
     "panel.export_collection": "Coleção de Export",
-    "panel.mouth_bone": "Bone da Boca",
+    "panel.texture_picker_target_bone": "Bone Alvo",
 
     # -----------------------------------------------------------------
     # interface.py -- N-Panel, aba Rig
@@ -98,6 +98,6 @@ TRANSLATIONS = {
     # interface.py -- avisos reaproveitados em mais de uma aba
     # -----------------------------------------------------------------
     "panel.warn_anim_experimental": "Experimental",
-    "panel.warn_mouth_wip_short": "WIP",
+    "panel.warn_texture_picker_wip_short": "WIP",
     "panel.warn_rig_experimental": "Geração de rig é experimental",
 }
