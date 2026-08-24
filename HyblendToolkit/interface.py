@@ -40,9 +40,11 @@ from .importer import IMPORT_OT_hytale_blockymodel, IMPORT_OT_hytale_bbmodel
 from .anim_importer import IMPORT_OT_hytale_blockyanim
 from .anim_tools import (
     ANIM_OT_hytale_set_fk_ik,
+    ANIM_OT_hytale_set_head_follow,
     ANIM_OT_hytale_snap_selected,
     ANIM_OT_hytale_toggle_collection_visibility,
     get_fk_ik_state,
+    get_head_follow_state,
 )
 from .common import HYTALE_OT_pick_bone_into_field
 from .translations import get_language, tr
@@ -666,6 +668,17 @@ class HYTALE_PT_main(Panel):
                     picker_row("head_bone", tr("panel.field_head_bone", lang))
                     picker_row("head_end_bone", tr("panel.field_head_end_bone", lang))
                     col.label(text=tr("panel.hint_head_no_ik", lang), icon="INFO")
+                    # v0.13.4 -- "Head Free/Lock" (era "Continuous Chain"
+                    # até v0.13.3, removido daqui -- ver comentário em
+                    # HytaleIKChainItem.continuous_chain, rigger/rig.py).
+                    # Um toggle só: redireciona sozinho o Tail do
+                    # predecessor imediato de "Head" (Neck ou Chest, o
+                    # que existir) pro Head do Head_CTRL, reparenta pro
+                    # Origin_CTRL, e monta os constraints de Child
+                    # Of/Copy Location -- sem precisar configurar nada
+                    # em outra entrada.
+                    col.separator()
+                    col.prop(item, "head_follow_enabled", text=tr("panel.field_head_follow_enabled", lang))
                     col.separator()
                     col.prop(item, "collection_override", text=tr("panel.field_collection", lang))
                 elif item.chain_type == "SPINE":
@@ -683,6 +696,11 @@ class HYTALE_PT_main(Panel):
                     for field_name, label_key in list(zip(spine_fields, spine_labels))[: max(0, item.spine_count - 1)]:
                         picker_row(field_name, tr(label_key, lang))
                     col.label(text=tr("panel.hint_spine_no_ik", lang), icon="INFO")
+                    # v0.13.4 -- "Continuous Chain" removido daqui (era
+                    # exibido aqui até v0.13.3) -- ver comentário em
+                    # HytaleIKChainItem.continuous_chain, rigger/rig.py.
+                    # A Spine não tem mais nenhuma opção equivalente a
+                    # "Head Free/Lock" (só faz sentido pra Head hoje).
                     col.separator()
                     col.prop(item, "collection_override", text=tr("panel.field_collection", lang))
                 elif item.chain_type == "ATTACHMENTS":
@@ -1302,6 +1320,31 @@ class HYTALE_PT_main(Panel):
             op_ik.mode = "IK"
         if not any_chain_found:
             fkik_box.label(text=tr("panel.hint_anim_no_fkik", lang), icon="INFO")
+
+        # --- Head Free/Lock -------------------------------------------
+        # v0.13.5 -- mesmo espírito da box FK/IK acima, só que UM switch
+        # SÓ (não por índice de cadeia -- só existe UM Head_CTRL no rig
+        # inteiro). get_head_follow_state (anim_tools.py) devolve None
+        # quando "Head Free/Lock" (HytaleIKChainItem.head_follow_enabled,
+        # painel Bone Settings) nunca foi ligado em nenhuma entrada HEAD,
+        # ou o rig nunca foi gerado -- a box inteira nem aparece nesse
+        # caso (nada pra trocar), só o hint. Nenhum "Snap" equivalente
+        # ao FK/IK (não pedido, e não haveria "lado oposto" pra igualar
+        # do mesmo jeito -- ver docstring do módulo em anim_tools.py).
+        head_follow_state = get_head_follow_state(obj)
+        if head_follow_state is not None:
+            layout.separator()
+            head_follow_box = layout.box()
+            head_follow_box.label(text=tr("panel.anim_head_follow_box", lang), icon="CON_CHILDOF")
+            row = head_follow_box.row(align=True)
+            op_free = row.operator(
+                ANIM_OT_hytale_set_head_follow.bl_idname, text="Free", depress=(head_follow_state == 0)
+            )
+            op_free.mode = "FREE"
+            op_lock = row.operator(
+                ANIM_OT_hytale_set_head_follow.bl_idname, text="Lock", depress=(head_follow_state == 1)
+            )
+            op_lock.mode = "LOCK"
 
 
 def register():

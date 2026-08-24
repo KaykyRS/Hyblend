@@ -55,12 +55,15 @@ from ..templates import (
 # o Snap teria sua própria cópia da lógica de "andar pela hierarquia
 # ORG", podendo divergir do que o rig realmente gerado tem.
 #
-# SUFFIX_IK_MCH entrou pelo mesmo motivo (FK/IK Snap): o bone `_IK` da
-# PONTA de uma cadeia (ex. Hand_IK) tem uma rest orientation DIFERENTE
-# do bridge `_IK_MCH` correspondente (ver _build_ik_layer -- o `_IK` da
-# ponta é reorientado, o bridge não), então o Snap precisa ler
-# `bones[nome + SUFFIX_IK_MCH].matrix_local` pra calcular esse offset e
-# compensar -- sem isso, a rotação da ponta sai torta ao trocar pra IK.
+# SUFFIX_MCH_IK_TRANSFER entrou pelo mesmo motivo (FK/IK Snap): o bone
+# `_IK` da PONTA de uma cadeia (ex. Hand_IK) tem uma rest orientation
+# DIFERENTE do bridge `_MCH_IK_Transfer` correspondente (ver
+# _build_ik_layer -- o `_IK` da ponta é reorientado, o bridge não),
+# então o Snap precisa ler
+# `bones[nome + SUFFIX_MCH_IK_TRANSFER].matrix_local` pra calcular esse
+# offset e compensar -- sem isso, a rotação da ponta sai torta ao trocar
+# pra IK. v0.13: renomeado de SUFFIX_IK_MCH -- anim_tools.py precisa
+# trocar o import/uso pro nome novo.
 #
 # CONSTRAINT_CHILD_OF_LOCAL/GLOBAL entraram junto, mesmo motivo: tanto
 # o pole target quanto o ik_tip têm uma Child Of ATIVA por padrão (ver
@@ -69,6 +72,12 @@ from ..templates import (
 # rodando de novo em cima do canal recém-escrito); o Snap precisa
 # desativar a constraint pelo NOME antes de escrever a matrix, e
 # reativar depois -- ver anim_tools.py.
+#
+# PROP_HEAD_FOLLOW_SWITCH entrou na v0.13.5 pro mesmo motivo de
+# PROP_FK_IK_SWITCH: anim_tools.py (aba Animation) precisa ler/escrever
+# a custom property de "Head Free/Lock" (ver HytaleIKChainItem.
+# head_follow_enabled/_build_head_follow em rig.py) sem duplicar o
+# nome dela na mão.
 # ---------------------------------------------------------------------------
 from .constants import (  # noqa: F401
     BONE_PROPERTIES,
@@ -77,13 +86,14 @@ from .constants import (  # noqa: F401
     CONSTRAINT_CHILD_OF_GLOBAL,
     CONSTRAINT_CHILD_OF_LOCAL,
     PROP_FK_IK_SWITCH,
+    PROP_HEAD_FOLLOW_SWITCH,
     PROP_RIG_LAYER,
     SUFFIX_CTRL,
     SUFFIX_IK,
-    SUFFIX_IK_MCH,
     SUFFIX_MCH,
+    SUFFIX_MCH_IK_TRANSFER,
+    SUFFIX_MCH_TRANSFER,
     SUFFIX_POLE,
-    SUFFIX_TAIL,
 )
 from .rig import (  # noqa: F401
     HytaleBoneCollectionItem,

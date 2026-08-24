@@ -95,8 +95,8 @@ from .rigger import (
     SUFFIX_CTRL,
     SUFFIX_IK,
     SUFFIX_MCH,
+    SUFFIX_MCH_TRANSFER,
     SUFFIX_POLE,
-    SUFFIX_TAIL,
 )
 
 # ---------------------------------------------------------------------------
@@ -890,6 +890,20 @@ def _resolve_parent_world(parent, world_target, rest_cache, pose_bones):
          se acumulando bone a bone -- é exatamente por isso que só
          corrigir a equação de CADA bone individualmente (a versão
          anterior desta função) não bastava.
+         v0.13 (rigger.py): o bridge deixou de ser exclusivo da cadeia
+         Tail (`_Tail`, SUFFIX_TAIL) -- rigger.py agora cria um bridge
+         `_MCH_Transfer` (SUFFIX_MCH_TRANSFER) pra TODO `_CTRL`, e é ELE
+         (não mais o `_CTRL` direto) que FK_CopyRotation/_Scale/_Location
+         (em MCH) miram, em World Space. A correção abaixo, portanto,
+         passou a ser buscada pra QUALQUER `_CTRL`, não só o de uma
+         cadeia Tail -- mas o resultado numérico não muda pra ninguém
+         além da Tail: pra um `_CTRL` "normal" (rest igual ao ORG/MCH,
+         igual sempre foi), `bridge_rest` (rest do bridge RELATIVA ao
+         `_CTRL`, seu parent real) dá Identity, e a correção
+         `@ bridge_rest.inverted()` vira um no-op -- a fórmula se reduz
+         sozinha ao caso sem bridge. Só onde a rest do `_CTRL` foi
+         desviada da rest do bridge (hoje, só a Tail -- ver
+         _build_tail_layer) o termo extra faz diferença de verdade.
       2) Parent termina em SUFFIX_MCH (idem, sem essa correção -- MCH
          nunca é escrito diretamente por este importador, converge pro
          world_target via constraint em tempo de execução, não por um
@@ -911,7 +925,7 @@ def _resolve_parent_world(parent, world_target, rest_cache, pose_bones):
             if org_name in world_target:
                 target = world_target[org_name]
                 if suffix == SUFFIX_CTRL:
-                    bridge_pbone = pose_bones.get(org_name + SUFFIX_TAIL)
+                    bridge_pbone = pose_bones.get(org_name + SUFFIX_MCH_TRANSFER)
                     if bridge_pbone is not None:
                         bridge_rest = _get_rest_local(bridge_pbone, rest_cache)
                         return target @ bridge_rest.inverted()
@@ -934,15 +948,16 @@ def _resolve_matrix_basis(pbone, world_matrix, world_target, rest_cache, pose_bo
 def _resolve_ctrl_matrix_basis(ctrl_pbone, org_name, world_matrix, world_target, rest_cache, pose_bones):
     """Wrapper de _resolve_matrix_basis pra um bone `_CTRL` -- igual à
     versão genérica na grande maioria dos casos, EXCETO quando esse
-    `_CTRL` tem um bridge `_Tail` como filho de verdade (rigger.py,
-    HytaleIKChainItem.chain_type == 'TAIL', ver _build_tail_layer): nesse
-    caso, o rest do `_CTRL` foi deliberadamente desviado do rest do ORG
-    (redirecionado pro head do próximo segmento da cauda -- ver
-    SUFFIX_TAIL/_build_tail_layer, rigger.py), e é o BRIDGE quem
-    realmente precisa bater com a pose-alvo (é ele que o MCH copia, não
-    o `_CTRL` -- ver _build_tail_pose_constraints, rigger.py). Mesmo
-    princípio exato de _resolve_ik_tip_matrix_basis (mesmo comentário:
-    "aquela fórmula assume implicitamente que a rest do bone bate com a
+    `_CTRL` tem um bridge `_MCH_Transfer` como filho de verdade
+    (rigger.py -- v0.13, ver _build_edit_bones/_build_pose_constraints,
+    e _build_tail_layer pro caso específico da Tail): nesse caso, se a
+    rest do `_CTRL` foi desviada da rest do bridge (hoje, só acontece na
+    cadeia Tail -- redirecionada pro head do próximo segmento da cauda,
+    ver _build_tail_layer, rigger.py), é o BRIDGE quem realmente precisa
+    bater com a pose-alvo (é ele que o MCH copia agora, não o `_CTRL`
+    direto -- ver _build_pose_constraints, rigger.py). Mesmo princípio
+    exato de _resolve_ik_tip_matrix_basis (mesmo comentário: "aquela
+    fórmula assume implicitamente que a rest do bone bate com a
     orientação do que ele representa visualmente, o que não é verdade
     aqui") -- só que aqui o bone com a rest "correta" (a do ORG) é um
     FILHO do bone que estamos escrevendo, não o próprio.
@@ -957,14 +972,19 @@ def _resolve_ctrl_matrix_basis(ctrl_pbone, org_name, world_matrix, world_target,
                         @ rest_local(bridge)⁻¹
 
     Que é EXATAMENTE a fórmula genérica de _resolve_matrix_basis com um
-    "@ rest_local(bridge)⁻¹" a mais no final -- faz sentido: sem bridge
-    nenhum (a maioria dos `_CTRL` do rig), essa correção não existe e as
-    duas fórmulas são a mesma coisa. IMPORTANTE: como esse `_CTRL` mesmo
-    NÃO fica em `world_matrix` (só o bridge fica), qualquer FILHO deste
-    `_CTRL` (o próximo segmento da cauda) precisa saber disso também ao
-    calcular SUA PRÓPRIA referência de pai -- ver a mesma correção
-    espelhada em _resolve_parent_world."""
-    bridge_pbone = pose_bones.get(org_name + SUFFIX_TAIL)
+    "@ rest_local(bridge)⁻¹" a mais no final. v0.13: TODO `_CTRL` agora
+    tem um bridge (não só Tail) -- mas isso não muda o resultado pra
+    ninguém além da Tail: `rest_local(bridge)` é relativa ao PRÓPRIO
+    `_CTRL` (seu parent real), então pra um `_CTRL` "normal" (rest igual
+    a ORG/MCH/bridge, igual sempre foi) esse termo dá Identity e a
+    correção vira no-op -- a fórmula se reduz sozinha à genérica. Só a
+    Tail (rest do `_CTRL` de fato desviada) usa a correção de verdade.
+    IMPORTANTE: como esse `_CTRL` mesmo NÃO fica em `world_matrix` (só o
+    bridge fica) NOS CASOS ONDE A REST DIVERGE (Tail), qualquer FILHO
+    deste `_CTRL` (o próximo segmento da cauda) precisa saber disso
+    também ao calcular SUA PRÓPRIA referência de pai -- ver a mesma
+    correção espelhada em _resolve_parent_world."""
+    bridge_pbone = pose_bones.get(org_name + SUFFIX_MCH_TRANSFER)
     if bridge_pbone is None:
         return _resolve_matrix_basis(ctrl_pbone, world_matrix, world_target, rest_cache, pose_bones)
     ctrl_rest = _get_rest_local(ctrl_pbone, rest_cache)

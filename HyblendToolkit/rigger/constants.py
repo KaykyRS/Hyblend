@@ -22,15 +22,18 @@ COLL_INTERNAL = "Internal"
 COLL_ORG = "ORG"
 COLL_MCH = "MCH"
 # v0.7: renomeada de "MCH-IK" pra "Specials" -- deixou de guardar só os
-# bridges _IK_MCH da cadeia de IK, também guarda os bridges _Tail da
-# cadeia de Tail (ver _build_tail_layer) -- os dois são o mesmo tipo de
+# bridges _MCH_IK_Transfer da cadeia de IK, também guarda os bridges
+# genéricos _MCH_Transfer (ver SUFFIX_MCH_TRANSFER em cima, e
+# _build_edit_bones/_build_tail_layer) -- os dois são o mesmo tipo de
 # coisa (bone "de mecanismo", só existe pra dar uma rest orientation
 # "limpa" pra outro bone copiar, nunca selecionado/posado por quem
 # anima), então dividem a MESMA bone collection interna/oculta em vez de
-# cada cadeia ganhar uma própria. O valor da custom property
+# cada tipo ganhar uma própria. O valor da custom property
 # PROP_RIG_LAYER continua "MCH-IK" pros bridges de IK (não mexi nisso --
-# é dado interno, independente do nome de exibição da collection) e
-# "TAIL" pros bridges de Tail (ver is_excluded_from_main_collections).
+# é dado interno, independente do nome de exibição da collection, e
+# independente do rename do sufixo em si) e agora "MCH-TRANSFER" pro
+# bridge genérico (v0.13 -- substituiu "TAIL", que só existia pro extinto
+# bridge dedicado da cadeia Tail; ver is_excluded_from_main_collections).
 COLL_MCH_IK = "Specials"
 COLL_CTRL = "CTRL"
 COLL_CTRL_IK = "CTRL-IK"
@@ -59,7 +62,7 @@ COLL_MAIN_ARM_R = "Arm R"
 COLL_MAIN_LEG_L = "Leg L"
 COLL_MAIN_LEG_R = "Leg R"
 COLL_MAIN_ROOT = "Root"
-COLL_MAIN_TAIL = "Tail"  # v0.7 -- bones _Tail (ver SUFFIX_TAIL), sempre visível (mesmo espírito de Arm/Leg/etc.)
+COLL_MAIN_TAIL = "Tail"  # v0.7 -- bones _CTRL de uma cadeia Tail (ver HytaleIKChainItem.chain_type == "TAIL"), sempre visível (mesmo espírito de Arm/Leg/etc.)
 COLL_MAIN_TEXTURE_PICKER = "Texture Picker"  # v0.10 -- chain_type MOUTH, renomeado TEXTURE_PICKER na v0.11 (Texture Picker), mesmo espírito organizacional de COLL_MAIN_HEAD/SPINE
 
 # Todo nome de bone collection que o PRÓPRIO "Create Rig" já cria/
@@ -81,14 +84,50 @@ RESERVED_MAIN_COLLECTION_NAMES = {
 # passou a ser a fonte da verdade pro exporter.py (antes cada lado tinha
 # a própria cópia -- rigger.py com estes literais, exporter.py com
 # CONTROL_SUFFIXES -- e só concordavam "por acaso"; ver DEVELOPER_NOTES.md,
-# "Duplicação solta pra ficar de olho"). SUFFIX_IK_MCH e SUFFIX_POLE
-# CONTINUAM só aqui -- não são usados por mais ninguém fora do rigger,
-# não precisam ir pra common.py (regra prática: common.py só compartilha
-# o que realmente precisa ser idêntico dos dois lados).
+# "Duplicação solta pra ficar de olho"). SUFFIX_MCH_IK_TRANSFER e
+# SUFFIX_POLE CONTINUAM só aqui -- não são usados por mais ninguém fora
+# do rigger (bom, quase -- ver nota abaixo), não precisam ir pra
+# common.py (regra prática: common.py só compartilha o que realmente
+# precisa ser idêntico dos dois lados).
 from ..common import SUFFIX_CTRL, SUFFIX_IK, SUFFIX_MCH
 
-SUFFIX_IK_MCH = "_IK_MCH"  # bone-ponte por segmento, parentado ao _IK do mesmo segmento
+# v0.13 (Bridge genérico -- "MCH_Transfer"): RENOMEADO de SUFFIX_IK_MCH
+# ("_IK_MCH") pra bater com a convenção nova do bridge genérico logo
+# abaixo (SUFFIX_MCH_TRANSFER) -- mesma coisa de sempre, só nome novo:
+# bone-ponte por segmento da cadeia de IK, parent REAL (não constraint)
+# no `_IK` do mesmo segmento, rest = a do MCH/ORG original, intocada --
+# ver _build_ik_layer. RENOMEADO SEM MIGRAÇÃO (decisão consciente do
+# usuário, mesmo espírito de MOUTH -> TEXTURE_PICKER, ver
+# DEVELOPER_NOTES.md): rigs já gerados ficam com bones órfãos
+# "_IK_MCH" até "Remove Generated Bones"/regenerar -- não tem mais
+# nenhum código lendo esse nome antigo. IMPORTANTE: reexportado por
+# rigger/__init__.py -- anim_tools.py (FK/IK Snap) importa este nome de
+# lá; qualquer rename aqui precisa ser refletido nos dois.
+SUFFIX_MCH_IK_TRANSFER = "_MCH_IK_Transfer"
 SUFFIX_POLE = "_Pole_CTRL"
+
+# v0.13 -- bridge GENÉRICO, mesmo princípio exato de SUFFIX_MCH_IK_TRANSFER
+# acima, generalizado pra TODO bone `_CTRL` "normal" criado pelo loop
+# genérico org -> _CTRL em _build_edit_bones (incluindo os que também
+# fazem parte de uma cadeia IK ou Tail -- eles ganham ESTE bridge além
+# do próprio, ver acima/abaixo). Também SUBSTITUI o extinto
+# SUFFIX_TAIL/"_Tail" (mesma função, mesmo mecanismo -- ver
+# _build_tail_layer, que agora reaproveita este bridge em vez de criar
+# o próprio).
+#
+# Motivo de existir: o `_CTRL` é o bone que uma feature futura vai
+# poder reposicionar livremente (Head no Tail do bone pai, por exemplo)
+# -- mas FK_CopyRotation/_Scale/_Location (em MCH, World Space) precisam
+# de uma rest "limpa" (a mesma do MCH/ORG original) pra não sair torto:
+# constraint em World Space IGNORA a rest própria de quem ele copia, só
+# copia a transform absoluta -- se a rest do alvo mudar, a rest NOVA
+# vaza pro MCH como se fosse pose. Parentesco REAL (Blender) não tem
+# esse problema -- a rest do FILHO (aqui, o bridge) sempre vale como
+# baseline própria dele, e só a DELTA de pose do pai é herdada por cima
+# -- por isso o bridge existe: rest = ORG original, intocada, filho
+# real do `_CTRL` (que pode ter a rest que for). O MCH copia do
+# bridge (não mais do `_CTRL` direto) -- ver _build_pose_constraints.
+SUFFIX_MCH_TRANSFER = "_MCH_Transfer"
 
 # v0.8: bone puramente visual (nunca posável -- hide_select=True),
 # parentado DIRETO no bone de referência do pole (pole_ref, o mesmo
@@ -102,17 +141,17 @@ SUFFIX_POLE = "_Pole_CTRL"
 # faz o resto sozinho, sem nenhuma custom property nem driver.
 SUFFIX_POLE_LINE = "_Pole_Line"
 
-# v0.7: bone-ponte por segmento de uma cadeia TAIL (ver HytaleIKChainItem.
-# chain_type e _build_tail_layer) -- MESMO princípio do bridge _IK_MCH:
-# mantém a rest orientation "real" (a do ORG original, intocada) separada
-# do bone que o usuário efetivamente anima (aqui, o próprio _CTRL -- não
-# um bone à parte). É o _CTRL da cauda que recebe o redirect de tail
-# (aponta pro head do próximo segmento) pra formar a cadeia sempre
-# conectada (use_connect=True) que addons de física esperam; o `_Tail`
-# só existe pra dar ao MCH uma fonte de rotação/escala/posição com rest
-# "limpa" (sem o redirect), do mesmo jeito que o `_IK_MCH` existe pro MCH
-# de uma cadeia de IK (ver _build_tail_pose_constraints).
-SUFFIX_TAIL = "_Tail"
+# v0.7 -- v0.13: SUFFIX_TAIL ("_Tail") existia aqui como o bridge
+# DEDICADO de uma cadeia TAIL (mesmo princípio do bridge de IK, ver
+# SUFFIX_MCH_TRANSFER acima). Na v0.13, retirado -- Tail passou a
+# reaproveitar o bridge GENÉRICO (SUFFIX_MCH_TRANSFER), que já existe
+# pra todo `_CTRL` de qualquer forma, em vez de criar um bridge próprio
+# redundante. RETIRADO SEM MIGRAÇÃO (mesma decisão de SUFFIX_MCH_IK_TRANSFER,
+# acima): rigs já gerados ficam com bones órfãos "_Tail" até "Remove
+# Generated Bones"/regenerar. anim_importer.py também consumia este
+# nome (via rigger/__init__.py) -- avisado separadamente, precisa trocar
+# pra SUFFIX_MCH_TRANSFER (mesmo lugar, mesmo formato de correção, só o
+# nome do sufixo muda -- ver _build_tail_layer pro novo funcionamento).
 
 # Marca todo bone criado por este script (independente da camada). É isso
 # -- não o nome -- que diferencia um bone ORG (original) de um gerado, e é
@@ -122,6 +161,20 @@ PROP_RIG_LAYER = "hytale_rig_layer"
 # Custom property no bone _IK da ponta (mão/pé) de cada cadeia. Inteira,
 # 0..1 -- 0 = FK, 1 = IK.
 PROP_FK_IK_SWITCH = "fk_ik_switch"
+
+# v0.13 -- "Head Follow" (ver CONSTRAINT_HEAD_FOLLOW_ROT/_LOC,
+# _apply_head_follow_parent, _build_head_follow em rig.py). Switch ÚNICO
+# (diferente de PROP_FK_IK_SWITCH -- não é "por cadeia/lado", só existe
+# UM Head_CTRL no rig todo) -- mesmo bone PROPERTIES, mesmo mecanismo de
+# driver (ver add_switch_driver). v0.13.1: 1 (default) = segue o Chest
+# (expression "switch" direta no Child Of -- ver CONSTRAINT_HEAD_FOLLOW_ROT
+# abaixo) -- um rig recém-gerado (ou regenerado) precisa continuar
+# parecendo com o de antes por padrão (igual sempre foi via parentesco
+# real, antes desta feature existir), sem exigir que o usuário ligue
+# nada. 0 = rotação livre (Head_CTRL para de seguir a rotação/escala do
+# Chest_CTRL -- a posição continua acompanhando, ver
+# CONSTRAINT_HEAD_FOLLOW_LOC, que nunca tem toggle).
+PROP_HEAD_FOLLOW_SWITCH = "head_follow_switch"
 
 # Nomes de constraint iguais aos dos scripts de referência (facilita
 # comparar/depurar um rig gerado por este script com um feito à mão).
@@ -136,6 +189,25 @@ CONSTRAINT_ORG_TO_MCH = "Hytale_ORG_to_MCH"  # trio Location/Rotation/Scale -- c
 CONSTRAINT_SPINE_FOLLOW = "Hytale_SpineFollow"
 CONSTRAINT_CHILD_OF_LOCAL = "Child Of_local"
 CONSTRAINT_CHILD_OF_GLOBAL = "Child Of_global"
+# v0.13 -- "Head Follow" (ver PROP_HEAD_FOLLOW_SWITCH acima). Dois
+# constraints em Head_CTRL, papéis bem separados -- ver _build_head_follow.
+# ORDEM no stack importa (v0.13.1, pedido explícito): _ROT (Child Of)
+# precisa vir ANTES de _LOC (Copy Location) -- _build_head_follow cria
+# nessa ordem E reordena explicitamente toda vez (idempotente, corrige
+# também um rig já gerado com a ordem antiga).
+#   _ROT (Child Of, só canais de Rotation/Scale -- Location DESLIGADO de
+#       propósito, senão brigaria com o _LOC abaixo) -- influência ligada
+#       ao PROP_HEAD_FOLLOW_SWITCH via driver, expression "switch" DIRETA
+#       (v0.13.1 -- ANTES era "1 - switch", invertida): switch=1
+#       (default) -> influência 1 -> segue. Cuida só da ROTAÇÃO/ESCALA --
+#       é essa que o switch liga/desliga.
+#   _LOC (Copy Location, World Space, head_tail=1.0 no target -- mira a
+#       PONTA/Tail do Chest_CTRL, não o Head) -- SEMPRE ativo, sem
+#       driver/switch nenhum. Cuida só da POSIÇÃO (o "arco" de seguir o
+#       tronco quando ele se move/rotaciona) -- independente do switch,
+#       sempre liga.
+CONSTRAINT_HEAD_FOLLOW_ROT = "Hytale_HeadFollow_Rot"
+CONSTRAINT_HEAD_FOLLOW_LOC = "Hytale_HeadFollow_Loc"
 # v0.8: Stretch To do bone "_Pole_Line" (ver SUFFIX_POLE_LINE), mirando
 # sempre no "_Pole_CTRL" do mesmo lado/cadeia -- ver ensure_stretch_to_constraint.
 CONSTRAINT_POLE_LINE_STRETCH = "PoleLine_StretchTo"
@@ -165,6 +237,13 @@ CTRL_PARENT_OVERRIDES = {
     "Belly_CTRL": "root.master_CTRL",
     "L-Thigh" + SUFFIX_CTRL: "root.pelvis_CTRL",
     "R-Thigh" + SUFFIX_CTRL: "root.pelvis_CTRL",
+    # v0.13.4 -- "Head_CTRL": "Origin_CTRL" (Head Follow) SAIU daqui --
+    # esse override virou CONDICIONAL, não incondicional como o resto
+    # deste dict (ver _apply_head_follow_parent em rig.py, e
+    # HytaleIKChainItem.head_follow_enabled/"Head Free/Lock"): só
+    # reparenta Head_CTRL se o toggle "Head Free/Lock" estiver ligado
+    # -- senão Head_CTRL fica com o parent NATURAL (Neck ou Chest, o
+    # que o loop genérico já teria escolhido sozinho).
 }
 
 # Bones utilitários de controle geral (não derivam de nenhum ORG por
@@ -262,6 +341,33 @@ SPINE_FOLLOW_BONES = {
     "Belly_CTRL": 0.5,
     "Chest_CTRL": 0.63,
 }
+
+# v0.13.4 -- "Head Follow" (ver CTRL_PARENT_OVERRIDES/PROP_HEAD_FOLLOW_SWITCH/
+# CONSTRAINT_HEAD_FOLLOW_LOC/_ROT acima, _apply_head_follow_parent/
+# _build_head_follow em rig.py). O bone-alvo (source) NÃO É uma string
+# fixa (era "Chest_CTRL" até v0.13.1) -- personagens com Neck entre
+# Chest e Head (o caso comum) tinham Head_CTRL "grudado" errado, mirando
+# o Tail do Chest em vez do último Neck. Resolvido dinamicamente,
+# lendo o pai REAL do ORG "Head" na hierarquia original do modelo (só
+# personagens SEM nenhum Neck resolvem pro Chest mesmo).
+#
+# v0.13.4: a feature INTEIRA (reparent + os dois constraints) é
+# controlada por UM ÚNICO toggle explícito -- "Head Free/Lock"
+# (HytaleIKChainItem.head_follow_enabled, exclusivo de HEAD). v0.13.3
+# tentou resolver isso SEM toggle nenhum (media se a geometria já
+# estava alinhada, dependendo do usuário ter configurado "Continuous
+# Chain" na cadeia certa) -- funcionava, mas ficava confuso saber QUAL
+# combinação (HEAD com Neck encadeado, OU SPINE cruzando pra HEAD sem
+# Neck) fazia o alinhamento acontecer. Como só precisamos de UM
+# redirect (o Tail do predecessor IMEDIATO de "Head", não a cadeia
+# inteira), "Head Free/Lock" faz esse redirect sozinho -- sem depender
+# de mais nada configurado em outra entrada.
+
+# head_tail do Copy Location (CONSTRAINT_HEAD_FOLLOW_LOC) -- 1.0 = mira
+# o TAIL do bone resolvido (a "ponta de cima" dele, onde o Head começa
+# de verdade), não o Head dele (0.0). Ver
+# bpy.types.CopyLocationConstraint.head_tail na documentação do Blender.
+HEAD_FOLLOW_LOC_HEAD_TAIL = 1.0
 
 # Alvo do "Child Of_global" em todo pole target -- o mesmo bone usado como
 # parent do root.master_CTRL.
@@ -395,7 +501,7 @@ WGT_UI_ROOT = "WGT_hytale_ui_root"  # v0.10.4 -- widget do bone root.ui (nome de
 # depois. Ver _apply_ik_joint_fixes.
 #
 # Y/Z NUNCA são tocados nos bones de ik_joint_x_overrides, só X. NÃO mexe
-# no *_IK_MCH (bridge) -- só nos bones _IK "de verdade" (CTRL-IK).
+# no *_MCH_IK_Transfer (bridge) -- só nos bones _IK "de verdade" (CTRL-IK).
 
 # Dica de nome pra encontrar o bone-filho usado como referência de
 # orientação da ponta da cadeia (ex.: "L-Attachment", filho de "L-Hand").

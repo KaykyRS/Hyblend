@@ -155,6 +155,16 @@ TRANSLATIONS = {
     "panel.field_spine_3": "Spine3",
     "panel.field_spine_4": "Spine4",
     "panel.hint_spine_no_ik": "Spine bones follow their controls directly (no IK) -- organizational only",
+    # v0.13 -- "Continuous Chain", compartilhado por HEAD e SPINE (ver
+    # HytaleIKChainItem.continuous_chain/continuous_chain_link_bone em
+    # rigger/rig.py). v0.13.4: sem UI (removida de interface.py -- ver
+    # comentário lá) -- as duas keys ficam aqui sem uso por enquanto,
+    # mesmo espírito de manter o sistema "dormente" no rig.py.
+    "panel.field_continuous_chain": "Continuous Chain",
+    "panel.field_continuous_chain_link": "Connect Last Bone To",
+    # v0.13.4 -- "Head Free/Lock", exclusivo de HEAD (ver
+    # HytaleIKChainItem.head_follow_enabled em rigger/rig.py).
+    "panel.field_head_follow_enabled": "Head Free/Lock",
     # v0.9.7 -- campos de Attachments (organizacional, sem IK -- ver
     # HytaleIKChainItem em rigger.py).
     "panel.field_attachments_count": "Attachments Bones Amount",
@@ -233,6 +243,11 @@ TRANSLATIONS = {
     "panel.anim_fkik_box": "FK / IK",
     "panel.btn_snap_selected": "Snap FK/IK",
     "panel.hint_anim_no_fkik": "No Arm/Leg chains with a generated FK/IK switch yet.",
+    # v0.13.5 -- "Head Free/Lock" (ver ANIM_OT_hytale_set_head_follow/
+    # get_head_follow_state em anim_tools.py). Sem hint separado -- a
+    # box inteira só aparece quando o switch já existe (ver
+    # get_head_follow_state), então não tem estado "vazio" pra explicar.
+    "panel.anim_head_follow_box": "Head Free/Lock",
 
     # -----------------------------------------------------------------
     # interface.py -- avisos reaproveitados em mais de uma aba

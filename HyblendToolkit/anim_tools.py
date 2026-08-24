@@ -2,7 +2,7 @@
 anim_tools.py -- Auxiliares de Animação (aba "Animation" do N-Panel).
 ======================================================================
 
-Este submódulo NÃO desenha nada -- só registra os operadores (e duas
+Este submódulo NÃO desenha nada -- só registra os operadores (e três
 funções de leitura pura) que a aba "Animation" do interface.py usa.
 Mesmo espírito de rigger.py: interface.py é quem desenha os botões, este
 arquivo só fornece o que os botões chamam.
@@ -20,6 +20,14 @@ Cobre, até agora:
        bone ATIVO selecionado): iguala a pose do lado oposto ao
        selecionado E troca pra esse lado oposto, tudo de uma vez --
        ver identify_chain_from_bone/snap_chain_pose logo abaixo.
+  3. v0.13.5 -- "Head Free/Lock" (ANIM_OT_hytale_set_head_follow +
+     get_head_follow_state): mesmo espírito "cru" do botão FK/IK da
+     lista (só troca a influência, não iguala pose) -- não tem
+     equivalente ao "Snap FK/IK" (não pedido, e não haveria "lado
+     oposto" pra igualar do mesmo jeito -- Head_CTRL não tem duas
+     poses paralelas guardadas em bones diferentes, só uma rotação
+     própria vs. a do predecessor). Switch ÚNICO, sem índice de cadeia
+     -- só existe UM Head_CTRL no rig inteiro.
 
 CAVEAT -- Pole Local/Global: o pole target já tem dois Child Of no rig
 (um mirando na ponta da cadeia -- "Local", ativo por padrão -- outro no
@@ -36,8 +44,12 @@ nenhuma mudança deveria ser necessária neste arquivo.
 
 DEPENDÊNCIA -- este arquivo importa de `.rigger`:
     BONE_PROPERTIES, CONSTRAINT_CHILD_OF_GLOBAL, CONSTRAINT_CHILD_OF_LOCAL,
-    SUFFIX_CTRL, SUFFIX_IK, SUFFIX_IK_MCH, SUFFIX_MCH, SUFFIX_POLE,
-    find_org_path, switch_property_name
+    PROP_HEAD_FOLLOW_SWITCH, SUFFIX_CTRL, SUFFIX_IK, SUFFIX_MCH_IK_TRANSFER,
+    SUFFIX_MCH, SUFFIX_POLE, find_org_path, switch_property_name
+(v0.13: SUFFIX_IK_MCH renomeado pra SUFFIX_MCH_IK_TRANSFER em
+rigger/constants.py -- mesmo bone-ponte de sempre, só nome novo.
+v0.13.5: PROP_HEAD_FOLLOW_SWITCH entrou pro switch "Head Free/Lock" --
+ver get_head_follow_state/ANIM_OT_hytale_set_head_follow abaixo.)
 Todos precisam estar na lista de reexport de rigger/__init__.py (alguns
 -- BONE_PROPERTIES, find_org_path, switch_property_name -- não estavam
 lá originalmente; foram adicionados especificamente pra este arquivo
@@ -61,10 +73,11 @@ from .rigger import (
     BONE_PROPERTIES,
     CONSTRAINT_CHILD_OF_GLOBAL,
     CONSTRAINT_CHILD_OF_LOCAL,
+    PROP_HEAD_FOLLOW_SWITCH,
     SUFFIX_CTRL,
     SUFFIX_IK,
-    SUFFIX_IK_MCH,
     SUFFIX_MCH,
+    SUFFIX_MCH_IK_TRANSFER,
     SUFFIX_POLE,
     find_org_path,
     switch_property_name,
@@ -150,6 +163,29 @@ def get_fk_ik_state(obj, item):
         return None
     prop_name = switch_property_name(item.tip_bone, item.side)
     value = props_bone.get(prop_name)
+    if value is None:
+        return None
+    return 1 if value else 0
+
+
+def get_head_follow_state(obj):
+    """Leitura pura, sem efeito colateral -- mesmo espírito de
+    get_fk_ik_state acima, só que pro switch ÚNICO "Head Free/Lock"
+    (PROP_HEAD_FOLLOW_SWITCH -- não é "por cadeia/lado", só existe UM
+    Head_CTRL no rig todo, ver HytaleIKChainItem.head_follow_enabled/
+    _build_head_follow em rigger/rig.py). Retorna 1 (Lock -- segue o
+    predecessor) ou 0 (Free), ou None se o switch ainda não existe
+    ("Head Free/Lock" nunca foi ligado em nenhuma entrada HEAD, ou o
+    rig nunca foi gerado). Usada pelo interface.py só pra saber qual
+    dos dois botões (Free/Lock) desenhar destacado -- nunca escreve
+    nada."""
+    pose = obj.pose
+    if pose is None:
+        return None
+    props_bone = pose.bones.get(BONE_PROPERTIES)
+    if props_bone is None:
+        return None
+    value = props_bone.get(PROP_HEAD_FOLLOW_SWITCH)
     if value is None:
         return None
     return 1 if value else 0
@@ -287,14 +323,14 @@ def snap_chain_pose(context, obj, item, target_mode):
         tip_mch_pb = pose_bones.get(tip_org.name + SUFFIX_MCH)
         ik_tip_pb = pose_bones.get(tip_org.name + SUFFIX_IK)
         ik_tip_bone = bones.get(tip_org.name + SUFFIX_IK)
-        bridge_bone = bones.get(tip_org.name + SUFFIX_IK_MCH)
+        bridge_bone = bones.get(tip_org.name + SUFFIX_MCH_IK_TRANSFER)
         if tip_mch_pb is None or ik_tip_pb is None or ik_tip_bone is None or bridge_bone is None:
             return False, f"'{tip_org.name}{SUFFIX_MCH}'/'{tip_org.name}{SUFFIX_IK}' bones not found"
 
         # O bone `_IK` da PONTA (ex. Hand_IK) foi REORIENTADO na criação
         # do rig (aponta pro attachment ou "pra baixo" no mundo -- ver
         # _build_ik_layer) -- rest orientation DIFERENTE da do bridge
-        # `_IK_MCH` (que mantém a rest do ORG original, intocada -- por
+        # `_MCH_IK_Transfer` (que mantém a rest do ORG original, intocada -- por
         # isso IK_CopyRotation/Scale, em _build_pose_constraints, miram
         # nele em vez de no `_IK` direto: precisam de uma rest "limpa").
         # Copiar tip_mch.matrix direto pro `_IK` (como fazíamos antes)
@@ -403,7 +439,7 @@ class ANIM_OT_hytale_set_fk_ik(Operator):
     """Troca a cadeia (item de armature.hytale_ik_chains, por índice)
     pra FK (mode='FK') ou IK (mode='IK') -- SÓ a influência (custom
     property no bone PROPERTIES, criada por rigger.py -- ver
-    ensure_fk_ik_switch_property/add_switch_driver em rigger/rig.py).
+    ensure_switch_property/add_switch_driver em rigger/rig.py).
     NÃO iguala a pose (isso é ANIM_OT_hytale_snap_selected, separado de
     propósito -- pedido explícito: os botões de troca ficam "crus", o
     Snap é uma ação à parte que o usuário decide quando rodar)."""
@@ -440,6 +476,52 @@ class ANIM_OT_hytale_set_fk_ik(Operator):
             return {"CANCELLED"}
 
         _write_fk_ik_switch(context, obj, props_bone, prop_name, self.mode)
+        return {"FINISHED"}
+
+
+class ANIM_OT_hytale_set_head_follow(Operator):
+    """Troca o switch ÚNICO "Head Free/Lock" (PROP_HEAD_FOLLOW_SWITCH,
+    custom property no bone PROPERTIES -- ver ensure_switch_property/
+    _build_head_follow em rigger/rig.py) -- SÓ a custom property, mesmo
+    espírito "cru" de ANIM_OT_hytale_set_fk_ik acima (não iguala a
+    pose -- se a rotação atual de Head_CTRL divergir muito de onde o
+    predecessor está agora, trocar pode dar um "pulo" visual, mesmo
+    caveat já documentado pro FK/IK). Diferente do FK/IK, não precisa
+    de índice de cadeia nenhum -- só existe UM Head_CTRL no rig
+    inteiro."""
+
+    bl_idname = "pose.hytale_set_head_follow"
+    bl_label = "Set Head Free/Lock"
+    bl_description = "Lock (follow the predecessor bone's rotation) or Free (keep Head_CTRL's own rotation)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    mode: EnumProperty(items=[("FREE", "Free", ""), ("LOCK", "Lock", "")])
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == "ARMATURE" and obj.pose is not None
+
+    def execute(self, context):
+        obj = context.active_object
+        props_bone = obj.pose.bones.get(BONE_PROPERTIES)
+        if props_bone is None or PROP_HEAD_FOLLOW_SWITCH not in props_bone.keys():
+            self.report(
+                {"WARNING"},
+                f"'{PROP_HEAD_FOLLOW_SWITCH}' not found on the {BONE_PROPERTIES} bone -- enable 'Head "
+                "Free/Lock' on the HEAD entry (Bone Settings) and run 'Create Rig' first.",
+            )
+            return {"CANCELLED"}
+
+        # Mesmo padrão de _write_fk_ik_switch (update_tag + view_layer.
+        # update + redraw geral) -- ver docstring lá pro motivo dos 3
+        # serem necessários. Não reaproveitado direto (aquela função é
+        # específica de FK/IK, recebe prop_name -- aqui é sempre o
+        # mesmo PROP_HEAD_FOLLOW_SWITCH) mas é a MESMA sequência.
+        props_bone[PROP_HEAD_FOLLOW_SWITCH] = 1 if self.mode == "LOCK" else 0
+        obj.update_tag()
+        context.view_layer.update()
+        _redraw_all_areas(context)
         return {"FINISHED"}
 
 
@@ -541,6 +623,7 @@ class ANIM_OT_hytale_snap_selected(Operator):
 _CLASSES = (
     ANIM_OT_hytale_toggle_collection_visibility,
     ANIM_OT_hytale_set_fk_ik,
+    ANIM_OT_hytale_set_head_follow,
     ANIM_OT_hytale_snap_selected,
 )
 

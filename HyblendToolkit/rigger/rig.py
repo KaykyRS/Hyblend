@@ -334,12 +334,16 @@ def bone_side_prefix(name):
 def is_excluded_from_main_collections(bone):
     """Bones que NÃO devem entrar nas collections Head/Spine/Body/Arm/
     Leg/Root (dentro de Main): bones de attachment (vão só pra
-    Attachments) e bones das camadas MCH/MCH-IK/TAIL (Main só quer CTRL e
-    CTRL-IK, FK ou IK -- os bones "internos" de mecanismo, incluindo os
-    bridges _Tail (ver COLL_MCH_IK/"Specials"), ficam de fora)."""
+    Attachments) e bones das camadas MCH/MCH-IK/MCH-TRANSFER (Main só
+    quer CTRL e CTRL-IK, FK ou IK -- os bones "internos" de mecanismo,
+    incluindo os bridges _MCH_Transfer (ver COLL_MCH_IK/"Specials"),
+    ficam de fora). v0.13: "TAIL" trocado por "MCH-TRANSFER" -- o
+    bridge dedicado de Tail foi retirado, Tail agora usa o mesmo bridge
+    genérico de qualquer outro _CTRL (ver SUFFIX_MCH_TRANSFER/
+    _build_tail_layer)."""
     if is_attachment_bone(bone):
         return True
-    return bone.get(PROP_RIG_LAYER) in ("MCH", "MCH-IK", "TAIL")
+    return bone.get(PROP_RIG_LAYER) in ("MCH", "MCH-IK", "MCH-TRANSFER")
 
 
 def find_attachment_child(org_bone):
@@ -408,7 +412,7 @@ def collect_descendants_inclusive(edit_bones, root_name, exclude_predicate=None)
 # ---------------------------------------------------------------------------
 
 
-def ensure_copy_constraint(pose_bone, target_obj, subtarget_name, copy_type, name, space="LOCAL"):
+def ensure_copy_constraint(pose_bone, target_obj, subtarget_name, copy_type, name, space="LOCAL", head_tail=None):
     con = pose_bone.constraints.get(name)
     if con is None:
         con = pose_bone.constraints.new(_COPY_CONSTRAINT_TYPES[copy_type])
@@ -418,6 +422,17 @@ def ensure_copy_constraint(pose_bone, target_obj, subtarget_name, copy_type, nam
     con.target_space = space
     con.owner_space = space
     con.mute = False
+    # v0.13 -- head_tail (só faz sentido pra COPY_LOCATION -- Blender
+    # ignora a propriedade nos outros dois tipos, mas só seta se
+    # LOCATION mesmo, pra não confundir quem ler um COPY_ROTATION/SCALE
+    # com head_tail setado à toa). None (default) preserva o
+    # comportamento de TODOS os outros ~30 call sites já existentes
+    # (head_tail fica no default do Blender, 0.0 -- mira o Head do
+    # subtarget). Usado por _build_head_follow (mira o Tail do bone
+    # resolvido por _resolve_head_follow_source, head_tail=1.0 -- ver
+    # HEAD_FOLLOW_LOC_HEAD_TAIL).
+    if head_tail is not None and copy_type == "LOCATION":
+        con.head_tail = head_tail
     return con
 
 
@@ -491,12 +506,29 @@ def switch_property_name(tip_org_name, side):
     return f"{prefix_word}_{PROP_FK_IK_SWITCH}_{suffix}"
 
 
-def ensure_fk_ik_switch_property(pose_bone, prop_name):
+def ensure_switch_property(pose_bone, prop_name, description="0 = FK, 1 = IK", default_value=0):
+    """Cria (ou reaproveita) uma custom property inteira 0..1 em
+    `pose_bone`, com UI configurada (min/max/default/description) --
+    usado por QUALQUER switch de constraint por driver deste addon
+    (ver add_switch_driver). v0.13: RENOMEADA de
+    ensure_fk_ik_switch_property (era exclusiva do FK/IK switch por
+    cadeia, agora também usada por PROP_HEAD_FOLLOW_SWITCH/
+    _build_head_follow -- `description` deixou de vir hardcoded
+    "0 = FK, 1 = IK" pra dar espaço a outros textos, e `default_value`
+    entrou junto pra PROP_HEAD_FOLLOW_SWITCH, cujo valor "de repouso"
+    (1, não 0 -- ver _build_head_follow) é diferente do FK/IK switch --
+    ambos com default=0 nos parâmetros continuam preservando o único
+    call site que já existia antes desta mudança).
+    `default_value` só é aplicado na CRIAÇÃO (`prop_name not in
+    pose_bone.keys()`) -- não sobrescreve um valor que o usuário já
+    tenha ajustado numa execução anterior, mesmo espírito de idempotência
+    do resto do arquivo (ex.: create_bone_like nunca reseta um bone já
+    existente)."""
     if prop_name not in pose_bone.keys():
-        pose_bone[prop_name] = 0
+        pose_bone[prop_name] = default_value
     try:
         ui = pose_bone.id_properties_ui(prop_name)
-        ui.update(min=0, max=1, default=0, description="0 = FK, 1 = IK")
+        ui.update(min=0, max=1, default=default_value, description=description)
     except Exception:
         pass
 
@@ -1738,7 +1770,7 @@ class HytaleIKChainItem(PropertyGroup):
         name="Type",
         description="What this entry configures. 'Arm'/'Leg' behave exactly like the old generic IK chain "
         "(root/tip/pole path -> switchable FK/IK chain) -- only the field labels differ today. 'Tail' has "
-        "no IK: it builds a continuous '_Tail' bridge chain (always connected, no gap between segments) "
+        "no IK: it builds a continuous chain of connected control bones (no gap between segments) "
         "meant to be hooked into physics add-ons. 'Head'/'Spine'/'Attachments' create no bones at all -- "
         "they just identify existing control bones, for collection organization. 'Texture Picker' identifies a "
         "single texture-atlas control bone and builds a UV picker rig (a dedicated root.ui/cursor bone "
@@ -1927,6 +1959,65 @@ class HytaleIKChainItem(PropertyGroup):
     spine_bone_2: StringProperty(name="Spine2", description="Original bone name" + _HEAD_SPINE_FIELD_HINT, default="")
     spine_bone_3: StringProperty(name="Spine3", description="Original bone name" + _HEAD_SPINE_FIELD_HINT, default="")
     spine_bone_4: StringProperty(name="Spine4", description="Original bone name" + _HEAD_SPINE_FIELD_HINT, default="")
+    # v0.13 -- "Continuous Chain": generaliza o truque que a cadeia TAIL
+    # já usava (ver _build_tail_layer/SUFFIX_MCH_TRANSFER) pra HEAD e
+    # SPINE também. Diferente de TAIL (que sempre redireciona), aqui é
+    # OPT-IN por entrada -- default False, não muda nenhum rig já
+    # existente até o usuário ligar explicitamente. Quando ligado, o
+    # `_CTRL` de cada bone listado (ver _head_spine_bone_names) tem o
+    # TAIL redirecionado pro HEAD do próximo da lista -- o HEAD de cada
+    # bone NUNCA muda (fica na posição original do ORG, sempre). Ver
+    # _apply_continuous_chain_redirect.
+    #
+    # v0.13.4 -- SEM UI pra ligar/desligar (removida de interface.py --
+    # pedido explícito, ficou complexo demais validar a combinação
+    # certa entre entradas SPINE/HEAD só pra alimentar o Head Follow,
+    # que agora se resolve sozinho via "Head Free/Lock", bem mais
+    # simples -- ver head_follow_enabled abaixo). O campo, a property, e
+    # _apply_continuous_chain_redirect CONTINUAM existindo/rodando (só
+    # não têm mais UI) -- mantidos de propósito pra um uso futuro que
+    # precise da cadeia INTEIRA redirecionada (não só um bone), não só o
+    # Head Follow. Um template/.json antigo com continuous_chain=True
+    # continua funcionando normalmente se carregado.
+    continuous_chain: BoolProperty(
+        name="Continuous Chain",
+        description="Redirects each listed bone's _CTRL Tail to touch the next one's Head (same trick the "
+        "Tail chain type already uses) -- makes the chain look/behave like a connected sequence of bones "
+        "instead of independent floating controls. Off by default, doesn't affect existing rigs unless "
+        "turned on -- only the Tail moves, each bone's Head always stays at its original position.",
+        default=False,
+    )
+    continuous_chain_link_bone: StringProperty(
+        name="Connect Last Bone To",
+        description="Optional. Original bone name whose Head this entry's LAST listed bone should point "
+        "its Tail at (e.g. a Spine ending at 'Chest' connecting into a Head chain starting at 'Neck') -- "
+        "leave empty to keep the last bone's own original Tail instead" + _HEAD_SPINE_FIELD_HINT,
+        default="",
+    )
+    # v0.13.4 -- "Head Free/Lock" -- campo EXCLUSIVO de HEAD (v0.13.3
+    # tentou resolver isso medindo geometria automaticamente/sem toggle
+    # nenhum -- ver histórico em _apply_head_follow_parent; simplificado
+    # de volta pra um toggle explícito, mas BEM mais simples que o
+    # "Continuous Chain" genérico: só precisa de UM redirect -- o Tail
+    # do predecessor imediato de "Head" (Neck, se existir; Chest, se
+    # não -- resolvido automaticamente, sem precisar configurar nada
+    # além deste único toggle) pro Head de "Head". Ligado: monta o
+    # redirect + reparenta Head_CTRL pro Origin_CTRL + os dois
+    # constraints (Child Of + Copy Location, ver _build_head_follow) +
+    # a custom property PROP_HEAD_FOLLOW_SWITCH. Desligado (default):
+    # nada disso existe -- Head_CTRL segue o parent NATURAL (mesmo
+    # comportamento de antes desta feature inteira ter sido cogitada).
+    # Ver _apply_head_follow_parent.
+    head_follow_enabled: BoolProperty(
+        name="Head Free/Lock",
+        description="Lets Head_CTRL's rotation be locked to (or freed from) its predecessor bone "
+        "(Neck, or Chest if there's no Neck) at pose time, via a runtime switch -- see the "
+        "'head_follow_switch' custom property created on the PROPERTIES bone. Enabling this "
+        "automatically redirects the predecessor's Tail to Head's own Head (no other setup needed) and "
+        "reparents Head_CTRL to Origin_CTRL. Off by default -- Head_CTRL keeps following its predecessor "
+        "the normal way (real bone parenting, no switch).",
+        default=False,
+    )
     # v0.9.7 -- campos exclusivos de ATTACHMENTS. Mesmo padrão de
     # HEAD/SPINE (amount + N campos de bone ORG) -- attachments_count é
     # simplesmente quantos dos slots attachment_bone_N aparecem na UI
@@ -2409,6 +2500,9 @@ class RIG_OT_hytale_ik_chain_pick_bone(Operator):
             "neck_bone_1", "neck_bone_2", "neck_bone_3", "neck_bone_4", "neck_bone_5",
             "head_bone", "head_end_bone",
             "pelvis_bone", "spine_bone_1", "spine_bone_2", "spine_bone_3", "spine_bone_4",
+            # v0.13 -- campo de "Connect Last Bone To" (Continuous Chain),
+            # compartilhado por HEAD/SPINE -- mesmo picker genérico.
+            "continuous_chain_link_bone",
             # v0.9.8 -- gerado a partir de ATTACHMENTS_MAX_COUNT (constants.py)
             # em vez de 5 nomes escritos na mão -- acompanha o teto
             # automaticamente se ele mudar.
@@ -2941,6 +3035,19 @@ class RIG_OT_hytale_validate_rig(Operator):
                             f"'{name + SUFFIX_CTRL}' doesn't -- Create Rig hasn't run yet, or this bone is "
                             f"excluded from the generic ORG->CTRL loop."
                         )
+            # v0.13 -- checagem extra, só pra HEAD/SPINE com "Continuous
+            # Chain" ligado: continuous_chain_link_bone (se preenchido)
+            # precisa apontar pra um bone ORG que exista de verdade --
+            # senão _apply_continuous_chain_redirect já avisa sozinho em
+            # tempo de "Create Rig" (mesmo texto), mas validar aqui
+            # também deixa o problema visível ANTES de gerar o rig.
+            if item.chain_type in ("HEAD", "SPINE") and item.continuous_chain:
+                link_name = (item.continuous_chain_link_bone or "").strip()
+                if link_name and bones.get(link_name) is None:
+                    problems.append(
+                        f"{item.chain_type.title()} '{label}': continuous_chain connect target "
+                        f"'{link_name}' not found on this armature."
+                    )
             # v0.10 -- checagem extra, só pra TEXTURE_PICKER: o cursor/root da UI
             # (ver _build_texture_picker) só existe DEPOIS de "Create
             # Texture Picker" -- diferente do "_CTRL" acima (criado por "Create
@@ -4256,7 +4363,8 @@ class RIG_OT_hytale_generate_rig(Operator):
         self._build_pose_constraints(obj, chains_data)
         tail_constraint_count = self._build_tail_pose_constraints(obj, tail_chains_data)
         self._build_spine_follow(obj)
-        self._apply_pole_childof_inverses(obj, chains_data)
+        head_follow_built = self._build_head_follow(obj, stats["head_follow_active"], stats["head_follow_source"])
+        self._apply_pole_childof_inverses(obj, chains_data, head_follow_built)
         widget_stats = self._build_custom_shapes(obj, chains_data)
         shape_switch_count = self._build_ik_fk_shape_visibility(obj, chains_data)
         colored_count = self._build_bone_colors(obj, tail_chains_data)
@@ -4267,7 +4375,8 @@ class RIG_OT_hytale_generate_rig(Operator):
         self.report(
             {"INFO"},
             f"Rig ready: {stats['mch']} MCH, {stats['ctrl']} CTRL, {stats['ik']} CTRL-IK, "
-            f"{stats['ik_mch']} MCH-IK, {stats['tail']} Tail, {stats['root']} root control bone(s) created; "
+            f"{stats['ik_mch']} MCH-IK, {stats['mch_transfer']} MCH-Transfer, {stats['root']} root control "
+            f"bone(s) created; "
             f"{len(chains_data)} IK chain(s) and {len(tail_chains_data)} tail chain(s) processed "
             f"({tail_constraint_count} tail bridge bone(s) constrained); "
             f"{widget_stats['assigned']} custom shape(s) assigned"
@@ -4275,6 +4384,11 @@ class RIG_OT_hytale_generate_rig(Operator):
             + (f", {widget_stats['missing']} widget(s) missing (see warnings))" if widget_stats["missing"] else "")
             + f"; {shape_switch_count} FK/IK shape-scale driver(s) set; "
             + f"{colored_count} bone(s) colored"
+            + (f"; {stats['continuous_chain']} continuous-chain bone(s) redirected" if stats["continuous_chain"] else "")
+            + (
+                f"; Head Follow active (following '{stats['head_follow_source']}')" if stats["head_follow_active"]
+                else "; Head Follow inactive (Tail/Head not aligned -- see Continuous Chain)"
+            )
             + (f"; {joint_fix_count} IK joint fix(es) applied (rig template)." if joint_fix_count else "."),
         )
         return {"FINISHED"}
@@ -4299,7 +4413,7 @@ class RIG_OT_hytale_generate_rig(Operator):
         novo X, E acha o bone ANTERIOR na mesma cadeia (via
         chains_data/org_names) pra também setar o TAIL dele -- os dois
         compartilham a mesma junta visualmente, então precisam se mover
-        juntos. NÃO mexe no *_IK_MCH (bridge) -- só nos bones _IK reais
+        juntos. NÃO mexe no *_MCH_IK_Transfer (bridge) -- só nos bones _IK reais
         (CTRL-IK).
 
         COMPENSAÇÃO DE POLE ANGLE: mover o head do bone RAIZ da cadeia
@@ -4703,15 +4817,21 @@ class RIG_OT_hytale_generate_rig(Operator):
             colored += 1
         return colored
 
-    def _apply_pole_childof_inverses(self, obj, chains_data):
+    def _apply_pole_childof_inverses(self, obj, chains_data, head_follow_built=False):
         """Roda o equivalente ao botão "Set Inverse" nos Child Of que
-        dependem de posição -- os dois do pole (local e global) e o
-        Child Of_global novo do ik_tip (Hand_IK/Foot_IK) -- senão eles
-        "pulam" de lugar assim que a influência for ligada (mesmo com
-        influência 0, o Set Inverse precisa rodar logo na criação, já
-        com a pose correta, ou o resultado fica errado quando alguém
-        subir a influência depois). Usa o operator real do Blender (via
-        context override) em vez de matriz manual."""
+        dependem de posição -- os dois do pole (local e global), o
+        Child Of_global novo do ik_tip (Hand_IK/Foot_IK), e (v0.13) o
+        CONSTRAINT_HEAD_FOLLOW_ROT do Head_CTRL, se `head_follow_built`
+        -- senão eles "pulam" de lugar assim que a influência for
+        ligada (mesmo com influência 0, o Set Inverse precisa rodar
+        logo na criação, já com a pose correta, ou o resultado fica
+        errado quando alguém subir a influência depois). Usa o operator
+        real do Blender (via context override) em vez de matriz manual.
+
+        CONSTRAINT_HEAD_FOLLOW_LOC (Copy Location) NÃO entra aqui --
+        Set Inverse só existe pro tipo Child Of; Copy Location não
+        "pula" (é uma cópia contínua, sempre recalculada, sem estado
+        próprio pra ficar desalinhado)."""
         prev_mode = obj.mode
         if obj.mode != "POSE":
             bpy.ops.object.mode_set(mode="POSE")
@@ -4720,28 +4840,30 @@ class RIG_OT_hytale_generate_rig(Operator):
         prev_active = view_layer.objects.active
         view_layer.objects.active = obj
 
+        targets_by_bone = []
         for data in chains_data:
-            targets = [
-                (data["pole"], (CONSTRAINT_CHILD_OF_LOCAL, CONSTRAINT_CHILD_OF_GLOBAL)),
-                (data["ik_tip"], (CONSTRAINT_CHILD_OF_GLOBAL,)),
-            ]
-            for bone_name, constraint_names in targets:
-                pose_bone = obj.pose.bones.get(bone_name)
-                if pose_bone is None:
+            targets_by_bone.append((data["pole"], (CONSTRAINT_CHILD_OF_LOCAL, CONSTRAINT_CHILD_OF_GLOBAL)))
+            targets_by_bone.append((data["ik_tip"], (CONSTRAINT_CHILD_OF_GLOBAL,)))
+        if head_follow_built:
+            targets_by_bone.append((HEAD_COLLECTION_ROOT, (CONSTRAINT_HEAD_FOLLOW_ROT,)))
+
+        for bone_name, constraint_names in targets_by_bone:
+            pose_bone = obj.pose.bones.get(bone_name)
+            if pose_bone is None:
+                continue
+            obj.data.bones.active = pose_bone.bone
+            for cname in constraint_names:
+                if cname not in pose_bone.constraints:
                     continue
-                obj.data.bones.active = pose_bone.bone
-                for cname in constraint_names:
-                    if cname not in pose_bone.constraints:
-                        continue
-                    try:
-                        with bpy.context.temp_override(object=obj, active_object=obj, active_pose_bone=pose_bone):
-                            bpy.ops.constraint.childof_set_inverse(constraint=cname, owner="BONE")
-                    except Exception as exc:
-                        self.report(
-                            {"WARNING"},
-                            f"Could not auto Set Inverse for '{cname}' on '{bone_name}': {exc}. "
-                            f"Set it manually in the constraint panel.",
-                        )
+                try:
+                    with bpy.context.temp_override(object=obj, active_object=obj, active_pose_bone=pose_bone):
+                        bpy.ops.constraint.childof_set_inverse(constraint=cname, owner="BONE")
+                except Exception as exc:
+                    self.report(
+                        {"WARNING"},
+                        f"Could not auto Set Inverse for '{cname}' on '{bone_name}': {exc}. "
+                        f"Set it manually in the constraint panel.",
+                    )
 
         view_layer.objects.active = prev_active
         if obj.mode != prev_mode:
@@ -4812,7 +4934,10 @@ class RIG_OT_hytale_generate_rig(Operator):
         org_by_name = {b.name: b for b in org_bones}
         ordered = self._order_top_down(org_bones, org_by_name)
 
-        stats = {"mch": 0, "ctrl": 0, "ik": 0, "ik_mch": 0, "root": 0, "tail": 0}
+        stats = {
+            "mch": 0, "ctrl": 0, "ik": 0, "ik_mch": 0, "root": 0, "mch_transfer": 0, "continuous_chain": 0,
+            "head_follow_active": False, "head_follow_source": None,
+        }
 
         for org in ordered:
             coll_org.assign(org)
@@ -4838,6 +4963,24 @@ class RIG_OT_hytale_generate_rig(Operator):
                 stats["ctrl"] += 1
             coll_ctrl.assign(ctrl)
 
+            # v0.13 -- bridge genérico (ver SUFFIX_MCH_TRANSFER, rest =
+            # ORG original intocada, criado igual ao MCH acima -- NÃO
+            # espelha org.use_connect, esse bridge NUNCA é "connected",
+            # sempre solto). Parent REAL no _CTRL desta MESMA iteração
+            # (não no bridge do org pai) -- é isso que desacopla a rest
+            # do bridge (sempre limpa) da rest do _CTRL (que uma feature
+            # futura vai poder reposicionar). Reatribuído TODA VEZ (não
+            # só quando criado agora), mesmo princípio do fix de
+            # parent_override da cadeia de IK -- corrige também um bone
+            # já existente de uma execução anterior a esta mudança.
+            transfer, is_new = create_bone_like(edit_bones, org, org.name + SUFFIX_MCH_TRANSFER)
+            if is_new:
+                transfer[PROP_RIG_LAYER] = "MCH-TRANSFER"
+                stats["mch_transfer"] += 1
+            transfer.parent = ctrl
+            transfer.use_connect = False
+            coll_mch_ik.assign(transfer)
+
         # Bones utilitários de controle geral -- precisam existir ANTES da
         # camada de IK (overrides de parent podem apontar pra eles) e dos
         # overrides de parent dos CTRL normais.
@@ -4850,7 +4993,33 @@ class RIG_OT_hytale_generate_rig(Operator):
         )
 
         resolved_tail_chains = self._resolve_tail_chains(edit_bones, armature)
-        tail_chains_data = self._build_tail_layer(armature, edit_bones, resolved_tail_chains, stats)
+        tail_chains_data = self._build_tail_layer(armature, edit_bones, resolved_tail_chains)
+
+        # v0.13 -- "Continuous Chain" (HEAD/SPINE). Precisa rodar DEPOIS
+        # de tudo que possa criar/reparentar um `_CTRL` de HEAD/SPINE
+        # (o loop genérico já cobre isso -- HEAD/SPINE não têm override
+        # de parent próprio, diferente de Pelvis/Thigh em
+        # CTRL_PARENT_OVERRIDES, mas rodar por último não custa nada e
+        # deixa a ordem óbvia). Só mexe no TAIL de edit bones já
+        # existentes -- não cria bone, não depende de chains_data/
+        # tail_chains_data.
+        stats["continuous_chain"] = self._apply_continuous_chain_redirect(armature, edit_bones)
+
+        # v0.13.4 -- "Head Follow" (ver "Head Free/Lock",
+        # HytaleIKChainItem.head_follow_enabled). NÃO depende mais do
+        # Continuous Chain acima (v0.13.3 dependia -- ver histórico em
+        # _apply_head_follow_parent) -- faz o próprio redirect (só do
+        # Tail do predecessor imediato de "Head"), sozinho. Roda depois
+        # do Continuous Chain só por organização (ordem não importa mais
+        # pros dois não brigarem -- não deveriam nem se sobrepor, já que
+        # Continuous Chain não tem mais UI pra ligar). stats aqui guarda
+        # (bool, str|None) em vez de um número, mesmo espírito de
+        # reaproveitar o dict pra estado que precisa atravessar de Edit
+        # Mode (aqui) pra Pose Mode (_build_head_follow, chamado de
+        # execute() depois que os edit_bones já viraram pose_bones).
+        stats["head_follow_active"], stats["head_follow_source"] = self._apply_head_follow_parent(
+            armature, edit_bones
+        )
 
         self._build_main_collections(armature, edit_bones)
         self._move_main_child_before(armature, COLL_MAIN_TAIL, COLL_MAIN_ROOT)
@@ -4942,7 +5111,7 @@ class RIG_OT_hytale_generate_rig(Operator):
             resolved.append({"item": item, "path": path})
         return resolved
 
-    def _build_tail_layer(self, armature, edit_bones, resolved_tail_chains, stats):
+    def _build_tail_layer(self, armature, edit_bones, resolved_tail_chains):
         """Pra cada cadeia TAIL resolvida (v0.7, revisado): quem forma a
         cadeia fisicamente contínua (posicionalmente -- não "connected"
         no sentido do Blender, ver abaixo) são os próprios bones `_CTRL`
@@ -4959,33 +5128,35 @@ class RIG_OT_hytale_generate_rig(Operator):
         (spring bone, rigid body constraint etc.) hookar de um segmento
         pro próximo sem gap.
 
-        O bone `_Tail` (SUFFIX_TAIL) é um BRIDGE, mesmo princípio exato
-        do `_IK_MCH` da cadeia de IK: mesma rest orientation do MCH (ou
+        v0.13: o bridge dedicado `_Tail` (SUFFIX_TAIL) foi RETIRADO --
+        Tail agora reaproveita o bridge GENÉRICO `_MCH_Transfer`
+        (SUFFIX_MCH_TRANSFER) que o loop genérico de _build_edit_bones
+        já cria pra TODO `_CTRL`, mesmo princípio exato do bridge
+        `_MCH_IK_Transfer` da cadeia de IK: rest orientation do MCH (ou
         seja, a do ORG original, INTOCADA -- NÃO redirecionada, ao
-        contrário do CTRL acima), e filho REAL do `_CTRL` correspondente
-        (não do bridge anterior). O MCH normal (criado pelo pipeline
-        genérico, já com FK_CopyRotation/FK_CopyScale/FK_CopyLocation
-        mirando no CTRL) tem esses MESMOS constraints RETARGETADOS pro
-        bridge em vez do CTRL direto (ver _build_tail_pose_constraints)
-        -- exatamente por que o `_IK_MCH` existe: copiar rotação em World
+        contrário do CTRL acima), filho REAL do `_CTRL` correspondente.
+        Essa etapa aqui não CRIA mais o bridge (só o `.get()`, já criado
+        antes) -- só precisa dele pra montar `tail_bones` (ver
+        tail_chains_data abaixo, consumido por anim_importer.py). O MCH
+        normal (FK_CopyRotation/FK_CopyScale/FK_CopyLocation) já mira
+        nesse bridge desde o loop genérico (ver _build_pose_constraints)
+        -- exatamente por que o bridge existe: copiar rotação em World
         Space de um bone cuja rest orientation foi alterada (o CTRL,
-        agora redirecionado) sai errado/invertido sem esse intermediário
+        aqui redirecionado) sai errado/invertido sem esse intermediário
         de rest "limpa".
 
         Hierarquia final por segmento:
-            ORG -> (constraint) -> MCH -> (constraint) -> _Tail (bridge)
-            _Tail (bridge) -- parent real -> _CTRL
+            ORG -> (constraint) -> MCH -> (constraint) -> _MCH_Transfer (bridge)
+            _MCH_Transfer (bridge) -- parent real -> _CTRL
             _CTRL -- parent real -> _CTRL anterior da cauda
 
         Collections: _CTRL (a cadeia real, editável) fica em Main/Tail,
         visível -- é nela que o usuário seleciona/anima e onde um addon
-        de física deve prender os constraints. O bridge _Tail fica em
-        Internal/Specials (mesma collection do bridge _IK_MCH, ver
-        COLL_MCH_IK -- renomeada de "MCH-IK" pra "Specials" nesta
-        versão), oculta por padrão -- é só mecanismo interno, nunca
-        precisa ser selecionado."""
-        coll_internal = ensure_bone_collection(armature, COLL_INTERNAL)
-        coll_specials = ensure_bone_collection(armature, COLL_MCH_IK, parent=coll_internal)
+        de física deve prender os constraints. O bridge `_MCH_Transfer`
+        fica em Internal/Specials (mesma collection do bridge
+        `_MCH_IK_Transfer`, ver COLL_MCH_IK -- renomeada de "MCH-IK" pra
+        "Specials" nesta versão), oculta por padrão -- é só mecanismo
+        interno, nunca precisa ser selecionado."""
         coll_main = ensure_bone_collection(armature, COLL_MAIN)
         coll_tail = ensure_bone_collection(armature, COLL_MAIN_TAIL, parent=coll_main)
 
@@ -5060,20 +5231,28 @@ class RIG_OT_hytale_generate_rig(Operator):
                         f"left as-is.",
                     )
 
-            # 3) Bridge _Tail por segmento -- rest = ORG original
-            # (create_bone_like não redireciona nada), filho REAL do
-            # _CTRL correspondente (não do bridge anterior). Vai pra
-            # Internal/Specials, não Main/Tail (ver docstring acima).
+            # 3) Bridge _MCH_Transfer por segmento -- v0.13: já existe
+            # (o loop genérico de _build_edit_bones cria um pra TODO
+            # _CTRL, ANTES de _build_tail_layer rodar) -- aqui só
+            # `.get()` (não cria, não reatribui parent/collection de
+            # novo, o loop genérico já faz isso pra TODOS, tail incluído).
+            # Se não achar (não deveria acontecer no fluxo normal --
+            # mesma ordem de _build_edit_bones sempre roda o loop
+            # genérico primeiro), avisa e pula a cadeia.
             tail_bones = []
-            for i, org in enumerate(chain):
-                bridge, is_new = create_bone_like(edit_bones, org, org.name + SUFFIX_TAIL)
-                if is_new:
-                    bridge[PROP_RIG_LAYER] = "TAIL"
-                    stats["tail"] += 1
-                bridge.parent = ctrl_bones[i]  # toda vez -- corrige cadeias de uma revisão anterior também
-                bridge.use_connect = False
-                coll_specials.assign(bridge)
+            missing_bridge = False
+            for org in chain:
+                bridge = edit_bones.get(org.name + SUFFIX_MCH_TRANSFER)
+                if bridge is None:
+                    self.report(
+                        {"WARNING"},
+                        f"Tail: bridge bone '{org.name + SUFFIX_MCH_TRANSFER}' not found -- skipped.",
+                    )
+                    missing_bridge = True
+                    break
                 tail_bones.append(bridge)
+            if missing_bridge:
+                continue
 
             tail_chains_data.append(
                 {
@@ -5091,16 +5270,121 @@ class RIG_OT_hytale_generate_rig(Operator):
 
         return tail_chains_data
 
+    def _apply_continuous_chain_redirect(self, armature, edit_bones):
+        """v0.13 -- "Continuous Chain" (ver HytaleIKChainItem.continuous_chain/
+        continuous_chain_link_bone): generaliza pra HEAD e SPINE o MESMO
+        truque que a cadeia TAIL já usa (ver _build_tail_layer) -- o
+        `_CTRL` de cada bone listado (ver _head_spine_bone_names) tem o
+        TAIL redirecionado pro HEAD do próximo da lista, formando uma
+        cadeia visualmente contínua. O HEAD de cada bone NUNCA muda
+        (fica sempre na posição original do ORG) -- só o TAIL se move.
+        NÃO precisa de bridge próprio nem retarget de constraint nenhum:
+        desde a v0.13, TODO `_CTRL` já tem um `_MCH_Transfer` com rest
+        limpa (ver SUFFIX_MCH_TRANSFER/_build_edit_bones), que já é o
+        alvo do FK_CopyRotation/_Scale/_Location do MCH -- mexer só no
+        TAIL do `_CTRL` aqui já é suficiente, o resto do pipeline nem
+        precisa saber que isso aconteceu.
+
+        Roda em QUALQUER entrada HEAD/SPINE configurada, ligada ou não
+        -- pra cada uma, primeiro RESETA o Tail/Roll de cada `_CTRL`
+        listado pro original do próprio ORG (idempotente: permite
+        ligar/desligar o toggle, ou trocar continuous_chain_link_bone,
+        e "Create Rig" de novo sempre convergir pro estado certo, nunca
+        acumular de uma execução anterior) -- só DEPOIS disso, se
+        `continuous_chain` estiver ligado, aplica o redirect de verdade.
+
+        O ÚLTIMO bone da lista é tratado à parte: se
+        `continuous_chain_link_bone` apontar pra um bone ORG válido, o
+        Tail dele é redirecionado pro HEAD desse alvo (permite, por
+        exemplo, o último bone de uma cadeia SPINE -- ex. "Chest" --
+        conectar no primeiro bone de uma cadeia HEAD -- ex. "Neck1"),
+        mesmo sendo entradas SEPARADAS da lista; se o campo estiver
+        vazio (ou não resolver), o último bone fica com o Tail/Roll
+        original do próprio ORG (igual a ponta de uma cadeia TAIL).
+
+        CAVEAT conhecido -- Hytale_SpineFollow (ver _build_spine_follow/
+        SPINE_FOLLOW_BONES, hoje Belly_CTRL e Chest_CTRL): é um Copy
+        Transforms em espaço LOCAL (relativo à PRÓPRIA rest do bone, ao
+        contrário do World Space que o resto do rig usa) -- mudar o Tail
+        de Belly_CTRL/Chest_CTRL aqui muda também os eixos locais deles,
+        então o "empurrão" que esse constraint aplica quando o usuário
+        move o root.spine_CTRL passa a se manifestar numa direção
+        levemente diferente de antes. EM REPOUSO (root.spine_CTRL sem
+        pose, o caso comum) isso não importa -- mix_mode=AFTER_FULL com
+        alvo em identidade é sempre um no-op, então nada muda pra quem
+        nunca mexe no root.spine_CTRL. Só afeta o "follow-through" de
+        quem ativamente anima o root.spine_CTRL numa Spine com
+        Continuous Chain ligado -- não tentei compensar isso aqui (seria
+        um cálculo à parte, e o efeito é pequeno pros influence típicos,
+        0.5/0.63); se algum dia isso incomodar visualmente, é aqui que
+        precisa mexer."""
+        applied = 0
+        for item in armature.hytale_ik_chains:
+            if item.chain_type not in ("HEAD", "SPINE"):
+                continue
+
+            names = [name for name in _head_spine_bone_names(item) if name]
+            ctrl_bones = []
+            for name in names:
+                org = edit_bones.get(name)
+                ctrl = edit_bones.get(name + SUFFIX_CTRL)
+                if org is None or ctrl is None:
+                    continue  # já reportado em outro lugar (RIG_OT_hytale_validate_rig) -- não duplica warning aqui
+                ctrl_bones.append((org, ctrl))
+                # Baseline idempotente -- ver docstring acima.
+                ctrl.tail = org.tail.copy()
+                ctrl.roll = org.roll
+
+            # >= 1 (não >= 2): mesmo com só UM bone configurado nesta
+            # entrada (ex.: HEAD sem Neck e sem Head End -- só "Head"),
+            # o link pro continuous_chain_link_bone ainda faz sentido --
+            # é só o loop de "meio da cadeia" logo abaixo (range(len-1))
+            # que naturalmente não roda com 1 elemento só.
+            if not item.continuous_chain or not ctrl_bones:
+                continue
+
+            for i in range(len(ctrl_bones) - 1):
+                org_i, ctrl_i = ctrl_bones[i]
+                next_org, _ = ctrl_bones[i + 1]
+                ctrl_i.tail = next_org.head.copy()
+                ctrl_i.align_roll(org_i.z_axis)
+                applied += 1
+
+            last_org, last_ctrl = ctrl_bones[-1]
+            link_name = (item.continuous_chain_link_bone or "").strip()
+            link_org = edit_bones.get(link_name) if link_name else None
+            if link_org is not None:
+                last_ctrl.tail = link_org.head.copy()
+                last_ctrl.align_roll(last_org.z_axis)
+                applied += 1
+            elif link_name:
+                self.report(
+                    {"WARNING"},
+                    f"{item.chain_type.title()} '{item.label or last_org.name}': continuous_chain connect "
+                    f"target '{link_name}' not found -- last bone kept its own Tail.",
+                )
+        return applied
+
     def _build_tail_pose_constraints(self, obj, tail_chains_data):
-        """Pose Mode: retargeta, pro bridge `_Tail`, os MESMOS constraints
-        que o loop genérico de _build_pose_constraints já criou no MCH
-        mirando no CTRL (FK_CopyRotation/FK_CopyScale/FK_CopyLocation --
-        ensure_copy_constraint() só troca o `subtarget`, não recria
-        nada). Precisa rodar DEPOIS de _build_pose_constraints. Nenhum
-        driver de switch envolvido -- bones de cauda não entram em
-        chains_data (só Arm/Leg entram lá), então o loop genérico já os
-        deixa com influence=1.0 fixa (sem FK/IK, sempre "ligado"), exatamente
-        o que a cauda precisa."""
+        """v0.13: desde que Tail passou a reaproveitar o bridge
+        genérico `_MCH_Transfer` (ver _build_tail_layer), o loop
+        genérico de _build_pose_constraints JÁ deixa
+        FK_CopyRotation/FK_CopyScale/FK_CopyLocation (em MCH) mirando no
+        subtarget certo (`data["tail_bones"][i]`, que é literalmente o
+        mesmo bridge) pra bones de cauda também -- não é mais uma cadeia
+        DIFERENTE do resto do rig, só um `_CTRL` cujo tail foi
+        redirecionado. Este método virou uma reafirmação idempotente
+        (ensure_copy_constraint com o MESMO subtarget que já está lá),
+        mantida por segurança/clareza de intenção e pra continuar
+        reportando `tail_constraint_count` no resumo de "Create Rig" --
+        sem efeito nenhum na prática, mas retirar o call site é uma
+        mudança maior que não faz falta agora. Precisa rodar DEPOIS de
+        _build_pose_constraints só por causa disso (senão os
+        constraints ainda não existiriam pra reafirmar). Nenhum driver
+        de switch envolvido -- bones de cauda não entram em chains_data
+        (só Arm/Leg entram lá), então o loop genérico já os deixa com
+        influence=1.0 fixa (sem FK/IK, sempre "ligado"), exatamente o
+        que a cauda precisa."""
         pose_bones = obj.pose.bones
         count = 0
         for data in tail_chains_data:
@@ -5281,7 +5565,7 @@ class RIG_OT_hytale_generate_rig(Operator):
         """Pra cada cadeia resolvida (ver _resolve_chains): um bone `_IK`
         por segmento (raiz/meio com parentesco real espelhando ORG -- ou
         o parent_override do item; ponta solta + switch), um bone-ponte
-        `_IK_MCH` por segmento, e um pole target `_Pole_CTRL`."""
+        `_MCH_IK_Transfer` por segmento, e um pole target `_Pole_CTRL`."""
         chains_data = []
 
         for resolved in resolved_chains:
@@ -5416,7 +5700,7 @@ class RIG_OT_hytale_generate_rig(Operator):
                     ik_bones[0].use_connect = False
 
             for i, org in enumerate(chain):
-                bridge, is_new = create_bone_like(edit_bones, org, org.name + SUFFIX_IK_MCH)
+                bridge, is_new = create_bone_like(edit_bones, org, org.name + SUFFIX_MCH_IK_TRANSFER)
                 if is_new:
                     bridge.parent = ik_bones[i]  # parentesco REAL, é o truque do bridge
                     bridge.use_connect = False
@@ -5499,6 +5783,87 @@ class RIG_OT_hytale_generate_rig(Operator):
             )
 
         return chains_data
+
+    def _apply_head_follow_parent(self, armature, edit_bones):
+        """v0.13.4 -- decide, EM EDIT MODE, se o sistema "Head Follow"
+        (ver _build_head_follow, Pose Mode) deve existir NESTA execução
+        de "Create Rig" -- lendo o toggle "Head Free/Lock"
+        (HytaleIKChainItem.head_follow_enabled) de QUALQUER entrada
+        HEAD que o tenha ligado (normalmente só existe uma entrada
+        HEAD, mas não faz mal olhar todas).
+
+        v0.13.3 tentou resolver isso SEM toggle nenhum, medindo se a
+        geometria já estava alinhada (dependendo do usuário ter
+        configurado "Continuous Chain" na cadeia certa) -- funcionava,
+        mas a combinação certa dependia de qual entrada (HEAD com Neck
+        encadeado, OU SPINE cruzando pra HEAD sem Neck) fazia o
+        alinhamento acontecer, o que era confuso de configurar. v0.13.4
+        simplifica: só precisamos de UM redirect (o Tail do predecessor
+        IMEDIATO de "Head" -- Neck, se existir; Chest, se não -- pro
+        Head de "Head"), não da cadeia inteira -- então "Head Free/Lock"
+        faz esse único redirect SOZINHO, sem precisar de Continuous
+        Chain configurado em lugar nenhum.
+
+        Roda em QUALQUER caso (idempotente, toda vez): se o toggle
+        estiver ligado, redireciona o Tail do predecessor (mesmo truque
+        de _apply_continuous_chain_redirect, só que pra UM bone só) e
+        reparenta Head_CTRL pro Origin_CTRL (deixa pronto pra
+        _build_head_follow montar os constraints depois, em Pose Mode);
+        se estiver desligado, RESETA o Tail/Roll do predecessor pro
+        original do próprio ORG dele (desfaz um redirect de uma
+        execução anterior, se o toggle foi ligado e depois desligado) e
+        garante que Head_CTRL fique com o parent NATURAL que o loop
+        genérico já teria dado sozinho (o `_CTRL` do pai real do ORG
+        "Head") -- sem isso, desligar o toggle deixaria Head_CTRL preso
+        no Origin_CTRL sem nenhum constraint que desse sentido a isso.
+
+        Retorna (bool, str|None): (True, nome do `_CTRL`-fonte) se
+        ativo, (False, None) se não -- consumido por _build_head_follow
+        (Pose Mode) pra decidir se monta os constraints, e qual bone
+        mirar."""
+        head_org_name = HEAD_COLLECTION_ROOT[: -len(SUFFIX_CTRL)]
+        head_org = edit_bones.get(head_org_name)
+        head_ctrl = edit_bones.get(HEAD_COLLECTION_ROOT)
+        if head_org is None or head_ctrl is None or head_org.parent is None:
+            return False, None
+
+        source_org = head_org.parent  # EditBone direto -- é o pai real do ORG "Head"
+        source_name = source_org.name + SUFFIX_CTRL
+        source_ctrl = edit_bones.get(source_name)
+        if source_ctrl is None:
+            return False, None
+
+        enabled = any(
+            item.chain_type == "HEAD" and item.head_follow_enabled for item in armature.hytale_ik_chains
+        )
+
+        if not enabled:
+            source_ctrl.tail = source_org.tail.copy()
+            source_ctrl.roll = source_org.roll
+            head_ctrl.parent = source_ctrl
+            head_ctrl.use_connect = False
+            return False, None
+
+        # Redireciona o Tail do predecessor pro Head de "Head" -- mesmo
+        # truque de _apply_continuous_chain_redirect (align_roll com o
+        # eixo Z do PRÓPRIO org do predecessor, não o de "Head").
+        source_ctrl.tail = head_org.head.copy()
+        source_ctrl.align_roll(source_org.z_axis)
+
+        origin_ctrl = edit_bones.get(ROOT_MASTER_PARENT)
+        if origin_ctrl is None:
+            # Sem Origin_CTRL não dá pra montar o sistema -- cai pro
+            # natural (o redirect do Tail acima já rodou, mas sem
+            # Origin_CTRL o resto não faz sentido -- Head_CTRL segue o
+            # predecessor pelo parentesco real mesmo, que já bate com a
+            # posição nova do Tail dele).
+            head_ctrl.parent = source_ctrl
+            head_ctrl.use_connect = False
+            return False, None
+
+        head_ctrl.parent = origin_ctrl
+        head_ctrl.use_connect = False
+        return True, source_name
 
     @staticmethod
     def _pole_position(pole_ref, distance, invert):
@@ -5896,30 +6261,40 @@ class RIG_OT_hytale_generate_rig(Operator):
         for data in chains_data:
             marked_names.update(data["org_names"])
 
-        # Camada base: ORG segue MCH. MCH segue CTRL em World Space
-        # (Rotation/Scale sempre; Location sempre que o bone não for
-        # conectado ao pai).
+        # Camada base: ORG segue MCH. MCH segue o bridge _MCH_Transfer
+        # (não mais o CTRL direto -- v0.13, ver SUFFIX_MCH_TRANSFER) em
+        # World Space (Rotation/Scale sempre; Location sempre que o
+        # bone não for conectado ao pai). O bridge é filho REAL do
+        # CTRL com rest limpa (igual ao MCH/ORG) -- é isso que deixa o
+        # CTRL livre pra uma feature futura reposicionar sem que essa
+        # cópia em World Space saia torta (constraint World Space
+        # ignora a rest de quem ele copia; parentesco real, não).
         for bone in armature.bones:
             if PROP_RIG_LAYER in bone.keys():
                 continue
             org_name = bone.name
             mch_name = org_name + SUFFIX_MCH
             ctrl_name = org_name + SUFFIX_CTRL
-            if mch_name not in pose_bones or ctrl_name not in pose_bones:
+            transfer_name = org_name + SUFFIX_MCH_TRANSFER
+            if mch_name not in pose_bones or ctrl_name not in pose_bones or transfer_name not in pose_bones:
                 continue
             mch_pose = pose_bones[mch_name]
 
             ensure_copy_set(pose_bones[org_name], obj, mch_name, CONSTRAINT_ORG_TO_MCH)
 
-            fk_rot = ensure_copy_constraint(mch_pose, obj, ctrl_name, "ROTATION", CONSTRAINT_FK_ROT, space="WORLD")
-            fk_scale = ensure_copy_constraint(mch_pose, obj, ctrl_name, "SCALE", CONSTRAINT_FK_SCALE, space="WORLD")
+            fk_rot = ensure_copy_constraint(
+                mch_pose, obj, transfer_name, "ROTATION", CONSTRAINT_FK_ROT, space="WORLD"
+            )
+            fk_scale = ensure_copy_constraint(
+                mch_pose, obj, transfer_name, "SCALE", CONSTRAINT_FK_SCALE, space="WORLD"
+            )
 
             is_chain_bone = org_name in marked_names
 
             fk_loc = None
             if not bone.use_connect:
                 fk_loc = ensure_copy_constraint(
-                    mch_pose, obj, ctrl_name, "LOCATION", CONSTRAINT_FK_LOC, space="WORLD"
+                    mch_pose, obj, transfer_name, "LOCATION", CONSTRAINT_FK_LOC, space="WORLD"
                 )
             else:
                 old_loc = mch_pose.constraints.get(CONSTRAINT_FK_LOC)
@@ -5946,7 +6321,7 @@ class RIG_OT_hytale_generate_rig(Operator):
             switch_prop = data["switch_property"]
 
             if BONE_PROPERTIES in pose_bones:
-                ensure_fk_ik_switch_property(pose_bones[BONE_PROPERTIES], switch_prop)
+                ensure_switch_property(pose_bones[BONE_PROPERTIES], switch_prop)
             else:
                 self.report(
                     {"WARNING"},
@@ -6044,7 +6419,7 @@ class RIG_OT_hytale_generate_rig(Operator):
 
             for org_name in org_names:
                 mch_name = org_name + SUFFIX_MCH
-                bridge_name = org_name + SUFFIX_IK_MCH
+                bridge_name = org_name + SUFFIX_MCH_IK_TRANSFER
                 if mch_name not in pose_bones:
                     continue
                 mch_pose = pose_bones[mch_name]
@@ -6056,7 +6431,7 @@ class RIG_OT_hytale_generate_rig(Operator):
                     continue
 
                 # IK_CopyRotation/IK_CopyScale em World Space -- miram no
-                # bridge (_IK_MCH): tem a MESMA rest orientation do MCH
+                # bridge (_MCH_IK_Transfer): tem a MESMA rest orientation do MCH
                 # (o _IK não tem mais, desde que ganhou tail/roll
                 # corrigidos), garantindo que a cópia não saia invertida.
                 ik_rot = ensure_copy_constraint(
@@ -6114,6 +6489,125 @@ class RIG_OT_hytale_generate_rig(Operator):
             con.mix_mode = "AFTER_FULL"
             con.driver_remove("influence")
             con.influence = influence
+
+    def _build_head_follow(self, obj, active, source):
+        """v0.13.4 -- "Head Follow" (Pose Mode). `active`/`source`
+        JÁ FORAM DECIDIDOS em Edit Mode por _apply_head_follow_parent
+        (chamada de dentro de _build_edit_bones, ANTES desta função --
+        ver stats["head_follow_active"]/stats["head_follow_source"] em
+        execute()) -- esta função só CONSTRÓI (ou LIMPA) os constraints
+        de acordo, sem recalcular geometria nenhuma de novo (single
+        source of truth: a decisão -- e o motivo dela -- moram só lá).
+
+        Quando ATIVO (Head_CTRL já reparentado pro Origin_CTRL por
+        _apply_head_follow_parent): "seguir o `source`" vira uma
+        ESCOLHA feita por DOIS constraints com papéis bem separados
+        (nunca um só fazendo as duas coisas, pra não precisar
+        reimplementar a decomposição loc/rot que um Child Of "cheio"
+        faria sozinho):
+
+          1. CONSTRAINT_HEAD_FOLLOW_ROT (Child Of, só canais de
+             Rotation/Scale -- Location DESLIGADO de propósito, senão
+             brigaria com o Copy Location abaixo) -- influência ligada a
+             PROP_HEAD_FOLLOW_SWITCH (bone PROPERTIES) via
+             add_switch_driver, expression "switch" DIRETA (v0.13.1 --
+             ANTES era "1 - switch", invertida -- trocada a pedido:
+             switch=1 (default) -> influência 1 -> segue a
+             rotação/escala do `source`, igual sempre foi. switch=0 ->
+             influência 0 -> rotação LIVRE (Head_CTRL para de herdar a
+             rotação do `source`, mas continua seguindo a posição via #2).
+             Default do property É 1 (não 0 -- ver ensure_switch_property/
+             default_value abaixo), justamente pra um rig recém-gerado
+             continuar parecendo com o de antes desta feature (sempre
+             seguindo o predecessor) sem o usuário precisar ligar nada.
+
+          2. CONSTRAINT_HEAD_FOLLOW_LOC (Copy Location, World Space,
+             head_tail=HEAD_FOLLOW_LOC_HEAD_TAIL -- mira o TAIL do
+             `source`, não o Head dele) -- SEMPRE ativo, sem
+             switch/driver nenhum. Cuida só da POSIÇÃO -- Head_CTRL
+             sempre acompanha o "arco" de mover/rotacionar o tronco,
+             independente do switch acima.
+
+        ORDEM no stack de constraints IMPORTA (v0.13.1 -- pedido
+        explícito): o Child Of (#1) precisa vir ANTES do Copy Location
+        (#2) -- na ordem errada, a cabeça acaba aparecendo fora do
+        lugar. Como ensure_copy_constraint/ensure_child_of_constraint só
+        REAPROVEITAM um constraint já existente pelo NOME (não recriam,
+        não reordenam sozinhos), criar os dois na ordem certa não é
+        suficiente pra corrigir um rig que já foi gerado com a ordem
+        antiga -- por isso o reorder explícito no fim (.constraints.move),
+        que roda TODA VEZ, idempotente.
+
+        Quando INATIVO (`active=False`, Head_CTRL já com o parent
+        NATURAL, cuidado por _apply_head_follow_parent): esta função
+        LIMPA qualquer resquício de uma execução ANTERIOR em que Head
+        Follow esteve ativo (constraints + custom property) -- senão,
+        desligar Continuous Chain deixaria os dois constraints
+        "orfãos", ainda mirando um `source` que já não corresponde mais
+        à posição real, ou pior: sem source nenhum válido.
+
+        Set Inverse do Child Of acontece à parte (ver
+        _apply_pole_childof_inverses, que também cobre esta constraint
+        agora) -- precisa rodar em Pose Mode, DEPOIS que o constraint já
+        existe."""
+        pose_bones = obj.pose.bones
+        if HEAD_COLLECTION_ROOT not in pose_bones:
+            return False
+        head_pose = pose_bones[HEAD_COLLECTION_ROOT]
+
+        if not active or source is None or source not in pose_bones:
+            # Limpeza idempotente -- ver docstring acima.
+            for cname in (CONSTRAINT_HEAD_FOLLOW_ROT, CONSTRAINT_HEAD_FOLLOW_LOC):
+                con = head_pose.constraints.get(cname)
+                if con is not None:
+                    head_pose.constraints.remove(con)
+            if BONE_PROPERTIES in pose_bones:
+                props_bone = pose_bones[BONE_PROPERTIES]
+                if PROP_HEAD_FOLLOW_SWITCH in props_bone.keys():
+                    del props_bone[PROP_HEAD_FOLLOW_SWITCH]
+            return False
+
+        if BONE_PROPERTIES not in pose_bones:
+            self.report(
+                {"WARNING"},
+                f"'{BONE_PROPERTIES}' not found -- skipping Head Follow switch property "
+                f"'{PROP_HEAD_FOLLOW_SWITCH}' (and its driver).",
+            )
+            return False
+
+        ensure_switch_property(
+            pose_bones[BONE_PROPERTIES],
+            PROP_HEAD_FOLLOW_SWITCH,
+            description=f"1 = Follow {source} (default), 0 = Free rotation (Head_CTRL keeps its own "
+            f"rotation/scale, still follows {source}'s position)",
+            default_value=1,
+        )
+
+        # Child Of PRIMEIRO -- ver docstring acima (ordem importa).
+        rot_con = ensure_child_of_constraint(head_pose, obj, source, CONSTRAINT_HEAD_FOLLOW_ROT, 1.0)
+        # Location DESLIGADO -- é o Copy Location (#2) quem cuida disso.
+        # Rotation/Scale LIGADOS -- são o que o switch controla.
+        rot_con.use_location_x = rot_con.use_location_y = rot_con.use_location_z = False
+        rot_con.use_rotation_x = rot_con.use_rotation_y = rot_con.use_rotation_z = True
+        rot_con.use_scale_x = rot_con.use_scale_y = rot_con.use_scale_z = True
+        # v0.13.1 -- expression direta (não mais "1 - switch"): switch=1
+        # -> influência 1 -> segue. Ver docstring acima.
+        add_switch_driver(rot_con, obj, BONE_PROPERTIES, PROP_HEAD_FOLLOW_SWITCH, expression="switch")
+
+        loc_con = ensure_copy_constraint(
+            head_pose, obj, source, "LOCATION", CONSTRAINT_HEAD_FOLLOW_LOC,
+            space="WORLD", head_tail=HEAD_FOLLOW_LOC_HEAD_TAIL,
+        )
+
+        # Reorder idempotente -- corrige TAMBÉM um rig gerado antes desta
+        # correção (onde o Copy Location já existe ANTES do Child Of no
+        # stack). .find() devolve o índice pelo nome; .move() desloca.
+        rot_index = head_pose.constraints.find(CONSTRAINT_HEAD_FOLLOW_ROT)
+        loc_index = head_pose.constraints.find(CONSTRAINT_HEAD_FOLLOW_LOC)
+        if rot_index != -1 and loc_index != -1 and loc_index < rot_index:
+            head_pose.constraints.move(loc_index, rot_index)
+
+        return True
 
 
 class RIG_OT_hytale_shape_template_apply(Operator):
@@ -6209,8 +6703,10 @@ def _template_source(list_func, name):
 #                pole_angle_manual, pole_angle_fine_tune, extra_ik_location
 #   TAIL:        root_bone, tip_bone, extra_ik_location,
 #                tail_tip_rotation_axis, tail_tip_rotation_deg
-#   HEAD:        neck_count, neck_bone_1..5, head_bone, head_end_bone
-#   SPINE:       spine_count, pelvis_bone, spine_bone_1..4
+#   HEAD:        neck_count, neck_bone_1..5, head_bone, head_end_bone, continuous_chain,
+#                continuous_chain_link_bone, head_follow_enabled
+#   SPINE:       spine_count, pelvis_bone, spine_bone_1..4, continuous_chain,
+#                continuous_chain_link_bone
 #   ATTACHMENTS: attachments_count, attachment_bone_1..ATTACHMENTS_MAX_COUNT
 #   TEXTURE_PICKER:  texture_picker_bone, texture_picker_ui_parent_bone, texture_picker_plane_scale, texture_picker_plane_offset_x/_y,
 #                texture_picker_grid_cols/_rows/_cell_width/_cell_height,
@@ -6229,6 +6725,12 @@ _IK_CHAIN_JSON_FIELDS = (
     "neck_count", "neck_bone_1", "neck_bone_2", "neck_bone_3", "neck_bone_4", "neck_bone_5",
     "head_bone", "head_end_bone",
     "spine_count", "pelvis_bone", "spine_bone_1", "spine_bone_2", "spine_bone_3", "spine_bone_4",
+    # v0.13 -- "Continuous Chain", compartilhado por HEAD/SPINE (v0.13.4:
+    # sem UI, mas ainda salvo/carregado -- ver comentário em
+    # HytaleIKChainItem.continuous_chain).
+    "continuous_chain", "continuous_chain_link_bone",
+    # v0.13.4 -- "Head Free/Lock", exclusivo de HEAD.
+    "head_follow_enabled",
     "attachments_count", *(f"attachment_bone_{i}" for i in range(1, ATTACHMENTS_MAX_COUNT + 1)),
     "texture_picker_bone", "texture_picker_ui_parent_bone", "texture_picker_plane_scale", "texture_picker_plane_offset_x", "texture_picker_plane_offset_y",
     "texture_picker_grid_cols", "texture_picker_grid_rows",
