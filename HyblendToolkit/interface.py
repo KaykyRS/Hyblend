@@ -55,6 +55,8 @@ from .rigger import (
     RIG_OT_hytale_bone_collection_move,
     RIG_OT_hytale_bone_collection_remove,
     RIG_OT_hytale_bone_collection_reset_grid,
+    RIG_OT_hytale_camera_create,
+    RIG_OT_hytale_camera_remove,
     RIG_OT_hytale_clear_generated,
     RIG_OT_hytale_collection_template_apply,
     RIG_OT_hytale_collection_template_delete,
@@ -74,6 +76,8 @@ from .rigger import (
     RIG_OT_hytale_shape_template_apply,
     RIG_OT_hytale_shape_template_delete,
     RIG_OT_hytale_shape_template_save,
+    RIG_OT_hytale_shape_vertex_edit_mode_enter,
+    RIG_OT_hytale_shape_vertex_edit_mode_finish,
     RIG_OT_hytale_validate_rig,
     SUFFIX_CTRL,
     SUFFIX_IK,
@@ -417,10 +421,47 @@ class HYTALE_PT_main(Panel):
     # Rig
     # ------------------------------------------------------------------
 
+    def _draw_shape_vertex_edit_active(self, layout, context, lang, obj):
+        """Desenhado no lugar do resto de _draw_rig enquanto o objeto
+        ATIVO é a malha de um widget em Vertex Edit Mode (ver
+        RIG_OT_hytale_shape_vertex_edit_mode_enter/finish em rigger/
+        rig.py) -- nesse estado obj.type é 'MESH', não 'ARMATURE', então
+        o resto de _draw_rig (que sempre espera um Armature ativo) não
+        desenharia nada útil aqui, só o hint de "nenhum Armature
+        selecionado". `obj` já é a malha (chamador confirma obj.type ==
+        'MESH' e a custom property antes de chamar isto)."""
+        box = layout.box()
+        box.label(text=tr("panel.label_vertex_edit_active", lang), icon="EDITMODE_HLT")
+        bone_name = obj.get("hytale_vertex_edit_bone", "")
+        if bone_name:
+            box.label(text=bone_name, icon="BONE_DATA")
+        box.label(text=obj.name, icon="MESH_DATA")
+
+        col = layout.column(align=True)
+        col.scale_y = 1.4
+        col.operator(
+            RIG_OT_hytale_shape_vertex_edit_mode_finish.bl_idname,
+            text=tr("panel.btn_shape_vertex_edit_finish", lang),
+            icon="CHECKMARK",
+        )
+
     def _draw_rig(self, layout, context, lang):
+        obj = context.active_object
+
+        # v0.16 -- Vertex Edit Mode (ver RIG_OT_hytale_shape_vertex_edit_mode_enter
+        # em rigger/rig.py) troca o objeto ATIVO pra malha do widget
+        # (obj.type == 'MESH'), não o Armature -- o resto desta função
+        # sempre espera um Armature ativo, então checamos esse estado
+        # ANTES de tudo, senão o botão de "Finish Vertex Edit" ficaria
+        # inalcançável enquanto a malha está em Edit Mode (obj.type !=
+        # 'ARMATURE' cairia direto no hint "nenhum Armature selecionado"
+        # logo abaixo).
+        if obj is not None and obj.type == "MESH" and obj.get("hytale_vertex_edit_armature"):
+            self._draw_shape_vertex_edit_active(layout, context, lang, obj)
+            return
+
         layout.label(text=tr("panel.warn_rig_experimental", lang), icon="ERROR")
 
-        obj = context.active_object
         is_armature = obj is not None and obj.type == "ARMATURE"
 
         if not is_armature:
@@ -466,7 +507,11 @@ class HYTALE_PT_main(Panel):
             # Mirror Shape). Mirror Shape fica cinza sozinho (poll())
             # quando o bone ativo não começa com "L-"/"R-" -- sempre
             # desenhamos o botão quando há um bone ativo, sem duplicar
-            # essa checagem aqui.
+            # essa checagem aqui. Edit Shape Vertices (v0.16) segue o
+            # mesmo espírito: fica cinza sozinho quando o bone ativo não
+            # tem custom shape nenhum (poll() de RIG_OT_hytale_shape_
+            # vertex_edit_mode_enter) -- pedido explícito do usuário pra
+            # ficar ACIMA de Mirror Shape.
             active_pb = context.active_pose_bone
             box = layout.box()
             if active_pb is None:
@@ -476,6 +521,11 @@ class HYTALE_PT_main(Panel):
                 )
             else:
                 box.label(text=active_pb.name, icon="BONE_DATA")
+                box.operator(
+                    RIG_OT_hytale_shape_vertex_edit_mode_enter.bl_idname,
+                    text=tr("panel.btn_shape_vertex_edit_enter", lang),
+                    icon="EDITMODE_HLT",
+                )
                 box.operator(
                     RIG_OT_hytale_mirror_shape.bl_idname,
                     text=tr("panel.btn_mirror_shape", lang),
@@ -679,6 +729,70 @@ class HYTALE_PT_main(Panel):
                     # em outra entrada.
                     col.separator()
                     col.prop(item, "head_follow_enabled", text=tr("panel.field_head_follow_enabled", lang))
+                    col.separator()
+
+                    # v0.15 -- "Create First Person Camera" (pedido
+                    # explícito do usuário). Mesmo padrão collapsible
+                    # das seções do Texture Picker (Reference Image/
+                    # Companion Bones/Grid) -- caixa própria só pra não
+                    # poluir a entrada HEAD sempre que a opção estiver
+                    # desligada (comportamento padrão).
+                    camera_box = col.box()
+                    camera_header = camera_box.row()
+                    camera_header.prop(
+                        wm, "hytale_show_head_camera",
+                        text=tr("panel.head_camera_section", lang),
+                        icon="TRIA_DOWN" if wm.hytale_show_head_camera else "TRIA_RIGHT",
+                        emboss=False,
+                    )
+                    if wm.hytale_show_head_camera:
+                        camera_col = camera_box.column(align=True)
+                        camera_col.prop(item, "head_camera_enabled", text=tr("panel.field_head_camera_enabled", lang))
+                        if item.head_camera_enabled:
+                            _picker_row_into(
+                                camera_col, "head_camera_parent_bone", tr("panel.field_head_camera_parent_bone", lang)
+                            )
+                            camera_col.label(text=tr("panel.head_camera_offset_label", lang))
+                            offset_row = camera_col.row(align=True)
+                            offset_row.prop(item, "head_camera_offset_x", text=tr("panel.field_head_camera_offset_x", lang))
+                            offset_row.prop(item, "head_camera_offset_y", text=tr("panel.field_head_camera_offset_y", lang))
+                            offset_row.prop(item, "head_camera_offset_z", text=tr("panel.field_head_camera_offset_z", lang))
+                            camera_col.label(text=tr("panel.head_camera_rotation_label", lang))
+                            rotation_row = camera_col.row(align=True)
+                            rotation_row.prop(
+                                item, "head_camera_rotation_x", text=tr("panel.field_head_camera_rotation_x", lang)
+                            )
+                            rotation_row.prop(
+                                item, "head_camera_rotation_y", text=tr("panel.field_head_camera_rotation_y", lang)
+                            )
+                            rotation_row.prop(
+                                item, "head_camera_rotation_z", text=tr("panel.field_head_camera_rotation_z", lang)
+                            )
+                            # v0.15.1 -- FOV agora é campo de verdade
+                            # (pedido explícito do usuário), pra dar pra
+                            # ajustar ANTES de clicar "Create Camera"
+                            # (idempotente -- rodar de novo também
+                            # atualiza o FOV de uma câmera já criada).
+                            camera_col.prop(item, "head_camera_fov", text=tr("panel.field_head_camera_fov", lang))
+                            camera_col.label(text=tr("panel.hint_head_camera", lang), icon="INFO")
+                        # v0.15.1 -- CORRIGIDO: os botões Create/Remove
+                        # ficavam DENTRO do "if item.head_camera_enabled"
+                        # acima -- desmarcar a checkbox depois de já ter
+                        # criado a câmera escondia o botão "Remove
+                        # Camera" junto, sem jeito fácil de limpar uma
+                        # câmera órfã sem reativar a opção ou rodar
+                        # "Remove Generated Bones" (que apaga o rig
+                        # inteiro). Botões agora ficam SEMPRE visíveis
+                        # nesta caixa (Remove funciona independente do
+                        # toggle -- ver RIG_OT_hytale_camera_remove.poll);
+                        # "Create" continua desabilitado sozinho (poll)
+                        # se a opção estiver desligada ou faltar bone.
+                        camera_col.separator()
+                        camera_action_row = camera_col.row(align=True)
+                        camera_action_row.operator(RIG_OT_hytale_camera_create.bl_idname, icon="CAMERA_DATA")
+                        camera_action_row.operator(RIG_OT_hytale_camera_remove.bl_idname, icon="X", text="")
+
+
                     col.separator()
                     col.prop(item, "collection_override", text=tr("panel.field_collection", lang))
                 elif item.chain_type == "SPINE":
@@ -1376,11 +1490,16 @@ def register():
     # personagens não usa Texture Picker, não faz sentido a lista
     # aparecer sempre expandida.
     WindowManager.hytale_show_export_texture_picker = BoolProperty(default=False)
+    # v0.15 -- caixa collapsible da seção "First Person Camera" dentro
+    # de uma entrada HEAD -- mesmo espírito das do Texture Picker acima
+    # (só estado de UI). Fechada por padrão.
+    WindowManager.hytale_show_head_camera = BoolProperty(default=False)
     bpy.utils.register_class(HYTALE_PT_main)
 
 
 def unregister():
     bpy.utils.unregister_class(HYTALE_PT_main)
+    del WindowManager.hytale_show_head_camera
     del WindowManager.hytale_show_export_texture_picker
     del WindowManager.hytale_show_texture_picker_grid
     del WindowManager.hytale_show_texture_picker_companions

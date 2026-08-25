@@ -165,6 +165,21 @@ TRANSLATIONS = {
     # v0.13.4 -- "Head Free/Lock", exclusivo de HEAD (ver
     # HytaleIKChainItem.head_follow_enabled em rigger/rig.py).
     "panel.field_head_follow_enabled": "Head Free/Lock",
+    # v0.15 -- "Create First Person Camera", exclusivo de HEAD (ver
+    # HytaleIKChainItem.head_camera_* em rigger/rig.py).
+    "panel.head_camera_section": "First Person Camera",
+    "panel.field_head_camera_enabled": "Create First Person Camera",
+    "panel.field_head_camera_parent_bone": "Camera Parent Bone",
+    "panel.head_camera_offset_label": "Camera Offset",
+    "panel.field_head_camera_offset_x": "X",
+    "panel.field_head_camera_offset_y": "Y",
+    "panel.field_head_camera_offset_z": "Z",
+    "panel.head_camera_rotation_label": "Camera Rotation (deg)",
+    "panel.field_head_camera_rotation_x": "X",
+    "panel.field_head_camera_rotation_y": "Y",
+    "panel.field_head_camera_rotation_z": "Z",
+    "panel.field_head_camera_fov": "FOV (deg)",
+    "panel.hint_head_camera": "Position/rotation are a starting point -- fine-tune to line up with this character's eyes",
     # v0.9.7 -- campos de Attachments (organizacional, sem IK -- ver
     # HytaleIKChainItem em rigger.py).
     "panel.field_attachments_count": "Attachments Bones Amount",
@@ -228,10 +243,13 @@ TRANSLATIONS = {
     "panel.btn_shape_edit_enter": "Shape Edit Mode",
     "panel.btn_shape_edit_finish": "Finish Shape Edit Mode",
     "panel.hint_shape_edit_no_active_bone": "Select a bone in Pose Mode to edit or mirror its custom shape.",
-    "panel.btn_mirror_shape": "Mirror Shape to Opposite Side",
+    "panel.btn_mirror_shape": "Mirror Shape",
     "panel.field_shape_translation": "Shape Location",
     "panel.field_shape_rotation": "Shape Rotation",
     "panel.field_shape_scale": "Shape Scale",
+    "panel.btn_shape_vertex_edit_enter": "Edit Shape Vertices",
+    "panel.btn_shape_vertex_edit_finish": "Finish Vertex Edit",
+    "panel.label_vertex_edit_active": "Editing custom shape vertices",
     "panel.btn_remove_generated": "Remove Generated Bones",
 
     # -----------------------------------------------------------------

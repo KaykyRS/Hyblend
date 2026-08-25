@@ -104,6 +104,8 @@ from .rig import (  # noqa: F401
     RIG_OT_hytale_bone_collection_move,
     RIG_OT_hytale_bone_collection_remove,
     RIG_OT_hytale_bone_collection_reset_grid,
+    RIG_OT_hytale_camera_create,
+    RIG_OT_hytale_camera_remove,
     RIG_OT_hytale_clear_generated,
     RIG_OT_hytale_collection_template_apply,
     RIG_OT_hytale_collection_template_delete,
@@ -125,6 +127,8 @@ from .rig import (  # noqa: F401
     RIG_OT_hytale_shape_template_apply,
     RIG_OT_hytale_shape_template_delete,
     RIG_OT_hytale_shape_template_save,
+    RIG_OT_hytale_shape_vertex_edit_mode_enter,
+    RIG_OT_hytale_shape_vertex_edit_mode_finish,
     RIG_OT_hytale_validate_rig,
     RIG_UL_hytale_bone_collections,
     RIG_UL_hytale_ik_chains,
@@ -180,6 +184,12 @@ _CLASSES = (
     RIG_OT_hytale_clear_generated,
     RIG_OT_hytale_shape_edit_mode_enter,
     RIG_OT_hytale_shape_edit_mode_finish,
+    # v0.16 -- Vertex Edit Mode, sub-modo de Shape Edit Mode -- registrados
+    # logo depois de Enter/Finish, mesma ordem em que aparecem em rig.py
+    # (dependem do modo "de fora" já estar ativo, ver poll de
+    # RIG_OT_hytale_shape_vertex_edit_mode_enter).
+    RIG_OT_hytale_shape_vertex_edit_mode_enter,
+    RIG_OT_hytale_shape_vertex_edit_mode_finish,
     RIG_OT_hytale_generate_rig,
     RIG_OT_hytale_validate_rig,
     RIG_OT_hytale_mirror_shape,
@@ -190,6 +200,11 @@ _CLASSES = (
     # acrescentados no fim.
     RIG_OT_hytale_texture_picker_create,
     RIG_OT_hytale_texture_picker_remove,
+    # v0.15 -- First Person Camera, exclusivo de HEAD. Mesmo espírito de
+    # Texture Picker acima -- sem dependência de ordem conhecida com o
+    # resto, acrescentados no fim.
+    RIG_OT_hytale_camera_create,
+    RIG_OT_hytale_camera_remove,
 )
 
 
@@ -234,6 +249,15 @@ def register():
         "FK/IK shape-scale drivers -- set/cleared automatically by 'Enter'/'Finish Shape Edit Mode', read by "
         "interface.py to decide which of the two buttons to show and by 'Create Rig'/'Remove Generated Hytale "
         "Rig Bones' to refuse running mid-edit",
+        default=False,
+    )
+    Armature.hytale_shape_vertex_edit_mode = BoolProperty(
+        name="Shape Vertex Edit Mode",
+        description="True while a custom shape's mesh (the widget used by the active pose bone) is open in "
+        "Edit Mode via 'Edit Shape Vertices' -- set/cleared automatically by that operator and 'Finish Vertex "
+        "Edit', read by interface.py to draw the right panel (active_object is the widget MESH in this state, "
+        "not the Armature) and by 'Create Rig'/'Remove Generated Hytale Rig Bones'/'Finish Shape Edit Mode' to "
+        "refuse running with a vertex edit session left dangling",
         default=False,
     )
 
@@ -289,6 +313,7 @@ def unregister():
     del Armature.hytale_bone_collections_initialized
     del Armature.hytale_bone_collections_index
     del Armature.hytale_bone_collections
+    del Armature.hytale_shape_vertex_edit_mode
     del Armature.hytale_shape_edit_mode
     del Armature.hytale_active_collection_template
     del Armature.hytale_active_shape_template

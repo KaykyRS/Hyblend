@@ -327,6 +327,15 @@ TEXTURE_PICKER_UVMAP_NODE_NAME = "Hytale_Texture_Picker_UV_Map"
 # do grid informado (0..num_cols-1 células em X, 0..num_rows-1 em Y).
 CONSTRAINT_TEXTURE_PICKER_LIMIT = "Hytale_Texture_Picker_Limit"
 
+# v0.15 -- "Create First Person Camera", exclusivo de HEAD (ver
+# HytaleIKChainItem.head_camera_enabled/rig.py, _build_first_person_camera).
+# Sufixo do Object Camera criado -- prefixado pelo NOME DO ARMATURE (não
+# por um bone, diferente de TEXTURE_PICKER_PLANE_SUFFIX), porque só existe
+# UMA câmera de primeira pessoa esperada por personagem/armature (não é
+# multi-instância como Texture Picker) -- garante nome único mesmo com
+# vários personagens na mesma cena.
+FIRST_PERSON_CAMERA_SUFFIX = "_FirstPerson_CAM"
+
 # Bone utilitário que guarda TODAS as custom properties de FK/IK switch
 # (uma por cadeia -- ver _switch_property_name) -- fica acima da cabeça,
 # parentado no Head_CTRL, mesmo tamanho/eixo dele. Não deriva de nenhum
@@ -423,15 +432,23 @@ PARENT_OVERRIDE_ALIASES = {
 # você diretamente no Blender -- ver build_hytale_widgets.py (fora do
 # pacote do addon) pra um ponto de partida com formas básicas.
 #
-# Os objetos widget NÃO são linkados em nenhuma collection de cena (mesma
-# técnica do Rigify) -- ficam "órfãos" de propósito: pose_bone.custom_shape
-# já conta como usuário do datablock (não somem ao salvar), mas também não
-# aparecem soltos no viewport/outliner pra alguém selecionar sem querer.
+# v0.16 -- os objetos widget são CÓPIAS POR-PERSONAGEM (ver
+# _widget_instance_name/ensure_widget_objects/get_or_create_widgets_collection
+# em rig.py), linkadas na collection 'WGT - <nome>' dentro de
+# 'Rig - <nome>'. ANTES desta versão era um único objeto GLOBAL
+# compartilhado entre todo Armature do .blend, sem link em collection
+# nenhuma (mesma técnica do Rigify, "órfão" de propósito) -- isso
+# impedia editar o shape por vértice (Vertex Edit Mode) sem afetar
+# outros personagens. A collection 'WGT - <nome>' fica EXCLUÍDA da View
+# Layer por padrão (mesmo efeito prático de antes: pose_bone.custom_shape
+# já conta como usuário do datablock, não some ao salvar, mas também não
+# aparece solto no viewport/Outliner à toa) -- só é reincluída
+# temporariamente durante Vertex Edit Mode.
 # ---------------------------------------------------------------------------
 
 WIDGETS_LIBRARY_SUBDIR = "assets"
 WIDGETS_LIBRARY_FILENAME = "hytale_widgets.blend"
-WIDGETS_NAME_PREFIX = "WGT_hytale_"  # prefixo comum de TODOS os WGT_* abaixo -- usado pra purgar em massa (ver RIG_OT_hytale_clear_generated)
+WIDGETS_NAME_PREFIX = "WGT_hytale_"  # prefixo comum de TODOS os WGT_* abaixo (nome-BASE, dentro de hytale_widgets.blend -- ver _widget_instance_name em rig.py pro nome final por-personagem que efetivamente aparece em bpy.data.objects)
 
 WGT_DEFAULT_FALLBACK = "WGT_hytale_default"  # usado quando o shape "preferido" abaixo não existe ainda
 WIDGET_WIRE_WIDTH = 2.0  # custom_shape_wire_width -- espessura de linha, igual pra TODOS os bones com shape

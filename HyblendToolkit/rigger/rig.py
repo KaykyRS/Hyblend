@@ -25,6 +25,13 @@ de RIG_OT_hytale_generate_rig pra ele poder reaproveitar a MESMA lógica
 sem duplicar, ver comentário ali). RIG_OT_hytale_mirror_shape (Tarefa D,
 novo) mora na seção de Shapes, logo depois de Shape Edit Mode Enter/
 Finish, de quem ele depende (só funciona com o modo ativo).
+
+v0.16 -- widgets viraram cópias POR-PERSONAGEM (ver
+_widget_instance_name/get_or_create_widgets_collection, seção de
+Shapes) em vez de um único objeto global compartilhado, o que abriu
+espaço pra Vertex Edit Mode (RIG_OT_hytale_shape_vertex_edit_mode_enter/
+finish, entre Shape Edit Mode Finish e Mirror Shape): editar o custom
+shape por vértice, não só Translation/Rotation/Scale.
 """
 import math
 import os
@@ -732,8 +739,11 @@ def _iter_shape_scale_drivers(obj):
     deles já é um valor estático, sem driver, já livremente editável a
     qualquer momento; Shape Edit Mode não tem nada a fazer com eles.
 
-    Base pros dois operadores de Shape Edit Mode abaixo (Enter muta cada
-    driver encontrado aqui, Finish só reativa os que encontrar mutados)."""
+    Base pra _mute_shape_scale_drivers/_unmute_shape_scale_drivers/
+    _restore_shape_scale_drivers, logo abaixo, usadas pelos QUATRO
+    operadores de Shape Edit Mode / Vertex Edit Mode (mutar/desmutar/
+    restaurar, conforme cada um precisa -- ver docstring de cada
+    função)."""
     anim_data = getattr(obj, "animation_data", None)
     if anim_data is None:
         return
@@ -743,6 +753,88 @@ def _iter_shape_scale_drivers(obj):
             fcurve = anim_data.drivers.find(data_path, index=i)
             if fcurve is not None and fcurve.driver is not None:
                 yield pb, i, fcurve
+
+
+def _mute_shape_scale_drivers(obj):
+    """Muta cada driver de custom_shape_scale_xyz de `obj` (ver
+    _iter_shape_scale_drivers), resolvendo cada eixo pro "tamanho cheio"
+    (valor hoje embutido na expressão, não o avaliado no momento) antes
+    de mutar -- deixa livre pra redimensionar qualquer custom shape sem
+    o driver de FK/IK sobrescrevendo o valor. Extraído de dentro de
+    RIG_OT_hytale_shape_edit_mode_enter (v0.17) pra RIG_OT_hytale_shape_
+    vertex_edit_mode_finish poder reaproveitar a mesma lógica (ver
+    docstring da seção de Vertex Edit Mode, mais abaixo). Devolve
+    quantos canais foram mutados nesta chamada -- já mutados são
+    ignorados (fcurve.mute não é checado aqui de propósito, sempre
+    reforça o valor "tamanho cheio" e garante mute=True, idempotente)."""
+    muted = 0
+    for pb, i, fcurve in _iter_shape_scale_drivers(obj):
+        driver = fcurve.driver
+        match = _SHAPE_SCALE_DRIVER_VALUE_RE.match(driver.expression or "")
+        if match:
+            pb.custom_shape_scale_xyz[i] = float(match.group(1))
+        fcurve.mute = True
+        muted += 1
+    return muted
+
+
+def _unmute_shape_scale_drivers(obj):
+    """Desmuta cada driver de custom_shape_scale_xyz de `obj` (ver
+    _iter_shape_scale_drivers) SEM reescrever a expressão nem o valor
+    atual do pose bone -- ao contrário de _restore_shape_scale_drivers
+    (que GRAVA o valor atual como o novo "tamanho cheio" permanente na
+    expressão -- ação de "salvar calibração", certa pro Finish Shape
+    Edit Mode externo, mas ERRADA aqui).
+
+    Usado só por RIG_OT_hytale_shape_vertex_edit_mode_enter -- é um
+    toggle TEMPORÁRIO (só quer que os drivers voltem a controlar
+    visibilidade por FK/IK enquanto dura o Vertex Edit de UM bone), não
+    uma ação de "salvar". Chamar _restore_shape_scale_drivers aqui por
+    engano bakearia o valor ATUAL de TODO bone do armature (inclusive
+    de outros bones que o usuário ainda pode estar calibrando, sem ter
+    clicado 'Finish Shape Edit Mode' ainda) como permanente -- bug real
+    encontrado em revisão, não é intencional.
+
+    Desmutar aqui não precisa reescrever nada: assim que o driver
+    reassume, o próximo depsgraph update já sobrescreve
+    custom_shape_scale_xyz sozinho com o valor avaliado da expressão --
+    e _mute_shape_scale_drivers (chamado por RIG_OT_hytale_shape_
+    vertex_edit_mode_finish) sabe voltar pro valor "cheio" certo na
+    saída, porque lê o literal da EXPRESSÃO (não o valor ao vivo, que
+    pode ter sido zerado pelo driver enquanto esteve desmutado) --
+    então nenhuma calibração em andamento de nenhum bone é perdida ou
+    comprometida por esta função. Devolve quantos canais foram
+    desmutados nesta chamada."""
+    unmuted = 0
+    for pb, i, fcurve in _iter_shape_scale_drivers(obj):
+        if fcurve.mute:
+            fcurve.mute = False
+            unmuted += 1
+    return unmuted
+
+
+def _restore_shape_scale_drivers(obj):
+    """Desmuta cada driver de custom_shape_scale_xyz de `obj` que
+    ESTIVER mutado (ver guard `if not fcurve.mute: continue`),
+    regravando o valor atual do pose bone como o novo "tamanho cheio" na
+    expressão -- contrário de _mute_shape_scale_drivers. Extraído de
+    dentro de RIG_OT_hytale_shape_edit_mode_finish (v0.17) pra RIG_OT_
+    hytale_shape_vertex_edit_mode_enter poder reaproveitar a mesma
+    lógica (ver docstring da seção de Vertex Edit Mode, mais abaixo).
+    Devolve quantos canais foram restaurados nesta chamada."""
+    restored = 0
+    for pb, i, fcurve in _iter_shape_scale_drivers(obj):
+        driver = fcurve.driver
+        if not fcurve.mute:
+            continue
+        new_value = _format_shape_scale_literal(float(pb.custom_shape_scale_xyz[i]))
+        if "(1 - switch)" in (driver.expression or ""):
+            driver.expression = f"{new_value}*(1 - switch)"
+        else:
+            driver.expression = f"{new_value}*switch"
+        fcurve.mute = False
+        restored += 1
+    return restored
 
 
 def _widgets_library_path():
@@ -761,32 +853,372 @@ def _widgets_library_path():
     return os.path.join(package_root, WIDGETS_LIBRARY_SUBDIR, WIDGETS_LIBRARY_FILENAME)
 
 
-def ensure_widget_objects(names):
-    """Garante que cada nome em `names` exista em bpy.data.objects,
-    fazendo append (cópia, não link) de hytale_widgets.blend só pros que
-    ainda faltam -- idempotente, igual o resto do pipeline: rodar de novo
-    não duplica nada (objeto já existente com aquele nome é reaproveitado
-    como está, mesmo que o usuário tenha editado o shape manualmente
-    depois).
+def _widget_instance_name(base_name, armature_name):
+    """Nome do objeto TEMPLATE (por-personagem, por-papel) de um widget,
+    ex.: 'WGT_hytale_fk_ring - Steve' -- mesmo sufixo ' - <armature_name>'
+    que resolve_mesh_bone_collection (importer.py) já usa pras
+    collections de malha, pelo mesmo motivo: nomes de Object são únicos
+    GLOBALMENTE em bpy.data.objects, e dois personagens no MESMO .blend
+    não podem mais compartilhar o objeto cru vindo da biblioteca (ver
+    v0.16 no docstring de ensure_widget_objects, abaixo) -- sem o
+    sufixo, o SEGUNDO personagem forçaria o Blender a criar
+    'WGT_hytale_fk_ring.001' sozinho, e cada import posterior geraria
+    mais um em vez de reaproveitar o existente.
 
-    Retorna o conjunto de nomes que NÃO foi possível resolver (arquivo
-    hytale_widgets.blend ausente, ou nome que não existe dentro dele) --
-    o chamador decide como avisar o usuário; isso nunca levanta exceção,
-    porque custom shape é 100% cosmético e não deve travar a geração do
-    resto do rig."""
-    missing = {name for name in names if name not in bpy.data.objects}
-    if not missing:
+    v0.17 -- este objeto é só o TEMPLATE (nunca atribuído a bone nenhum
+    diretamente) -- cada bone recebe sua PRÓPRIA cópia, duplicada deste
+    template (ver _bone_widget_name/_ensure_bone_widget_copy, logo
+    abaixo). Antes da v0.17, este MESMO objeto era compartilhado direto
+    por TODO bone do mesmo papel dentro do personagem -- não é mais."""
+    return f"{base_name} - {armature_name}"
+
+
+def _find_layer_collection(layer_collection, name):
+    """Busca recursiva por um LayerCollection cujo .collection.name bata
+    com `name`, a partir de `layer_collection` (normalmente context.
+    view_layer.layer_collection, a raiz da árvore). Precisa disso porque
+    '.exclude' (Exclude from View Layer) mora no LayerCollection, não no
+    Collection em si (que pode aparecer em mais de uma View Layer, cada
+    uma com seu próprio estado de exclusão) -- ver _set_collection_excluded,
+    logo abaixo, o único lugar que chama isto."""
+    if layer_collection.collection.name == name:
+        return layer_collection
+    for child in layer_collection.children:
+        found = _find_layer_collection(child, name)
+        if found is not None:
+            return found
+    return None
+
+
+def _set_collection_excluded(collection, excluded):
+    """Liga/desliga o checkbox 'Exclude from View Layer' de `collection`
+    na View Layer ATIVA (bpy.context.view_layer) -- mesma técnica que o
+    Rigify usa pra manter a collection WGTS fora do caminho (objetos
+    existem no arquivo/Outliner, mas não aparecem/selecionam na
+    viewport durante o uso normal do rig) sem precisar mexer em
+    hide_viewport de cada objeto individualmente. Silenciosamente não
+    faz nada se a collection não estiver na árvore da View Layer ativa
+    (nunca deveria acontecer no fluxo normal, mas não é motivo pra
+    levantar exceção -- mesmo espírito 100%-cosmético de
+    ensure_widget_objects)."""
+    layer_coll = _find_layer_collection(bpy.context.view_layer.layer_collection, collection.name)
+    if layer_coll is not None:
+        layer_coll.exclude = excluded
+
+
+def _find_rig_collection(armature_obj):
+    """Acha a collection 'Rig - <nome>' que importer.py cria e linka o
+    Armature dentro dela (ver build_character_collections em
+    importer.py) -- procurando pelo NOME EXATO entre as collections em
+    que o Armature está linkado (armature_obj.users_collection), não
+    por busca global em bpy.data.collections (uma cena grande pode ter
+    várias collections com nomes parecidos, em partes diferentes da
+    hierarquia). Cai pra uma busca global só como último recurso, pro
+    caso do Armature ter sido movido manualmente pra outra collection
+    depois do import (a 'Rig - X' pode continuar existindo em outro
+    canto da cena)."""
+    expected_name = f"Rig - {armature_obj.name}"
+    for coll in armature_obj.users_collection:
+        if coll.name == expected_name:
+            return coll
+    return bpy.data.collections.get(expected_name)
+
+
+def _unlink_and_remove_collection(collection):
+    """Remove `collection` de dentro de QUALQUER collection-pai que a
+    contenha (percorre a árvore inteira a partir da Scene Collection --
+    diferente de Object, uma bpy.types.Collection não sabe dizer 'quem é
+    meu pai' direto) e apaga o datablock de bpy.data.collections. Só
+    deve ser chamado com uma collection já VAZIA -- não remove nada de
+    dentro dela; ver o purge de widgets em RIG_OT_hytale_clear_generated,
+    o único chamador hoje."""
+    def _unlink_from(parent):
+        for child in list(parent.children):
+            if child == collection:
+                parent.children.unlink(collection)
+                return True
+            if _unlink_from(child):
+                return True
+        return False
+
+    _unlink_from(bpy.context.scene.collection)
+    bpy.data.collections.remove(collection)
+
+
+def _find_widgets_collection(armature_obj):
+    """Variante 'read-only' de get_or_create_widgets_collection -- devolve
+    a collection 'WGT - <nome>' já existente (via
+    armature_obj['hytale_widgets_collection'], ou o fallback andando a
+    árvore de 'Rig - <nome>'), ou None se este Armature nunca teve
+    'Create Rig' rodado ainda (nenhum widget foi criado). Nunca cria
+    nada -- usado pelo purge de RIG_OT_hytale_clear_generated, que não
+    deve materializar uma collection vazia só pra constatar que não
+    tinha nada pra apagar."""
+    stored_name = armature_obj.get("hytale_widgets_collection")
+    if stored_name:
+        collection = bpy.data.collections.get(stored_name)
+        if collection is not None:
+            return collection
+    rig_collection = _find_rig_collection(armature_obj)
+    if rig_collection is not None:
+        name = f"WGT - {armature_obj.name}"
+        for child in rig_collection.children:
+            if child.name == name:
+                return child
+    return None
+
+
+def get_or_create_widgets_collection(armature_obj):
+    """Devolve (criando se preciso) a collection 'WGT - <nome>' -- onde
+    moram as CÓPIAS locais, por-personagem, dos custom shapes apendados
+    de hytale_widgets.blend (ver ensure_widget_objects). Guarda o nome
+    resolvido em armature_obj['hytale_widgets_collection'] (mesmo
+    princípio de hytale_meshes_main_collection/_attachments_collection
+    em importer.py) pra sobreviver a um rename do Armature depois de
+    criada -- sem isso, _find_rig_collection (que depende do nome ATUAL
+    do Armature pra achar 'Rig - <nome>') deixaria de encontrar a
+    collection certa depois de renomear o personagem.
+
+    Nasce DENTRO de 'Rig - <nome>' quando essa collection existe (fluxo
+    normal de import, ver build_character_collections em importer.py);
+    cai pra criar direto na Scene Collection como fallback se não achar
+    (Armature criado fora do importer.py, ou 'Rig - X' removida/movida
+    manualmente) -- nunca falha silenciosamente, os widgets sempre
+    acabam em algum lugar editável.
+
+    Fica EXCLUÍDA da View Layer ATIVA toda vez que esta função roda (ver
+    _set_collection_excluded) -- reexcluir uma collection que já está
+    excluída não tem efeito nenhum, então chamar isto com frequência
+    (toda vez que um widget pode precisar ser criado/reaproveitado,
+    idempotente igual o resto do pipeline) não reabre a collection à
+    toa no meio de um 'Create Rig'. Vertex Edit Mode reinclui a
+    collection temporariamente por conta própria -- ver
+    RIG_OT_hytale_shape_vertex_edit_mode_enter/finish."""
+    collection = _find_widgets_collection(armature_obj)
+    if collection is None:
+        name = f"WGT - {armature_obj.name}"
+        rig_collection = _find_rig_collection(armature_obj)
+        parent_collection = rig_collection if rig_collection is not None else bpy.context.scene.collection
+        collection = bpy.data.collections.new(name)
+        parent_collection.children.link(collection)
+    armature_obj["hytale_widgets_collection"] = collection.name
+    _set_collection_excluded(collection, True)
+    return collection
+
+
+def ensure_widget_objects(names, armature_obj):
+    """Garante que o TEMPLATE por-personagem (ver _widget_instance_name)
+    de cada base name em `names` exista em bpy.data.objects, linkado na
+    collection 'WGT - <nome>' deste Armature (ver
+    get_or_create_widgets_collection) -- faz append (cópia, não link) de
+    hytale_widgets.blend só pros que ainda faltam, renomeando a cópia
+    recém-apendada pro nome de template antes de devolver o controle.
+    Idempotente, igual o resto do pipeline: rodar de novo não duplica
+    nada (template já existente com aquele nome é reaproveitado como
+    está).
+
+    v0.17 -- este template NUNCA é atribuído a bone nenhum diretamente
+    -- serve só de FONTE pras cópias por-bone de verdade (ver
+    _ensure_bone_widget_copy, logo abaixo), que fazem
+    Object.copy()/Object.data.copy() a partir dele. Editar o template
+    em si (não deveria acontecer pela UI normal, só manualmente via
+    Outliner) mudaria a "receita" pras PRÓXIMAS cópias, mas não afeta
+    nenhuma cópia por-bone já feita (elas têm Mesh própria, desconectada
+    do template desde o momento da duplicação).
+
+    v0.16 -- ANTES desta versão (v0.16), o objeto era um ÚNICO global
+    compartilhado entre TODOS os Armatures do .blend (nome cru da
+    biblioteca, ex. 'WGT_hytale_fk_ring', sem link em collection
+    nenhuma -- ver comentário antigo perto de WIDGETS_LIBRARY_FILENAME
+    em constants.py). A v0.16 isolou por PERSONAGEM (este template);
+    a v0.17 (ver nota acima) isolou também por BONE -- cada bone tem
+    sua própria cópia duplicada deste template, então hoje um Vertex
+    Edit nunca vaza nem pra outro Armature, nem pra outro bone do MESMO
+    Armature, mesmo que os dois usem o mesmo papel (fk_ring, ik_box,
+    etc.).
+
+    hide_render=True é forçado em TODA cópia (nova ou reaproveitada) --
+    antes, um widget órfão (sem collection nenhuma) nunca aparecia num
+    render de jeito nenhum, independente desse flag. Agora que o widget
+    mora numa collection de verdade (só EXCLUÍDA da View Layer -- ver
+    get_or_create_widgets_collection), e Vertex Edit Mode a reinclui
+    temporariamente pra poder editar, sem isso o widget que está sendo
+    editado no momento apareceria num render disparado durante a edição
+    (Exclude from View Layer tira do render também, mas só enquanto
+    excluída -- Vertex Edit Mode desliga essa exclusão de propósito).
+
+    v0.16.1 -- CADA nome é apendado num `bpy.data.libraries.load()`
+    ISOLADO (um arquivo reaberto por widget), em vez de um único load
+    pedindo todos os nomes faltantes de uma vez. Feito depois de um
+    relato real: pedir vários nomes de uma vez só resolvia uma PARTE
+    deles, de forma inconsistente entre uma rodada de 'Create Rig' e
+    outra -- sem nenhuma mudança no arquivo da biblioteca no meio, o
+    que não é explicável por conteúdo/nome errado (isso seria estável
+    entre rodadas). Mais lento (N reaberturas em vez de 1), mas isola
+    qualquer widget problemático (exceção capturada por nome) sem
+    derrubar os outros, e permite reportar exatamente qual nome falhou.
+
+    Retorna o conjunto de BASE NAMES que não foi possível resolver
+    (arquivo hytale_widgets.blend ausente, nome que não existe dentro
+    dele, ou exceção ao apendar) -- o chamador decide como avisar o
+    usuário; isso nunca levanta exceção, porque custom shape é 100%
+    cosmético e não deve travar a geração do resto do rig."""
+    widgets_collection = get_or_create_widgets_collection(armature_obj)
+
+    to_append = []
+    for base_name in names:
+        target_name = _widget_instance_name(base_name, armature_obj.name)
+        obj = bpy.data.objects.get(target_name)
+        if obj is not None:
+            if obj.name not in widgets_collection.objects:
+                widgets_collection.objects.link(obj)
+            obj.hide_render = True
+            continue
+        to_append.append(base_name)
+
+    if not to_append:
         return set()
 
     filepath = _widgets_library_path()
     if not os.path.isfile(filepath):
-        return missing
+        return set(to_append)
 
-    with bpy.data.libraries.load(filepath, link=False) as (data_from, data_to):
-        data_to.objects = [name for name in data_from.objects if name in missing]
+    still_missing = set()
+    for base_name in to_append:
+        try:
+            with bpy.data.libraries.load(filepath, link=False) as (data_from, data_to):
+                data_to.objects = [base_name] if base_name in data_from.objects else []
+        except Exception:
+            # Nunca propaga -- custom shape é 100% cosmético (mesmo
+            # espírito do resto desta função); um widget problemático
+            # (malha corrompida, referência quebrada etc.) não pode
+            # travar a geração do resto do rig.
+            still_missing.add(base_name)
+            continue
 
-    loaded_names = {obj.name for obj in data_to.objects if obj is not None}
-    return missing - loaded_names
+        loaded = data_to.objects[0] if data_to.objects else None
+        if loaded is None:
+            still_missing.add(base_name)
+            continue
+        loaded.name = _widget_instance_name(base_name, armature_obj.name)
+        loaded.hide_render = True
+        widgets_collection.objects.link(loaded)
+
+    return still_missing
+
+
+def list_widget_library_names():
+    """Lista TODOS os nomes de Object realmente presentes dentro de
+    hytale_widgets.blend, sem apendar nada (data_to.objects fica vazio
+    de propósito -- só leitura). Usado só pra DIAGNÓSTICO no aviso de
+    'Widget shape(s) not found' em _build_custom_shapes, quando um nome
+    esperado não é encontrado -- separa rápido 'a biblioteca realmente
+    não tem esse nome' de 'tem um nome PARECIDO, mas escrito diferente'
+    (maiúscula/minúscula, espaço a mais, etc.). Devolve lista vazia se o
+    arquivo não existir ou não puder ser lido -- nunca levanta exceção,
+    é só um extra informativo pro aviso."""
+    filepath = _widgets_library_path()
+    if not os.path.isfile(filepath):
+        return []
+    try:
+        with bpy.data.libraries.load(filepath, link=False) as (data_from, _data_to):
+            return list(data_from.objects)
+    except Exception:
+        return []
+
+
+def _bone_widget_name(armature_name, bone_name):
+    """Nome do custom shape ÚNICO de um bone específico (v0.17 -- cada
+    bone tem sua PRÓPRIA cópia de mesh, nunca mais compartilhada com
+    nenhum outro bone, nem sequer com outro do mesmo papel/role -- ver
+    _ensure_bone_widget_copy). NÃO inclui o base_name/papel (ex.
+    'WGT_hytale_fk_ring') de propósito -- juntar base_name +
+    armature_name + bone_name estoura fácil o limite de ~63 caracteres
+    de nome de Object/Mesh do Blender pra personagens com nomes de bone
+    longos; o papel só importa no momento de ESCOLHER de qual TEMPLATE
+    duplicar (ver _ensure_bone_widget_copy), não precisa sobreviver no
+    nome final. Mesmo limite de tamanho ainda existe pra
+    armature_name + bone_name sozinhos -- caso extremo (nomes muito
+    longos) não tratado aqui, mesmo espírito 100%-cosmético do resto
+    deste sistema: na pior hipótese o Blender trunca/sufixa sozinho,
+    sem travar a geração do rig."""
+    return f"WGT - {armature_name} - {bone_name}"
+
+
+def _ensure_bone_widget_copy(base_name, armature_obj, bone_name, widgets_collection):
+    """Devolve a cópia ÚNICA (Object E Mesh independentes, nunca
+    compartilhados com nenhum outro bone) do custom shape de
+    `bone_name` -- duplicada, na primeira vez, do TEMPLATE do papel
+    `base_name` (ver ensure_widget_objects, que só materializa/mantém
+    esse template -- ele nunca é atribuído a bone nenhum diretamente).
+    `Object.copy()` + `Object.data.copy()` -- a segunda parte é o que
+    garante uma Mesh de verdade independente (só `Object.copy()`
+    sozinho ainda compartilharia a MESMA malha entre o template e a
+    cópia, já que objetos podem apontar pro mesmo datablock de mesh).
+
+    Idempotente: reruns de 'Create Rig' reaproveitam a cópia já
+    existente com o nome por-bone (preserva qualquer edição manual ou
+    Vertex Edit feita antes, sem regenerar do template de novo -- só
+    duplica na PRIMEIRA vez que este bone específico precisa de um
+    shape). Nunca move/reposiciona o objeto -- isso é feito só ao
+    entrar em Vertex Edit Mode (ver _compute_bone_widget_world_matrix),
+    não aqui, porque a posição do OBJETO em si não importa pra exibição
+    em Pose Mode (o Blender recalcula a exibição do custom shape a
+    partir do bone + custom_shape_translation/_rotation/_scale, ignora
+    matrix_world do objeto) -- só importa quando alguém entra em Edit
+    Mode direto na malha.
+
+    Devolve None se o template de `base_name` não existir (biblioteca
+    sem esse shape, ou ainda não apendado) -- chamador decide o
+    fallback, mesmo espírito 100%-cosmético do resto deste sistema."""
+    target_name = _bone_widget_name(armature_obj.name, bone_name)
+    obj = bpy.data.objects.get(target_name)
+    if obj is not None:
+        if obj.name not in widgets_collection.objects:
+            widgets_collection.objects.link(obj)
+        obj.hide_render = True
+        return obj
+
+    template = bpy.data.objects.get(_widget_instance_name(base_name, armature_obj.name))
+    if template is None:
+        return None
+
+    obj = template.copy()
+    obj.data = template.data.copy()
+    obj.name = target_name
+    obj.data.name = target_name
+    obj.hide_render = True
+    widgets_collection.objects.link(obj)
+    return obj
+
+
+def _compute_bone_widget_world_matrix(armature_obj, pose_bone):
+    """Matriz mundial que reproduz EXATAMENTE onde o Blender desenha o
+    custom shape de `pose_bone` em Pose Mode -- mesma fórmula já
+    documentada em compute_widget_transform_correction (ver logo acima
+    nesta seção): origem no HEAD do bone, eixo Y do shape = eixo Y do
+    bone, e com 'Scale to Bone Length' ligado (use_custom_shape_
+    bone_size -- este script sempre deixa True, ver _build_custom_
+    shapes) TUDO (Translation e Scale) multiplicado pelo comprimento
+    do bone; Rotation não depende do comprimento.
+
+    Usado só por RIG_OT_hytale_shape_vertex_edit_mode_enter (v0.17) pra
+    POSICIONAR o objeto do widget em cima do bone antes de entrar em
+    Edit Mode -- sem isso, o usuário veria a malha longe, na posição em
+    que o TEMPLATE foi apendado (perto da origem do mundo, ver
+    ensure_widget_objects), sem nenhuma referência visual de como o
+    shape fica de verdade sobre o bone. Recalculada do zero toda vez
+    que Enter roda -- se o usuário reposar o Armature entre uma edição
+    e outra, a próxima entrada em Vertex Edit já reflete a pose atual."""
+    bone_length = pose_bone.bone.length if pose_bone.use_custom_shape_bone_size else 1.0
+    scale_matrix = Matrix.Diagonal((bone_length, bone_length, bone_length, 1.0))
+
+    shape_translation = Matrix.Translation(pose_bone.custom_shape_translation)
+    shape_rotation = Euler(pose_bone.custom_shape_rotation_euler, "XYZ").to_matrix().to_4x4()
+    shape_scale = Matrix.Diagonal((*pose_bone.custom_shape_scale_xyz, 1.0))
+    shape_transform = shape_translation @ shape_rotation @ shape_scale
+
+    return armature_obj.matrix_world @ pose_bone.matrix @ scale_matrix @ shape_transform
 
 
 def _widget_name_for_bone(bone_name, layer, ik_tip_names, shape_overrides=None):
@@ -904,6 +1336,13 @@ SHAPE_EDIT_BORDER_THICKNESS = 2  # pixels -- v0.8: 4px ficou grosso demais (ver 
 # padrão) ou embaixo (se o usuário tiver movido). Sombra sutil (texto
 # preto 1px atrás do amarelo) só pra manter legibilidade em fundos claros.
 SHAPE_EDIT_BORDER_TEXT = "Shape Edit Mode"
+# v0.17 -- texto alternativo mostrado enquanto o objeto ATIVO é a MESH
+# de um widget em Vertex Edit Mode (ver RIG_OT_hytale_shape_vertex_edit_
+# mode_enter/finish, e o branch de obj.type == 'MESH' logo abaixo em
+# _draw_shape_edit_border) -- reforça visualmente QUAL dos dois
+# sub-modos está ativo, já que os dois compartilham a mesma borda
+# amarela.
+SHAPE_VERTEX_EDIT_BORDER_TEXT = "Shape Vertex Edit Mode"
 SHAPE_EDIT_BORDER_TEXT_SIZE = 16  # pt
 SHAPE_EDIT_BORDER_TEXT_PADDING = 34  # pixels entre a borda de cima e o texto -- ver
 # comentário em _draw_shape_edit_border_text: mesmo o header NUNCA sendo desenhado
@@ -943,8 +1382,24 @@ def unregister_shape_edit_border():
 def _draw_shape_edit_border():
     context = bpy.context
     obj = context.active_object
-    if obj is None or obj.type != "ARMATURE" or not getattr(obj.data, "hytale_shape_edit_mode", False):
+    if obj is None:
         return
+
+    # v0.17 -- dois estados possíveis mostram a borda: Shape Edit Mode
+    # "de fora" (Armature ativo, hytale_shape_edit_mode) OU Vertex Edit
+    # Mode (objeto ativo é a MESH do widget, ver RIG_OT_hytale_shape_
+    # vertex_edit_mode_enter -- nesse estado obj.type é 'MESH', não
+    # 'ARMATURE', então o texto muda pra deixar claro qual sub-modo está
+    # ativo). Os dois nunca coincidem (trocar o objeto ativo pro widget
+    # é o que caracteriza entrar em Vertex Edit), então basta checar um
+    # de cada vez.
+    if obj.type == "MESH" and obj.get("hytale_vertex_edit_armature"):
+        border_text = SHAPE_VERTEX_EDIT_BORDER_TEXT
+    elif obj.type == "ARMATURE" and getattr(obj.data, "hytale_shape_edit_mode", False):
+        border_text = SHAPE_EDIT_BORDER_TEXT
+    else:
+        return
+
     region = context.region
     if region is None or region.width <= 0 or region.height <= 0:
         return
@@ -978,18 +1433,20 @@ def _draw_shape_edit_border():
     batch.draw(_shape_edit_border_shader)
     gpu.state.blend_set("NONE")
 
-    _draw_shape_edit_border_text(w, h, t)
+    _draw_shape_edit_border_text(w, h, t, border_text)
 
 
-def _draw_shape_edit_border_text(w, h, border_thickness):
-    """Desenha SHAPE_EDIT_BORDER_TEXT centralizado horizontalmente, logo
-    abaixo da faixa de cima da borda amarela -- ver comentário grande
-    perto de SHAPE_EDIT_BORDER_TEXT sobre por que isso nunca cobre o
-    header do viewport (region diferente). Chamado só por
-    _draw_shape_edit_border, depois de desenhar a borda em si."""
+def _draw_shape_edit_border_text(w, h, border_thickness, text):
+    """Desenha `text` centralizado horizontalmente, logo abaixo da faixa
+    de cima da borda amarela -- ver comentário grande perto de
+    SHAPE_EDIT_BORDER_TEXT sobre por que isso nunca cobre o header do
+    viewport (region diferente). Chamado só por _draw_shape_edit_border,
+    depois de desenhar a borda em si -- `text` já vem resolvido de lá
+    (SHAPE_EDIT_BORDER_TEXT ou SHAPE_VERTEX_EDIT_BORDER_TEXT, conforme o
+    sub-modo ativo)."""
     font_id = 0
     blf.size(font_id, SHAPE_EDIT_BORDER_TEXT_SIZE)
-    text_width, text_height = blf.dimensions(font_id, SHAPE_EDIT_BORDER_TEXT)
+    text_width, text_height = blf.dimensions(font_id, text)
     text_x = round((w - text_width) / 2.0)
     text_y = h - border_thickness - SHAPE_EDIT_BORDER_TEXT_PADDING - text_height
 
@@ -998,11 +1455,11 @@ def _draw_shape_edit_border_text(w, h, border_thickness):
     # do arquivo: cosmético, nunca essencial pra entender o estado).
     blf.color(font_id, *SHAPE_EDIT_BORDER_TEXT_SHADOW_COLOR)
     blf.position(font_id, text_x - 1, text_y - 1, 0)
-    blf.draw(font_id, SHAPE_EDIT_BORDER_TEXT)
+    blf.draw(font_id, text)
 
     blf.color(font_id, *SHAPE_EDIT_BORDER_COLOR)
     blf.position(font_id, text_x, text_y, 0)
-    blf.draw(font_id, SHAPE_EDIT_BORDER_TEXT)
+    blf.draw(font_id, text)
 
 
 class RIG_OT_hytale_shape_edit_mode_enter(Operator):
@@ -1044,14 +1501,7 @@ class RIG_OT_hytale_shape_edit_mode_enter(Operator):
         if obj.mode != "POSE":
             bpy.ops.object.mode_set(mode="POSE")
 
-        muted = 0
-        for pb, i, fcurve in _iter_shape_scale_drivers(obj):
-            driver = fcurve.driver
-            match = _SHAPE_SCALE_DRIVER_VALUE_RE.match(driver.expression or "")
-            if match:
-                pb.custom_shape_scale_xyz[i] = float(match.group(1))
-            fcurve.mute = True
-            muted += 1
+        muted = _mute_shape_scale_drivers(obj)
 
         armature.hytale_shape_edit_mode = True
         _redraw_all_areas(context)  # v0.8 -- pra borda amarela (ver _draw_shape_edit_border) aparecer na hora
@@ -1097,27 +1547,22 @@ class RIG_OT_hytale_shape_edit_mode_finish(Operator):
         if not getattr(obj.data, "hytale_shape_edit_mode", False):
             cls.poll_message_set("Not currently in Shape Edit Mode.")
             return False
+        if getattr(obj.data, "hytale_shape_vertex_edit_mode", False):
+            # Só alcançável se o usuário reselecionar o Armature manualmente
+            # enquanto uma sessão de Vertex Edit ficou pendurada (a malha do
+            # widget ainda em Edit Mode, sem passar por 'Finish Vertex
+            # Edit') -- normalmente a aba Rig nem desenha este botão nesse
+            # estado (active_object é a malha, não o Armature -- ver
+            # interface.py, _draw_shape_vertex_edit_active).
+            cls.poll_message_set("Finish Vertex Edit Mode first.")
+            return False
         return True
 
     def execute(self, context):
         obj = context.active_object
         armature = obj.data
 
-        restored = 0
-        for pb, i, fcurve in _iter_shape_scale_drivers(obj):
-            driver = fcurve.driver
-            if not fcurve.mute:
-                # Não foi este Enter que mutou (ex.: "Create Rig" rodou de novo no meio do Shape Edit Mode e
-                # recriou o driver do zero, já desmutado -- ver aviso sobre o poll de RIG_OT_hytale_generate_rig
-                # logo abaixo; isso não deveria mais acontecer, mas o guard fica por segurança).
-                continue
-            new_value = _format_shape_scale_literal(float(pb.custom_shape_scale_xyz[i]))
-            if "(1 - switch)" in (driver.expression or ""):
-                driver.expression = f"{new_value}*(1 - switch)"
-            else:
-                driver.expression = f"{new_value}*switch"
-            fcurve.mute = False
-            restored += 1
+        restored = _restore_shape_scale_drivers(obj)
 
         armature.hytale_shape_edit_mode = False
         _redraw_all_areas(context)  # v0.8 -- pra borda amarela (ver _draw_shape_edit_border) sumir na hora
@@ -1125,6 +1570,239 @@ class RIG_OT_hytale_shape_edit_mode_finish(Operator):
             {"INFO"},
             f"Shape Edit Mode off -- {restored} shape-scale driver channel(s) restored, new size(s) saved as "
             f"the max value.",
+        )
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# Operadores: Vertex Edit Mode do custom shape (v0.16 -- feature nova)
+#
+# Sub-modo de Shape Edit Mode: em vez de só Translation/Rotation/Scale
+# (o que os dois operadores acima já cobrem), entra em Edit Mode DIRETO
+# na malha do widget usado pelo bone ativo, pra editar a forma por
+# vértice. Só existe hoje porque cada widget virou uma cópia
+# POR-PERSONAGEM e, desde a v0.17, POR-BONE (ver ensure_widget_objects/
+# _ensure_bone_widget_copy/get_or_create_widgets_collection) -- editar
+# vértices de um objeto compartilhado (entre Armatures OU entre bones)
+# vazaria pra todo mundo usando aquele shape, o que nunca seria o que o
+# usuário quer.
+#
+# Truque de contexto usado pelos dois operadores abaixo: o Blender guarda
+# .mode POR OBJETO, não um modo global único -- trocar o objeto ativo pra
+# malha do widget e chamar mode_set(EDIT) não tira o Armature do Pose
+# Mode "por baixo", só troca o que o dropdown de modo da viewport mostra
+# enquanto o widget está ativo. Por isso interface.py precisa de um
+# branch especial no topo de _draw_rig (obj.type == 'MESH' com a custom
+# property 'hytale_vertex_edit_armature') pra continuar desenhando um
+# botão de Finish mesmo com o Armature fora de "active_object" -- ver
+# _draw_shape_vertex_edit_active lá.
+# ---------------------------------------------------------------------------
+
+
+class RIG_OT_hytale_shape_vertex_edit_mode_enter(Operator):
+    """Entra em Edit Mode direto na malha do custom shape do bone pose
+    ativo -- esconde (via _set_collection_excluded temporariamente
+    reincluída + hide_set por objeto) todo OUTRO widget deste mesmo
+    Armature, pra deixar só a malha alvo visível/selecionável enquanto
+    dura a edição. Antes de entrar em Edit Mode, também MOVE o objeto
+    pra cima do bone (ver _compute_bone_widget_world_matrix) -- sem
+    isso, a malha apareceria longe, na posição em que foi apendada da
+    biblioteca (perto da origem do mundo), sem nenhuma referência visual
+    de como o shape fica de verdade sobre o bone.
+
+    Só disponível DENTRO do Shape Edit Mode "de fora" (RIG_OT_hytale_
+    shape_edit_mode_enter já precisa ter rodado) -- reaproveita o mesmo
+    contexto "estou calibrando shapes agora" em vez de criar um terceiro
+    modo independente sem relação com os outros dois.
+
+    v0.17 -- cada BONE tem sua PRÓPRIA cópia de mesh (ver
+    _ensure_bone_widget_copy/_build_custom_shapes) -- editar aqui NUNCA
+    afeta nenhum outro bone, nem outro Armature, mesmo que os dois usem
+    o mesmo papel (fk_ring, ik_box, etc.). ANTES da v0.17, bones do
+    MESMO papel dentro do MESMO personagem compartilhavam o mesmo
+    objeto/malha -- não é mais o caso.
+
+    Também DESMUTA os drivers de custom_shape_scale_xyz (ver
+    _unmute_shape_scale_drivers -- NÃO _restore_shape_scale_drivers, que
+    bakeia o valor atual como novo permanente e serviria pra "salvar",
+    não pra este toggle temporário) -- Shape Edit Mode "de fora" os
+    deixa mutados (todo shape em tamanho cheio, pra dar pra redimensionar
+    qualquer um livremente), mas isso deixa TODOS os widgets visíveis
+    de uma vez (FK e IK sobrepostos, por exemplo), poluindo a viewport
+    bem na hora de focar só no que está sendo esculpido. Desmutar aqui
+    faz o resto do armature voltar a respeitar o switch FK/IK
+    normalmente enquanto dura o Vertex Edit -- o widget ALVO continua
+    visível de qualquer jeito (hide_set(False) explícito, acima, é
+    independente do valor do driver), e nenhuma calibração de escala em
+    andamento em OUTRO bone é comprometida (nada é gravado na
+    expressão aqui, só o mute é ligado/desligado). RIG_OT_hytale_shape_
+    vertex_edit_mode_finish muta de novo ao sair (usando
+    _mute_shape_scale_drivers, que sabe voltar cada canal pro valor
+    "cheio" certo lendo da expressão, não do valor ao vivo), devolvendo
+    pro estado "tudo visível" do Shape Edit Mode externo."""
+
+    bl_idname = "armature.hytale_shape_vertex_edit_mode_enter"
+    bl_label = "Edit Shape Vertices"
+    bl_description = (
+        "Enter Edit Mode directly on the active bone's custom shape mesh, hiding every other widget of this "
+        "character -- use 'Finish Vertex Edit' afterwards to return to Pose Mode"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        if obj is None or obj.type != "ARMATURE":
+            return False
+        if not getattr(obj.data, "hytale_shape_edit_mode", False):
+            cls.poll_message_set("Only available during Shape Edit Mode.")
+            return False
+        if getattr(obj.data, "hytale_shape_vertex_edit_mode", False):
+            cls.poll_message_set("Already editing a shape's vertices -- use 'Finish Vertex Edit' first.")
+            return False
+        active_pb = context.active_pose_bone
+        if active_pb is None or active_pb.custom_shape is None:
+            cls.poll_message_set("Active bone must have a custom shape assigned.")
+            return False
+        return True
+
+    def execute(self, context):
+        armature_obj = context.active_object
+        active_pb = context.active_pose_bone
+        target_obj = active_pb.custom_shape
+
+        widgets_collection = get_or_create_widgets_collection(armature_obj)
+        _set_collection_excluded(widgets_collection, False)
+
+        for wgt_obj in widgets_collection.objects:
+            wgt_obj.hide_select = False
+            wgt_obj.hide_set(wgt_obj is not target_obj)
+
+        # Rede de segurança: se o custom shape do bone ativo não vier da
+        # collection 'WGT - <nome>' (ex.: override manual de template
+        # apontando pra um Object qualquer fora do sistema de widgets),
+        # o loop acima nunca toca em `target_obj` -- garante aqui que ele
+        # fica visível/selecionável de qualquer jeito, senão o mode_set
+        # (EDIT) logo abaixo falharia silenciosamente num objeto ainda
+        # escondido/excluído.
+        target_obj.hide_select = False
+        target_obj.hide_set(False)
+
+        # v0.17 -- posiciona o objeto do widget EM CIMA do bone (mesma
+        # transformação que o Blender usa pra desenhar o custom shape em
+        # Pose Mode, ver _compute_bone_widget_world_matrix) antes de
+        # entrar em Edit Mode -- senão a malha apareceria onde foi
+        # apendada da biblioteca (perto da origem do mundo), sem
+        # referência nenhuma de como o shape fica de verdade sobre o
+        # bone. Fica "estacionado" ali depois do Finish também (não tem
+        # motivo pra desfazer -- a posição do objeto não é usada pra
+        # exibição em Pose Mode, só ajuda quem for espiar no Outliner).
+        target_obj.matrix_world = _compute_bone_widget_world_matrix(armature_obj, active_pb)
+
+        # v0.17 -- desmuta os drivers de FK/IK AGORA, depois de já ter
+        # posicionado o objeto acima -- a posição calculada usou o valor
+        # de custom_shape_scale_xyz de ANTES de desmutar (o "tamanho
+        # cheio" do Shape Edit Mode externo), então fica estável mesmo
+        # que o driver, uma vez desmutado, reavalie pra outro valor no
+        # próximo redraw (matrix_world do Object não é recalculado
+        # automaticamente por driver nenhum -- só custom_shape_scale_xyz
+        # do PoseBone é). Ver docstring desta classe pro motivo.
+        restored = _unmute_shape_scale_drivers(armature_obj)
+
+        # v0.16.2 -- deseleção via API direta (view_layer.objects +
+        # select_set), não bpy.ops.object.select_all -- esse operator
+        # tem poll() próprio que pode falhar com "context is incorrect"
+        # dependendo de COMO o botão foi clicado (relatado por usuário
+        # real), mesmo dentro de um Panel da VIEW_3D onde outros
+        # bpy.ops.object.* deste arquivo funcionam sem problema. Iterar
+        # e chamar select_set(False) direto não depende de poll nenhum,
+        # nunca falha por causa de contexto.
+        for other_obj in context.view_layer.objects:
+            other_obj.select_set(False)
+        target_obj.select_set(True)
+        context.view_layer.objects.active = target_obj
+
+        bpy.ops.object.mode_set(mode="EDIT")
+
+        # Marcadores lidos por RIG_OT_hytale_shape_vertex_edit_mode_finish
+        # (que roda com `target_obj`, não o Armature, como active_object --
+        # ver comentário da seção acima) e por interface.py
+        # (_draw_shape_vertex_edit_active) pra saber a quem devolver o
+        # controle e o que mostrar na UI.
+        target_obj["hytale_vertex_edit_armature"] = armature_obj.name
+        target_obj["hytale_vertex_edit_bone"] = active_pb.name
+        armature_obj.data.hytale_shape_vertex_edit_mode = True
+
+        self.report(
+            {"INFO"},
+            f"Editing vertices of '{target_obj.name}' (bone '{active_pb.name}') -- other widgets of this "
+            f"character are hidden, and {restored} FK/IK shape-scale driver(s) unmuted (no calibrated size was "
+            f"changed). Use 'Finish Vertex Edit' when done.",
+        )
+        return {"FINISHED"}
+
+
+class RIG_OT_hytale_shape_vertex_edit_mode_finish(Operator):
+    """Contrário de RIG_OT_hytale_shape_vertex_edit_mode_enter: sai do
+    Edit Mode da malha do widget, re-esconde a collection 'WGT - <nome>'
+    inteira (_set_collection_excluded de volta pra True), MUTA de novo
+    os drivers de FK/IK (ver _mute_shape_scale_drivers -- Enter tinha
+    restaurado, volta pro estado "tudo em tamanho cheio" do Shape Edit
+    Mode externo, que continua ativo) e devolve o Armature como objeto
+    ativo -- como o Armature nunca saiu do Pose Mode "por baixo" (ver
+    comentário da seção acima), a viewport volta pra Pose Mode sozinha
+    assim que ele vira o ativo de novo, sem precisar de mode_set()
+    explícito pra ele."""
+
+    bl_idname = "armature.hytale_shape_vertex_edit_mode_finish"
+    bl_label = "Finish Vertex Edit"
+    bl_description = "Leave the widget's Edit Mode, re-hide this character's widgets, and return to Pose Mode"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        if obj is None or obj.type != "MESH" or not obj.get("hytale_vertex_edit_armature"):
+            cls.poll_message_set("Only available while editing a custom shape's vertices.")
+            return False
+        return True
+
+    def execute(self, context):
+        target_obj = context.active_object
+        armature_name = target_obj.get("hytale_vertex_edit_armature")
+        bone_name = target_obj.get("hytale_vertex_edit_bone", "")
+        armature_obj = bpy.data.objects.get(armature_name)
+
+        if target_obj.mode == "EDIT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+
+        if "hytale_vertex_edit_armature" in target_obj:
+            del target_obj["hytale_vertex_edit_armature"]
+        if "hytale_vertex_edit_bone" in target_obj:
+            del target_obj["hytale_vertex_edit_bone"]
+
+        if armature_obj is not None:
+            widgets_collection = get_or_create_widgets_collection(armature_obj)  # já reexcluí -- ver docstring
+            armature_obj.data.hytale_shape_vertex_edit_mode = False
+            _mute_shape_scale_drivers(armature_obj)  # volta pro estado "tudo em tamanho cheio" do Shape Edit Mode
+
+            # Mesmo motivo do Enter -- API direta em vez de
+            # bpy.ops.object.select_all (poll pode falhar com "context
+            # is incorrect" dependendo do caminho de invocação).
+            for other_obj in context.view_layer.objects:
+                other_obj.select_set(False)
+            armature_obj.select_set(True)
+            context.view_layer.objects.active = armature_obj
+        else:
+            self.report(
+                {"WARNING"},
+                "Could not find the armature this shape belongs to (renamed/deleted mid-edit?) -- the widgets "
+                "collection wasn't re-hidden automatically, hide it manually in the Outliner if needed.",
+            )
+
+        self.report(
+            {"INFO"},
+            f"Finished editing '{target_obj.name}'" + (f" (bone '{bone_name}')." if bone_name else "."),
         )
         return {"FINISHED"}
 
@@ -1166,18 +1844,55 @@ def _mirrored_bone_name(name):
     return None
 
 
+def _mirror_mesh_data_x(mesh):
+    """Espelha TODOS os vértices de `mesh` no eixo X LOCAL (espaço do
+    próprio Object/Mesh, o mesmo eixo X que a convenção "shape space"
+    deste addon já usa -- origem no head do bone, ver
+    _compute_bone_widget_world_matrix) e inverte a ordem dos vértices de
+    cada face (bmesh.ops.reverse_faces) -- sem isso, espelhar só a
+    posição em X deixa as normais "de dentro pra fora" (mirror num único
+    eixo sempre inverte o handedness/winding das faces, problema
+    clássico de qualquer espelhamento assim, não é bug específico
+    daqui).
+
+    Opera DIRETO no datablock `mesh` -- precisa já ser uma cópia
+    exclusiva (Object.data.copy(), nunca a mesh de um TEMPLATE ou de
+    outro bone ainda compartilhada) -- ver RIG_OT_hytale_mirror_shape,
+    o único chamador hoje."""
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    for v in bm.verts:
+        v.co.x = -v.co.x
+    bmesh.ops.reverse_faces(bm, faces=bm.faces)
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
+
+
 class RIG_OT_hytale_mirror_shape(Operator):
-    """Copia o custom shape (translation/rotation/scale) do bone ativo pro
-    bone do lado oposto (L-/R-), invertendo só o eixo X da translation --
-    mesma convenção de mirror em X que o resto do addon usa pra L-/R.
-    Rotation e scale são copiados DIRETO, sem inverter nada: um custom
-    shape não tem handedness (ao contrário de uma transform completa de
-    edit bone), então não existe "espelhar rotação/escala" aqui -- só a
-    POSIÇÃO em X muda de lado."""
+    """v0.17 -- Espelha a MALHA do custom shape do bone ativo pro bone
+    do lado oposto (L-/R-), não só Translation/Rotation/Scale (que
+    também são copiados/espelhados junto, mesmo esquema de antes). Fluxo
+    completo pro bone oposto: (1) se ele já tiver um shape PRÓPRIO
+    atribuído (não compartilhado com o bone de origem), remove esse
+    Object e sua Mesh de bpy.data -- nunca deixa lixo órfão pra trás; (2)
+    duplica o Object + Mesh do bone de ORIGEM (cópia nova, independente,
+    mesmo mecanismo de _ensure_bone_widget_copy); (3) espelha essa cópia
+    em X (ver _mirror_mesh_data_x); (4) atribui a cópia espelhada como o
+    novo custom_shape do bone oposto.
+
+    Translation espelha em X (posição muda de lado, mesma convenção de
+    mirror em X que o resto do addon usa pra L-/R); Rotation e Scale são
+    copiados DIRETO -- um valor de escala/rotação não tem handedness
+    por si (ao contrário da malha em si, que precisa da correção de
+    winding em _mirror_mesh_data_x)."""
 
     bl_idname = "armature.hytale_mirror_shape"
     bl_label = "Mirror Shape"
-    bl_description = "Copy this bone's custom shape transform to its L-/R- opposite, mirrored on X"
+    bl_description = (
+        "Delete the L-/R- opposite bone's own shape (if any) and replace it with a mirrored copy of this "
+        "bone's shape mesh, including its Location/Rotation/Scale"
+    )
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -1192,16 +1907,87 @@ class RIG_OT_hytale_mirror_shape(Operator):
         if active_pb is None or _mirrored_bone_name(active_pb.name) is None:
             cls.poll_message_set("Active bone must start with 'L-' or 'R-' to have a mirror target.")
             return False
+        if active_pb is not None and active_pb.custom_shape is None:
+            cls.poll_message_set("Active bone must have a custom shape assigned to mirror.")
+            return False
         return True
 
     def execute(self, context):
         obj = context.active_object
         source = context.active_pose_bone
+        source_obj = source.custom_shape
         target_name = _mirrored_bone_name(source.name)
         target = obj.pose.bones.get(target_name)
         if target is None:
             self.report({"WARNING"}, f"Mirror target '{target_name}' not found on this armature.")
             return {"CANCELLED"}
+
+        widgets_collection = get_or_create_widgets_collection(obj)
+
+        # (1) remove o shape PRÓPRIO do bone alvo (Object + Mesh), se
+        # tiver -- nunca deixa órfão em bpy.data. Guard `!= source_obj`
+        # cobre o caso raro dos dois bones ainda apontarem pro MESMO
+        # Object (nunca deveria acontecer sob o esquema por-bone da
+        # v0.17, mas evita apagar a própria fonte por engano se
+        # acontecer).
+        old_target_obj = target.custom_shape
+        if old_target_obj is not None and old_target_obj != source_obj:
+            old_mesh = old_target_obj.data
+            bpy.data.objects.remove(old_target_obj, do_unlink=True)
+            if old_mesh is not None and old_mesh.users == 0:
+                bpy.data.meshes.remove(old_mesh, do_unlink=True)
+
+        # (2) duplica Object + Mesh do bone de origem -- mesmo mecanismo
+        # de _ensure_bone_widget_copy, mas a PARTIR do shape atual do
+        # bone de origem (que pode já ter sido esculpido em Vertex Edit
+        # Mode), não do template original.
+        target_widget_name = _bone_widget_name(obj.name, target.name)
+
+        # Rede de segurança extra: garante que o NOME CANÔNICO
+        # (_bone_widget_name) do bone alvo está livre antes de renomear
+        # a cópia nova pra ele -- cobre o caso raro de existir um
+        # objeto ÓRFÃO com esse nome exato que NÃO era o custom_shape
+        # atual do bone (ex.: leftover de um bone renomeado depois).
+        # Sem isso, o Blender resolveria a colisão sufixando ".001" na
+        # cópia nova sozinho, e futuras chamadas de
+        # _ensure_bone_widget_copy (que procuram pelo nome exato, SEM
+        # sufixo) não achariam essa cópia espelhada -- perderia o
+        # mirror silenciosamente na próxima vez que "Create Rig" rodasse.
+        stale_obj = bpy.data.objects.get(target_widget_name)
+        if stale_obj is not None and stale_obj != source_obj:
+            stale_mesh = stale_obj.data
+            bpy.data.objects.remove(stale_obj, do_unlink=True)
+            if stale_mesh is not None and stale_mesh.users == 0:
+                bpy.data.meshes.remove(stale_mesh, do_unlink=True)
+
+        new_obj = source_obj.copy()
+        new_obj.data = source_obj.data.copy()
+        new_obj.name = target_widget_name
+        new_obj.data.name = target_widget_name
+        new_obj.hide_render = True
+        # Object.copy() também copia custom properties -- se a fonte por
+        # acaso ainda carregar marcadores de uma sessão de Vertex Edit
+        # interrompida de forma anormal (ver RIG_OT_hytale_shape_vertex_
+        # edit_mode_finish, que normalmente já limpa isso ao sair), a
+        # cópia nova NÃO deve herdar esses marcadores -- confundiria
+        # interface.py (_draw_shape_vertex_edit_active) se este objeto
+        # virasse o ativo por qualquer motivo sem estar de fato em Edit
+        # Mode.
+        if "hytale_vertex_edit_armature" in new_obj:
+            del new_obj["hytale_vertex_edit_armature"]
+        if "hytale_vertex_edit_bone" in new_obj:
+            del new_obj["hytale_vertex_edit_bone"]
+        widgets_collection.objects.link(new_obj)
+
+        # (3) espelha a cópia em X -- só a cópia nova, nunca o Object de
+        # origem (source_obj.data.copy() acima já garantiu que
+        # new_obj.data é independente antes de mexer nela).
+        _mirror_mesh_data_x(new_obj.data)
+
+        # (4) atribui como o novo custom_shape do bone oposto.
+        target.custom_shape = new_obj
+        target.use_custom_shape_bone_size = source.use_custom_shape_bone_size
+        target.custom_shape_wire_width = source.custom_shape_wire_width
 
         src_translation = source.custom_shape_translation
         target.custom_shape_translation = (
@@ -1210,7 +1996,7 @@ class RIG_OT_hytale_mirror_shape(Operator):
         target.custom_shape_rotation_euler = tuple(source.custom_shape_rotation_euler)
         target.custom_shape_scale_xyz = tuple(source.custom_shape_scale_xyz)
 
-        self.report({"INFO"}, f"Mirrored '{source.name}' custom shape onto '{target_name}'.")
+        self.report({"INFO"}, f"Mirrored '{source.name}' shape mesh onto '{target_name}'.")
         return {"FINISHED"}
 
 
@@ -2018,6 +2804,83 @@ class HytaleIKChainItem(PropertyGroup):
         "the normal way (real bone parenting, no switch).",
         default=False,
     )
+    # v0.15 -- "Create First Person Camera" (pedido explícito do
+    # usuário), exclusivo de HEAD. Ativa um botão dedicado
+    # (RIG_OT_hytale_camera_create/_remove, mesmo espírito de "Create
+    # Texture Picker" -- separado de "Create Rig" porque não precisa
+    # regenerar o resto do rig sempre que só a câmera muda) que cria um
+    # Object Camera de verdade, bone-parented (mesmo mecanismo do Atlas
+    # Plane do Texture Picker -- ver _build_first_person_camera) no bone
+    # escolhido. Diferente de Texture Picker, o campo de bone aqui é
+    # LIVRE (pode ser qualquer bone da armature, não só um bone de
+    # HEAD) -- pedido explícito. Puramente ferramenta de
+    # preview/animação no Blender -- exporter.py não sabe nem precisa
+    # saber que esta câmera existe (não faz parte do .blockyanim).
+    head_camera_enabled: BoolProperty(
+        name="Create First Person Camera",
+        description="Adds a 'Create Camera' button below that parents a real Blender Camera object to the "
+        "chosen bone -- useful for previewing/animating a first-person view",
+        default=False,
+    )
+    head_camera_parent_bone: StringProperty(
+        name="Camera Parent Bone",
+        description="Which bone the camera should be parented to (bone parenting -- follows the bone's pose "
+        "automatically). Can be any bone on this armature, not just a Head/Neck bone" + _HEAD_SPINE_FIELD_HINT,
+        default="",
+    )
+    # Ajuste fino manual, mesmo espírito de texture_picker_plane_offset_x/_y
+    # (Texture Picker) -- posição nasce em (0,0,0) = exatamente no
+    # Head/pivot do bone escolhido, ainda um chute (não temos a posição
+    # exata dos olhos do personagem no jogo) -- por isso o campo fica
+    # aberto, o usuário calibra uma vez por personagem (mesmo fluxo do
+    # Atlas Plane).
+    #
+    # v0.15.1 -- rotação default CORRIGIDA: a v0.15 assumia 90° em X (
+    # derivado da mesma convenção de eixo do Atlas Plane do Texture
+    # Picker), mas o usuário testou ao vivo no Blender e confirmou que
+    # X:0 / Y:180 / Z:0 é o que deixa a câmera de frente de verdade
+    # pro personagem -- a suposição original (eixo Y do bone = frente)
+    # não valia igual pro bone usado como parent da câmera. Mantido
+    # como default agora (valor CONFIRMADO, não mais um chute), mas os
+    # campos continuam abertos -- cada personagem/bone escolhido como
+    # parent pode ter uma orientação de rest ligeiramente diferente.
+    head_camera_offset_x: FloatProperty(
+        name="Camera Offset X", default=0.0,
+        description="Nudge the camera left/right, local to the parent bone's rest orientation",
+    )
+    head_camera_offset_y: FloatProperty(
+        name="Camera Offset Y", default=0.0,
+        description="Nudge the camera forward/back, local to the parent bone's rest orientation",
+    )
+    head_camera_offset_z: FloatProperty(
+        name="Camera Offset Z", default=0.0,
+        description="Nudge the camera up/down, local to the parent bone's rest orientation",
+    )
+    head_camera_rotation_x: FloatProperty(
+        name="Camera Rotation X (deg)", default=0.0,
+        description="Extra rotation (degrees, local X to the parent bone)",
+    )
+    head_camera_rotation_y: FloatProperty(
+        name="Camera Rotation Y (deg)", default=180.0,
+        description="Extra rotation (degrees, local Y to the parent bone) -- default confirmed to face the "
+        "camera forward on the parent bone's rest orientation",
+    )
+    head_camera_rotation_z: FloatProperty(
+        name="Camera Rotation Z (deg)", default=0.0,
+        description="Extra rotation (degrees, local Z to the parent bone)",
+    )
+    # v0.15.1 -- FOV exposto como campo de verdade (pedido explícito do
+    # usuário) em vez de fixo no código -- pode ser ajustado ANTES de
+    # clicar "Create Camera" (e reaplicado a qualquer momento rodando o
+    # botão de novo, mesmo espírito idempotente do resto do rigger).
+    # Default 90° continua sendo um chute razoável de "FOV parecido com
+    # FPS de jogo" -- não é um valor confirmado do Hytale (sem acesso à
+    # câmera real do jogo).
+    head_camera_fov: FloatProperty(
+        name="Camera FOV (deg)", default=90.0, min=1.0, max=179.0,
+        description="Horizontal field of view of the generated camera, in degrees -- not a confirmed Hytale "
+        "value, just a reasonable FPS-game starting point",
+    )
     # v0.9.7 -- campos exclusivos de ATTACHMENTS. Mesmo padrão de
     # HEAD/SPINE (amount + N campos de bone ORG) -- attachments_count é
     # simplesmente quantos dos slots attachment_bone_N aparecem na UI
@@ -2145,6 +3008,19 @@ class HytaleIKChainItem(PropertyGroup):
         description="Pixel distance between rows of texture-atlas cells. Doesn't matter if Rows is 1",
         default=16, min=1,
     )
+    # v0.14 -- "Crop Texture" REMOVIDO na v0.15.2 (pedido explícito do
+    # usuário): a ideia era mostrar só a região do grid no plane de
+    # referência em vez do atlas inteiro. A matemática de tamanho foi
+    # CONFIRMADA correta por medição direta no Blender (Dimensions do
+    # plane bateram exatamente com o esperado, 0.25/0.046875 -- ver
+    # histórico do chat), mas o resultado visual final não bateu com o
+    # que o usuário queria mesmo assim, e não convergiu depois de
+    # várias rodadas de ajuste remoto -- decisão foi voltar pro fluxo
+    # manual (usuário edita a malha do plane à mão, cortando as faces
+    # de fora, como já fazia antes desse recurso existir). Se for
+    # reintroduzido no futuro, vale considerar que o problema pode não
+    # ser a MATEMÁTICA da malha em si, e sim como ela se relaciona com
+    # o zoom do viewport/escala do personagem na hora de comparar.
     # v0.10.13 -- Companion Bones: pra personagens cujo alvo animado é
     # composto por mais de uma malha/bone que precisam mudar de
     # expressão JUNTOS (ex.: metades L/R espelhadas se encontrando no
@@ -2511,6 +3387,8 @@ class RIG_OT_hytale_ik_chain_pick_bone(Operator):
             "texture_picker_bone",
             # v0.10.5 -- segundo campo de TEXTURE_PICKER (pai do root.ui).
             "texture_picker_ui_parent_bone",
+            # v0.15 -- campo de "Create First Person Camera", exclusivo de HEAD.
+            "head_camera_parent_bone",
             # v0.10.13 -- Companion Bones, mesmo esquema de
             # ATTACHMENTS_MAX_COUNT acima (gerado a partir do teto em
             # constants.py, não escrito na mão).
@@ -2965,6 +3843,8 @@ class RIG_OT_hytale_validate_rig(Operator):
        não precisa entrar em Edit Mode só pra validar. v0.9 (Etapa 2):
        mesma checagem pros campos de Head/Spine (neck_bone_*/head_bone/
        head_end_bone/pelvis_bone/spine_bone_*), via _head_spine_bone_names.
+       v0.15: mesma checagem também pro head_camera_parent_bone (campo
+       LIVRE de HEAD, fora de _head_spine_bone_names de propósito).
     2. Itens em modo PRESET cujo pole_angle_preset_name não existe em
        pole_angle_presets do rig template ativo -- reaproveita
        resolve_pole_angle_preset_degrees (acima), o MESMO lookup que
@@ -3062,6 +3942,21 @@ class RIG_OT_hytale_validate_rig(Operator):
                         f"Texture Picker '{label}': '{cursor_name}' not found -- 'Create Texture Picker' hasn't "
                         f"been run yet for this entry."
                     )
+            # v0.15 -- checagem extra, só pra HEAD com "Create First Person
+            # Camera" ligado: head_camera_parent_bone (campo LIVRE, não
+            # passa por _head_spine_bone_names de propósito -- ver
+            # comentário lá) precisa apontar pra um bone que exista de
+            # verdade, senão "Create Camera" recusa rodar (poll já cobre
+            # isso no botão, mas validar aqui também deixa o problema
+            # visível sem precisar abrir a seção da câmera).
+            if item.chain_type == "HEAD" and item.head_camera_enabled:
+                camera_bone_name = (item.head_camera_parent_bone or "").strip()
+                if not camera_bone_name:
+                    problems.append(f"Head '{label}': Create First Person Camera is on, but no Camera Parent Bone is set.")
+                elif bones.get(camera_bone_name) is None:
+                    problems.append(
+                        f"Head '{label}': Camera Parent Bone '{camera_bone_name}' not found on this armature."
+                    )
 
         # 2. Preset de pole angle que não existe no template ativo.
         rig_template = get_rig_template(getattr(armature, "hytale_active_rig_template", ""))
@@ -3145,19 +4040,28 @@ class RIG_OT_hytale_clear_generated(Operator):
     bones ORG originais. Não mexe na lista hytale_ik_chains -- rodar
     "Create Rig" de novo depois reconstrói tudo igual.
 
-    Também purga os objetos WGT_hytale_* cacheados em bpy.data -- sem
-    isso, depois de editar/atualizar hytale_widgets.blend (ex.: remodelar
-    um shape existente), "Create Rig" continuava usando a cópia antiga
-    que já estava carregada na cena (ensure_widget_objects só faz append
-    do que ainda NÃO existe em bpy.data.objects -- um objeto com o mesmo
-    nome já presente nunca é atualizado sozinho). Rodar este botão força
-    um append fresco da biblioteca na próxima geração.
+    Também purga TODOS os objetos widget deste Armature -- os TEMPLATES
+    por-papel (ver ensure_widget_objects) E as cópias por-bone (v0.17,
+    ver _ensure_bone_widget_copy), já que ambos moram juntos na mesma
+    collection 'WGT - <nome>' e o purge simplesmente esvazia essa
+    collection inteira. Sem isso, depois de editar/atualizar
+    hytale_widgets.blend (ex.: remodelar um shape existente), "Create
+    Rig" continuava usando os TEMPLATES antigos já presentes na cena
+    (ensure_widget_objects só faz append do que ainda NÃO existe em
+    bpy.data.objects -- um objeto com o mesmo nome já presente nunca é
+    atualizado sozinho) -- e as cópias por-bone, que vêm dos templates,
+    herdariam a forma antiga junto. Rodar este botão força um append
+    fresco da biblioteca (novos templates) e novas cópias por-bone na
+    próxima geração. A collection 'WGT - <nome>' em si também é
+    removida se ficar vazia.
 
-    CUIDADO se você tiver MAIS DE UM personagem/armature no mesmo arquivo
-    .blend compartilhando os mesmos widgets: purgar aqui remove os
-    objetos pra TODOS eles (bpy.data é global, não por-armature) -- os
-    outros rigs voltam a usar o octaedro padrão até rodarem "Create Rig"
-    de novo também."""
+    v0.16 -- desde que os widgets viraram por-personagem (nome com
+    sufixo ' - <nome_do_armature>', ver _widget_instance_name), este
+    purge só afeta ESTE Armature: outro personagem no mesmo .blend
+    mantém os próprios widgets intactos (ANTES desta versão, quando o
+    objeto era um único global compartilhado, purgar aqui apagava os
+    widgets de TODOS os personagens do arquivo de uma vez -- esse
+    problema não existe mais)."""
 
     bl_idname = "armature.hytale_clear_generated_rig"
     bl_label = "Remove Generated Hytale Rig Bones"
@@ -3231,15 +4135,18 @@ class RIG_OT_hytale_clear_generated(Operator):
             _remove_tree(main_coll)
 
         purged = 0
-        for wgt_name in [o.name for o in bpy.data.objects if o.name.startswith(WIDGETS_NAME_PREFIX)]:
-            wgt_obj = bpy.data.objects.get(wgt_name)
-            if wgt_obj is None:
-                continue
-            mesh = wgt_obj.data
-            bpy.data.objects.remove(wgt_obj, do_unlink=True)
-            if mesh is not None and mesh.users == 0:
-                bpy.data.meshes.remove(mesh, do_unlink=True)
-            purged += 1
+        widgets_collection = _find_widgets_collection(obj)
+        if widgets_collection is not None:
+            for wgt_obj in list(widgets_collection.objects):
+                mesh = wgt_obj.data
+                bpy.data.objects.remove(wgt_obj, do_unlink=True)
+                if mesh is not None and mesh.users == 0:
+                    bpy.data.meshes.remove(mesh, do_unlink=True)
+                purged += 1
+            if not widgets_collection.objects:
+                _unlink_and_remove_collection(widgets_collection)
+                if obj.get("hytale_widgets_collection"):
+                    del obj["hytale_widgets_collection"]
 
         # v0.10 -- Texture Picker não é feito de bone PROP_RIG_LAYER só (o
         # plane de referência e os nodes injetados no material real da
@@ -3254,12 +4161,22 @@ class RIG_OT_hytale_clear_generated(Operator):
                 if _remove_texture_picker(obj, item):
                     texture_picker_cleaned += 1
 
+        # v0.15 -- First Person Camera não é bone nenhum (PROP_RIG_LAYER
+        # não alcança) -- limpa à parte, mesmo espírito do Texture
+        # Picker acima (reaproveita a mesma função do botão dedicado,
+        # RIG_OT_hytale_camera_remove). Só uma câmera por armature (ver
+        # comentário na seção "First Person Camera"), não precisa de
+        # loop por entrada.
+        camera_cleaned = _remove_first_person_camera(obj)
+
         self.report(
             {"INFO"},
             f"Removed {removed} generated bone(s) and {removed_collections} bone collection(s) under "
             f"Main; purged {purged} cached widget object(s) "
             f"(next 'Create Rig' re-loads them from {WIDGETS_LIBRARY_FILENAME})"
-            + (f"; cleaned {texture_picker_cleaned} Texture Picker setup(s)." if texture_picker_cleaned else "."),
+            + (f"; cleaned {texture_picker_cleaned} Texture Picker setup(s)" if texture_picker_cleaned else "")
+            + ("; removed First Person Camera" if camera_cleaned else "")
+            + ".",
         )
         return {"FINISHED"}
 
@@ -3730,6 +4647,15 @@ def _build_texture_picker_plane_mesh(mesh_name, plane_w, plane_h, rest_uv):
     célula de repouso do personagem específico fosse exatamente a
     primeira do atlas, pixel (0,0)).
 
+    v0.14/v0.15.2 -- um recurso "Crop Texture" (mostrar só a região do
+    grid em vez do atlas inteiro) chegou a existir aqui, mas foi
+    REMOVIDO a pedido do usuário -- a matemática de tamanho foi
+    confirmada correta por medição direta no Blender, mas o resultado
+    visual final não bateu com a expectativa mesmo assim. Se for
+    reconsiderado no futuro, o usuário reporta que cortar a malha à mão
+    (Edit Mode, deletar as faces de fora) continua funcionando bem como
+    alternativa manual.
+
     Plano construído no eixo local X/Z do bone (Y do bone fica
     perpendicular à tela, "pra fora") -- ver aviso no changelog: é o
     eixo mais provável pra um plane "de frente" com a convenção deste
@@ -3960,9 +4886,12 @@ def _build_texture_picker(context, armature_obj, item):
         # em si "vazava" pra fora do grid antes de snapar de volta).
         con.use_transform_limit = True
 
-        missing_widgets = ensure_widget_objects({WGT_TEXTURE_PICKER_CURSOR, WGT_UI_ROOT})
+        widgets_collection = get_or_create_widgets_collection(armature_obj)
+        missing_widgets = ensure_widget_objects({WGT_TEXTURE_PICKER_CURSOR, WGT_UI_ROOT}, armature_obj)
         if WGT_TEXTURE_PICKER_CURSOR not in missing_widgets:
-            pose_cursor.custom_shape = bpy.data.objects.get(WGT_TEXTURE_PICKER_CURSOR)
+            pose_cursor.custom_shape = _ensure_bone_widget_copy(
+                WGT_TEXTURE_PICKER_CURSOR, armature_obj, cursor_name, widgets_collection
+            )
             pose_cursor.use_custom_shape_bone_size = False
             pose_cursor.custom_shape_scale_xyz = (
                 min(0.05, plane_w * 0.15), min(0.05, plane_w * 0.15), min(0.05, plane_w * 0.15),
@@ -3975,7 +4904,9 @@ def _build_texture_picker(context, armature_obj, item):
         # maior que ele).
         pose_ui_root = armature_obj.pose.bones.get(ui_root_name)
         if pose_ui_root is not None and WGT_UI_ROOT not in missing_widgets:
-            pose_ui_root.custom_shape = bpy.data.objects.get(WGT_UI_ROOT)
+            pose_ui_root.custom_shape = _ensure_bone_widget_copy(
+                WGT_UI_ROOT, armature_obj, ui_root_name, widgets_collection
+            )
             pose_ui_root.use_custom_shape_bone_size = False
             pose_ui_root.custom_shape_scale_xyz = (
                 min(0.08, plane_w * 0.25), min(0.08, plane_w * 0.25), min(0.08, plane_w * 0.25),
@@ -3987,6 +4918,7 @@ def _build_texture_picker(context, armature_obj, item):
     material_name = texture_picker_bone_name + TEXTURE_PICKER_MATERIAL_SUFFIX
     reference_material = _ensure_texture_picker_reference_material(material_name, image)
     rest_uv = _get_texture_picker_mesh_rest_uv(mesh_obj)
+    rest_u, rest_v = rest_uv
 
     plane_obj = bpy.data.objects.get(plane_name)
     if plane_obj is None:
@@ -4305,6 +5237,169 @@ class RIG_OT_hytale_texture_picker_remove(Operator):
 
 
 # ---------------------------------------------------------------------------
+# First Person Camera (chain_type HEAD, HytaleIKChainItem.head_camera_enabled)
+# ---------------------------------------------------------------------------
+#
+# Sistema separado do "Create Rig" principal, mesmo espírito do Texture
+# Picker (RIG_OT_hytale_texture_picker_create acima) -- roda por conta
+# própria (RIG_OT_hytale_camera_create), porque não precisa regenerar o
+# resto do rig sempre que só a câmera muda de posição/rotação/parent.
+# NÃO exige "Create Rig" já ter rodado (diferente do Texture Picker, que
+# depende do "<bone>_CTRL" existir) -- o campo de bone aqui é livre, pode
+# ser qualquer bone ORG/MCH/CTRL da armature, então basta o bone em si
+# existir.
+#
+# Só existe UMA câmera esperada por armature (não multi-instância como
+# Texture Picker) -- nome derivado do ARMATURE, não do bone escolhido
+# (ver FIRST_PERSON_CAMERA_SUFFIX em constants.py), pra sobreviver a uma
+# troca de Camera Parent Bone sem precisar apagar e recriar. Se mais de
+# uma entrada HEAD tiver a opção ligada no mesmo armature (caso raro,
+# não é o uso pretendido), a última que rodar "Create Camera" vence --
+# sem checagem especial pra isso.
+#
+# Puramente uma ferramenta de preview/animação: o Object Camera nunca é
+# lido por exporter.py, não faz parte do contrato .blockyanim.
+
+
+def _build_first_person_camera(context, armature_obj, item):
+    """Núcleo de 'Create Camera': cria (ou atualiza) um Object Camera
+    bone-parented no bone escolhido (item.head_camera_parent_bone) --
+    idempotente, mesmo espírito do resto do rigger. Devolve (True,
+    mensagem) ou (False, mensagem de erro)."""
+    parent_bone_name = (item.head_camera_parent_bone or "").strip()
+    if not parent_bone_name:
+        return False, "No Camera Parent Bone set on this entry."
+    data_bone = armature_obj.data.bones.get(parent_bone_name)
+    if data_bone is None:
+        return False, f"'{parent_bone_name}' not found on this armature."
+
+    camera_name = armature_obj.name + FIRST_PERSON_CAMERA_SUFFIX
+    camera_data = bpy.data.cameras.get(camera_name)
+    if camera_data is None:
+        camera_data = bpy.data.cameras.new(camera_name)
+        camera_data.clip_start = 0.01
+    # v0.15.1 -- FOV agora é um campo de verdade (item.head_camera_fov,
+    # ver HytaleIKChainItem) -- reaplicado TODA VEZ (não só na criação),
+    # mesmo espírito idempotente do resto do rigger, pra "Create Camera"
+    # de novo já atualizar o FOV sem precisar apagar a câmera primeiro.
+    camera_data.lens_unit = "FOV"
+    camera_data.angle = math.radians(item.head_camera_fov)
+
+    camera_obj = bpy.data.objects.get(camera_name)
+    if camera_obj is None:
+        camera_obj = bpy.data.objects.new(camera_name, camera_data)
+        for coll in armature_obj.users_collection or [context.collection]:
+            coll.objects.link(camera_obj)
+    elif camera_obj.data is not camera_data:
+        camera_obj.data = camera_data
+
+    # Bone-parenting NATIVO, mesmo mecanismo/correção de sinal já
+    # confirmado ao vivo pro Atlas Plane do Texture Picker (ver
+    # _build_texture_picker): Blender posiciona Object bone-parented
+    # relativo à TAIL do bone, não ao head -- compensa com
+    # matrix_parent_inverse = Translation(0, -bone.length, 0).
+    camera_obj.parent = armature_obj
+    camera_obj.parent_type = "BONE"
+    camera_obj.parent_bone = parent_bone_name
+    camera_obj.matrix_parent_inverse = Matrix.Translation((0.0, -data_bone.length, 0.0))
+    camera_obj.location = (item.head_camera_offset_x, item.head_camera_offset_y, item.head_camera_offset_z)
+    camera_obj.rotation_euler = Euler(
+        (
+            math.radians(item.head_camera_rotation_x),
+            math.radians(item.head_camera_rotation_y),
+            math.radians(item.head_camera_rotation_z),
+        ),
+        "XYZ",
+    )
+
+    return True, (
+        f"First Person Camera '{camera_obj.name}' parented to '{parent_bone_name}'. Position/rotation are a "
+        f"starting point, not a calibrated Hytale value -- fine-tune with the Camera Offset/Rotation fields "
+        f"to line up with this character's eyes."
+    )
+
+
+def _remove_first_person_camera(armature_obj):
+    """Desfaz _build_first_person_camera -- remove o Object Camera (e o
+    Camera data-block, se não estiver mais em uso por mais nada) deste
+    armature. Seguro chamar mesmo se nada foi gerado ainda (idempotente).
+    Devolve True se algo foi de fato removido, False se já estava limpo."""
+    camera_name = armature_obj.name + FIRST_PERSON_CAMERA_SUFFIX
+    camera_obj = bpy.data.objects.get(camera_name)
+    if camera_obj is None:
+        return False
+    camera_data = camera_obj.data
+    bpy.data.objects.remove(camera_obj, do_unlink=True)
+    if camera_data is not None and camera_data.users == 0:
+        bpy.data.cameras.remove(camera_data, do_unlink=True)
+    return True
+
+
+class RIG_OT_hytale_camera_create(Operator):
+    """Botão 'Create Camera' -- ver _build_first_person_camera pra lógica
+    de verdade. Opera sobre a entrada HEAD ATIVA da lista
+    (armature.hytale_ik_chains_index)."""
+
+    bl_idname = "armature.hytale_camera_create"
+    bl_label = "Create Camera"
+    bl_description = "Create (or update) a First Person Camera object, bone-parented to the chosen bone"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        if obj is None or obj.type != "ARMATURE":
+            return False
+        armature = obj.data
+        index = armature.hytale_ik_chains_index
+        if not (0 <= index < len(armature.hytale_ik_chains)):
+            return False
+        item = armature.hytale_ik_chains[index]
+        if item.chain_type != "HEAD" or not item.head_camera_enabled:
+            return False
+        if not item.head_camera_parent_bone:
+            cls.poll_message_set("Set a Camera Parent Bone on this entry first.")
+            return False
+        if armature.bones.get(item.head_camera_parent_bone) is None:
+            cls.poll_message_set(f"'{item.head_camera_parent_bone}' not found on this armature.")
+            return False
+        return True
+
+    def execute(self, context):
+        obj = context.active_object
+        armature = obj.data
+        item = armature.hytale_ik_chains[armature.hytale_ik_chains_index]
+        ok, message = _build_first_person_camera(context, obj, item)
+        self.report({"INFO"} if ok else {"ERROR"}, message)
+        return {"FINISHED"} if ok else {"CANCELLED"}
+
+
+class RIG_OT_hytale_camera_remove(Operator):
+    """Botão ao lado de 'Create Camera' -- desfaz (ver
+    _remove_first_person_camera)."""
+
+    bl_idname = "armature.hytale_camera_remove"
+    bl_label = "Remove Camera"
+    bl_description = "Remove the generated First Person Camera object for this armature"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        if obj is None or obj.type != "ARMATURE":
+            return False
+        armature = obj.data
+        index = armature.hytale_ik_chains_index
+        return 0 <= index < len(armature.hytale_ik_chains) and armature.hytale_ik_chains[index].chain_type == "HEAD"
+
+    def execute(self, context):
+        obj = context.active_object
+        removed = _remove_first_person_camera(obj)
+        self.report({"INFO"}, "First Person Camera removed." if removed else "Nothing to remove.")
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
 # Operador principal: gera/atualiza as camadas do rig
 # ---------------------------------------------------------------------------
 
@@ -4534,13 +5629,18 @@ class RIG_OT_hytale_generate_rig(Operator):
         "esse bone é a ponta de uma cadeia IK?" com base em chains_data
         sem se preocupar com ordem.
 
-        Resolução em duas passadas: primeiro tenta o widget PREFERIDO de
-        cada bone (por papel -- FK/IK/pole/root/head); o que não existir
-        ainda na biblioteca cai pro WGT_DEFAULT_FALLBACK (se ele existir).
-        Isso deixa usar só 1-2 shapes modelados por enquanto -- assim que
-        um shape específico for adicionado à biblioteca com o nome certo,
-        ele passa a valer automaticamente pro papel dele, sem tocar em
-        código.
+        Resolução em duas passadas: primeiro tenta o TEMPLATE preferido
+        de cada bone (por papel -- FK/IK/pole/root/head); o que não
+        existir ainda na biblioteca cai pro template WGT_DEFAULT_FALLBACK
+        (se ele existir). Isso deixa usar só 1-2 shapes modelados por
+        enquanto -- assim que um shape específico for adicionado à
+        biblioteca com o nome certo, ele passa a valer automaticamente
+        pro papel dele, sem tocar em código. v0.17 -- essas duas
+        passadas só garantem que o TEMPLATE do papel existe
+        (ensure_widget_objects); a atribuição final de verdade usa
+        _ensure_bone_widget_copy, que duplica o template numa cópia
+        ÚNICA pra CADA bone (nunca mais compartilhada, nem entre bones
+        do mesmo papel).
 
         100% cosmético: se a biblioteca ainda não foi gerada/colocada em
         assets/hytale_widgets.blend, avisa e segue em frente -- os bones
@@ -4573,21 +5673,39 @@ class RIG_OT_hytale_generate_rig(Operator):
             if widget_name:
                 wanted[pb.name] = widget_name
 
-        # Passada 1: shapes preferidos (por papel).
+        # Passada 1: TEMPLATE preferido (por papel) -- ainda um por
+        # papel, compartilhado só como FONTE de cópia (ver docstring).
         preferred_names = set(wanted.values())
-        still_missing = ensure_widget_objects(preferred_names)
+        still_missing = ensure_widget_objects(preferred_names, obj)
 
-        # Passada 2: fallback só pros bones cujo preferido não existe.
+        # Passada 2: template fallback só pros bones cujo preferido não existe.
         needs_fallback = {b for b, w in wanted.items() if w in still_missing}
         fallback_available = False
         if needs_fallback:
-            fallback_missing = ensure_widget_objects({WGT_DEFAULT_FALLBACK})
+            fallback_missing = ensure_widget_objects({WGT_DEFAULT_FALLBACK}, obj)
             fallback_available = WGT_DEFAULT_FALLBACK not in fallback_missing
 
         if still_missing and not fallback_available:
+            # v0.16 -- diagnóstico melhorado: a mensagem antiga só listava
+            # os nomes, sem dizer SE o problema é 'arquivo .blend não
+            # encontrado no caminho calculado' (_widgets_library_path())
+            # ou 'arquivo encontrado, mas os nomes não existem dentro
+            # dele' -- duas causas bem diferentes que pediam a mesma
+            # frase genérica antes. v0.16.1 -- no segundo caso, lista
+            # também os nomes que a biblioteca REALMENTE tem
+            # (list_widget_library_names) -- se algum nome esperado
+            # aparecer aí escrito ligeiramente diferente (maiúscula,
+            # espaço, etc.), fica óbvio na hora.
+            lib_path = _widgets_library_path()
+            if os.path.isfile(lib_path):
+                available = list_widget_library_names()
+                available_hint = ", ".join(sorted(available)) if available else "(none readable)"
+                path_hint = f"names not present inside '{lib_path}' -- library actually contains: {available_hint}"
+            else:
+                path_hint = f"library file not found at '{lib_path}'"
             self.report(
                 {"WARNING"},
-                f"Widget shape(s) not found in '{WIDGETS_LIBRARY_FILENAME}': {', '.join(sorted(still_missing))} "
+                f"Widget shape(s) not found ({path_hint}): {', '.join(sorted(still_missing))} "
                 f"(and no '{WGT_DEFAULT_FALLBACK}' fallback available either) -- affected bone(s) left with the "
                 f"default shape.",
             )
@@ -4598,6 +5716,7 @@ class RIG_OT_hytale_generate_rig(Operator):
                 f"'{WGT_DEFAULT_FALLBACK}' as fallback for those roles.",
             )
 
+        widgets_collection = get_or_create_widgets_collection(obj)
         assigned = 0
         used_fallback = 0
         for bone_name, widget_name in wanted.items():
@@ -4607,7 +5726,13 @@ class RIG_OT_hytale_generate_rig(Operator):
                 widget_name = WGT_DEFAULT_FALLBACK
                 used_fallback += 1
             pb = pose_bones[bone_name]
-            new_shape_obj = bpy.data.objects[widget_name]
+            # v0.17 -- cópia ÚNICA deste bone, duplicada do template
+            # `widget_name` na primeira vez (ver _ensure_bone_widget_copy)
+            # -- nunca mais o mesmo Object entre dois bones, nem do
+            # mesmo papel.
+            new_shape_obj = _ensure_bone_widget_copy(widget_name, obj, bone_name, widgets_collection)
+            if new_shape_obj is None:
+                continue
             # Só reseta Translation/Rotation/Scale pro default na PRIMEIRA
             # vez que ESTE shape é atribuído a ESTE bone -- reruns não
             # apagam ajustes já feitos (template de shapes ativo, ver
@@ -6704,7 +7829,9 @@ def _template_source(list_func, name):
 #   TAIL:        root_bone, tip_bone, extra_ik_location,
 #                tail_tip_rotation_axis, tail_tip_rotation_deg
 #   HEAD:        neck_count, neck_bone_1..5, head_bone, head_end_bone, continuous_chain,
-#                continuous_chain_link_bone, head_follow_enabled
+#                continuous_chain_link_bone, head_follow_enabled, head_camera_enabled,
+#                head_camera_parent_bone, head_camera_offset_x/_y/_z, head_camera_rotation_x/_y/_z,
+#                head_camera_fov
 #   SPINE:       spine_count, pelvis_bone, spine_bone_1..4, continuous_chain,
 #                continuous_chain_link_bone
 #   ATTACHMENTS: attachments_count, attachment_bone_1..ATTACHMENTS_MAX_COUNT
@@ -6731,6 +7858,14 @@ _IK_CHAIN_JSON_FIELDS = (
     "continuous_chain", "continuous_chain_link_bone",
     # v0.13.4 -- "Head Free/Lock", exclusivo de HEAD.
     "head_follow_enabled",
+    # v0.15 -- "Create First Person Camera", exclusivo de HEAD (mesmo
+    # bug de antes espreitando: campo novo em HytaleIKChainItem tem que
+    # entrar aqui, senão salva/carrega template silenciosamente
+    # descarta o valor -- ver comentário grande acima).
+    "head_camera_enabled", "head_camera_parent_bone",
+    "head_camera_offset_x", "head_camera_offset_y", "head_camera_offset_z",
+    "head_camera_rotation_x", "head_camera_rotation_y", "head_camera_rotation_z",
+    "head_camera_fov",
     "attachments_count", *(f"attachment_bone_{i}" for i in range(1, ATTACHMENTS_MAX_COUNT + 1)),
     "texture_picker_bone", "texture_picker_ui_parent_bone", "texture_picker_plane_scale", "texture_picker_plane_offset_x", "texture_picker_plane_offset_y",
     "texture_picker_grid_cols", "texture_picker_grid_rows",
