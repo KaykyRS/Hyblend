@@ -37,6 +37,15 @@ from .common import (
     quat_to_dict,
     vec_to_dict,
 )
+from .translations import (
+    localized_props,
+    register_localized_class,
+    register_refresh_hook,
+    tooltip,
+    tr,
+    unregister_localized_class,
+    unregister_refresh_hook,
+)
 
 # ---------------------------------------------------------------------------
 # Formato .blockyanim -- ver JannisX11/hytale-blockbench-plugin,
@@ -159,18 +168,27 @@ def is_original_bone_name(name):
 # HYTALE_export_settings) ficou só com o que é DE VERDADE global à
 # Armature inteira (a Bone Collection de export -- não faz sentido "por
 # instância", só existe UM conjunto de bones exportáveis).
-class HYTALE_export_settings(PropertyGroup):
-    export_collection_name: StringProperty(
-        name="Export Bone Collection",
-        description=(
-            "Name of the Armature Bone Collection containing only the "
-            "'original' game bones to export (Armature Data Properties > "
-            "Bone Collections). If this collection doesn't exist on the "
-            "armature, falls back to guessing by name suffix "
-            "(_MCH/_CTRL/_IK), which is unreliable on complex rigs"
+# v0.14 -- @localized_props (ver translations/__init__.py). CUIDADO
+# ESPECIAL nesta classe (e na HYTALE_texture_picker_export_item logo
+# abaixo): as duas são alvo de PointerProperty/CollectionProperty
+# atribuídas direto em Armature (dado real, salvo no .blend -- não é
+# property de diálogo transitória) -- ver register()/
+# _redo_armature_property_assignments no fim do arquivo, que também
+# está registrado como refresh hook (register_refresh_hook) por causa
+# disso.
+def _export_settings_props(lang):
+    return {
+        "export_collection_name": StringProperty(
+            name="Export Bone Collection",
+            description=tr("exporter.prop.export_settings_collection_name", lang),
+            default=EXPORT_COLLECTION_NAME_DEFAULT,
         ),
-        default=EXPORT_COLLECTION_NAME_DEFAULT,
-    )
+    }
+
+
+@localized_props(_export_settings_props)
+class HYTALE_export_settings(PropertyGroup):
+    pass
 
 
 # v0.12 -- item da lista armature.hytale_texture_picker_exports (uma
@@ -185,89 +203,80 @@ class HYTALE_export_settings(PropertyGroup):
 # (ver HYTALE_UL_texture_picker_exports abaixo) -- mantida em sincronia
 # sempre que uv_offset_target_bone muda (ver RIG_OT_hytale_texture_
 # picker_create/_remove em rigger/rig.py, que são quem escreve aqui).
+#
+# v0.14 -- @localized_props também -- ver comentário acima de
+# HYTALE_export_settings pro motivo do cuidado especial (CollectionProperty
+# em Armature).
+def _texture_picker_export_item_props(lang):
+    return {
+        "uv_offset_source_bone": StringProperty(
+            name="UV Control Bone",
+            description=tr("exporter.prop.texture_picker_source_bone", lang),
+            default=UV_OFFSET_SOURCE_BONE_DEFAULT,
+        ),
+        "uv_offset_target_bone": StringProperty(
+            name="Target Bone (shapeUvOffset)",
+            description=tr("exporter.prop.texture_picker_target_bone", lang),
+            default=UV_OFFSET_TARGET_BONE_DEFAULT,
+        ),
+        # v0.10.13 -- Companion targets (rigger's "Companion Bones Amount" --
+        # HytaleIKChainItem.texture_picker_extra_bone_1..N in rigger/rig.py). Some
+        # characters have their animated part (mouth, face, etc.) split across
+        # more than one mesh/bone (e.g. mirrored L/R halves meeting in the
+        # middle) that need the SAME expression change at the SAME time --
+        # this field lets the SAME shapeUvOffset delta be written to more
+        # bones besides the primary uv_offset_target_bone. Comma-separated
+        # exact bone names (same name-space as uv_offset_target_bone -- raw
+        # Blender bone names, matched against the exportable set the same
+        # way). A name that isn't exportable is warned and skipped
+        # individually -- it does NOT cancel the primary target or the other
+        # companions (see sample_action()). Written automatically by 'Create
+        # Texture Picker' (rigger/rig.py, _build_texture_picker) from the companion
+        # bones configured on that entry -- normally you don't need to type
+        # here by hand. Companion Bones stay WITHIN this same instance/entry --
+        # they don't need their own list entry, they share this one's
+        # calibration (see step_x/px_x/step_y/px_y below).
+        "uv_offset_target_bones_extra": StringProperty(
+            name="Companion Target Bones (shapeUvOffset)",
+            description=tr("exporter.prop.texture_picker_target_bones_extra", lang),
+            default="",
+        ),
+        # v0.6.5 -- MOVIDOS de EXPORT_OT_hytale_blockyanim pra cá (eram
+        # Property de Operator, não persistiam com o arquivo -- resetavam
+        # pro default toda vez que o diálogo de export abria, então o
+        # Rigger (Texture Picker, "Create Texture Picker") não tinha como
+        # pré-preencher isso de verdade). v0.12: junto com o resto desta
+        # classe, movidos de novo -- da PointerProperty única (HYTALE_
+        # export_bone_settings) pra este item de CollectionProperty, uma
+        # calibração própria por instância. Ver sample_action(), que agora
+        # itera armature.hytale_texture_picker_exports inteira em vez de ler
+        # um conjunto fixo de campos.
+        "uv_offset_step_x": FloatProperty(
+            name="Grid Step X",
+            description=tr("exporter.prop.texture_picker_step_x", lang),
+            default=0.1,
+        ),
+        "uv_offset_px_x": FloatProperty(
+            name="Pixels per Step X",
+            description=tr("exporter.prop.texture_picker_px_x", lang),
+            default=20.0,
+        ),
+        "uv_offset_step_y": FloatProperty(
+            name="Grid Step Y",
+            description=tr("exporter.prop.texture_picker_step_y", lang),
+            default=-0.045,
+        ),
+        "uv_offset_px_y": FloatProperty(
+            name="Pixels per Step Y",
+            description=tr("exporter.prop.texture_picker_px_y", lang),
+            default=-10.0,
+        ),
+    }
+
+
+@localized_props(_texture_picker_export_item_props)
 class HYTALE_texture_picker_export_item(PropertyGroup):
-    uv_offset_source_bone: StringProperty(
-        name="UV Control Bone",
-        description=(
-            "Name of the helper bone whose Location drives the atlas "
-            "picker (e.g. 'ui.texture_picker'). This bone itself is NOT "
-            "exported -- only its Location is sampled"
-        ),
-        default=UV_OFFSET_SOURCE_BONE_DEFAULT,
-    )
-    uv_offset_target_bone: StringProperty(
-        name="Target Bone (shapeUvOffset)",
-        description=(
-            "Exact name of the real game bone to attach the "
-            "'shapeUvOffset' channel to -- must be one of the exportable "
-            "bones (e.g. 'Mouth', or any other atlas-driven part)"
-        ),
-        default=UV_OFFSET_TARGET_BONE_DEFAULT,
-    )
-    # v0.10.13 -- Companion targets (rigger's "Companion Bones Amount" --
-    # HytaleIKChainItem.texture_picker_extra_bone_1..N in rigger/rig.py). Some
-    # characters have their animated part (mouth, face, etc.) split across
-    # more than one mesh/bone (e.g. mirrored L/R halves meeting in the
-    # middle) that need the SAME expression change at the SAME time --
-    # this field lets the SAME shapeUvOffset delta be written to more
-    # bones besides the primary uv_offset_target_bone. Comma-separated
-    # exact bone names (same name-space as uv_offset_target_bone -- raw
-    # Blender bone names, matched against the exportable set the same
-    # way). A name that isn't exportable is warned and skipped
-    # individually -- it does NOT cancel the primary target or the other
-    # companions (see sample_action()). Written automatically by 'Create
-    # Texture Picker' (rigger/rig.py, _build_texture_picker) from the companion
-    # bones configured on that entry -- normally you don't need to type
-    # here by hand. Companion Bones stay WITHIN this same instance/entry --
-    # they don't need their own list entry, they share this one's
-    # calibration (see step_x/px_x/step_y/px_y below).
-    uv_offset_target_bones_extra: StringProperty(
-        name="Companion Target Bones (shapeUvOffset)",
-        description=(
-            "Comma-separated extra bone names that receive the exact same 'shapeUvOffset' data as "
-            "Target Bone above -- for characters whose animated part is split across more than one "
-            "mesh/bone (e.g. mirrored left/right halves) that must change expression together. Usually "
-            "filled automatically by 'Create Texture Picker' from the Companion Bones configured on this "
-            "entry, not typed here directly"
-        ),
-        default="",
-    )
-    # v0.6.5 -- MOVIDOS de EXPORT_OT_hytale_blockyanim pra cá (eram
-    # Property de Operator, não persistiam com o arquivo -- resetavam
-    # pro default toda vez que o diálogo de export abria, então o
-    # Rigger (Texture Picker, "Create Texture Picker") não tinha como
-    # pré-preencher isso de verdade). v0.12: junto com o resto desta
-    # classe, movidos de novo -- da PointerProperty única (HYTALE_
-    # export_bone_settings) pra este item de CollectionProperty, uma
-    # calibração própria por instância. Ver sample_action(), que agora
-    # itera armature.hytale_texture_picker_exports inteira em vez de ler
-    # um conjunto fixo de campos.
-    uv_offset_step_x: FloatProperty(
-        name="Grid Step X",
-        description=(
-            "In Blender units: how far the control bone has to move on X "
-            "for the mouth/face texture to shift by one step. Must match "
-            "whatever your shader/driver setup actually uses -- this "
-            "doesn't invent the behavior, it just has to describe it "
-            "correctly"
-        ),
-        default=0.1,
-    )
-    uv_offset_px_x: FloatProperty(
-        name="Pixels per Step X",
-        description="How many raw texture pixels one X grid step represents in the file (the game expects raw pixel offsets, not a 0..1 fraction)",
-        default=20.0,
-    )
-    uv_offset_step_y: FloatProperty(
-        name="Grid Step Y",
-        description="Same as Grid Step X, for the control bone's Y movement",
-        default=-0.045,
-    )
-    uv_offset_px_y: FloatProperty(
-        name="Pixels per Step Y",
-        description="Same as Pixels per Step X, for Y",
-        default=-10.0,
-    )
+    pass
 
 
 def get_export_settings(armature_obj):
@@ -332,7 +341,7 @@ class EXPORT_OT_texture_picker_export_add(Operator):
 
     bl_idname = "armature.hytale_texture_picker_export_add"
     bl_label = "Add Texture Picker Export"
-    bl_description = "Add a manual Texture Picker export entry to the list"
+    description = tooltip("exporter.tooltip.texture_picker_export_add")
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -354,7 +363,7 @@ class EXPORT_OT_texture_picker_export_remove(Operator):
 
     bl_idname = "armature.hytale_texture_picker_export_remove"
     bl_label = "Remove Texture Picker Export"
-    bl_description = "Remove the selected Texture Picker export entry from the list"
+    description = tooltip("exporter.tooltip.texture_picker_export_remove")
     bl_options = {"REGISTER", "UNDO"}
 
     index: IntProperty(default=-1)
@@ -1254,6 +1263,7 @@ class HYTALE_OT_select_all_actions(Operator):
 
     bl_idname = "hytale.select_all_actions"
     bl_label = "Select/Deselect All"
+    description = tooltip("exporter.tooltip.select_all_actions")
     bl_options = {"INTERNAL"}
 
     value: BoolProperty(default=True)
@@ -1274,337 +1284,215 @@ class HYTALE_OT_select_all_actions(Operator):
 # ---------------------------------------------------------------------------
 
 
+# v0.14 -- todas as properties de EXPORT_OT_hytale_blockyanim (mesmo as
+# sem tooltip, tipo os 6 toggles show_*) vêm desta função --
+# @localized_props precisa do dict COMPLETO pra reconstruir a classe
+# quando o idioma muda (ver translations/__init__.py, seção "Tooltip
+# de campo"). Diferente de HYTALE_export_settings/HYTALE_texture_picker_
+# export_item acima, esta classe é um Operator -- suas properties NÃO
+# persistem no .blend (só duram enquanto o diálogo de export está
+# aberto), então não tem o cuidado especial de type= externo.
+def _blockyanim_export_props(lang):
+    return {
+        "directory": StringProperty(subtype="DIR_PATH"),
+        "action_items": CollectionProperty(type=HYTALE_action_export_item),
+        "action_items_index": IntProperty(),
+        # ---------------- Geral (sempre visível) ----------------
+        "bake_animation": BoolProperty(
+            name="Bake Every Frame",
+            description=tr("exporter.prop.blockyanim_bake_animation", lang),
+            default=True,
+        ),
+        "is_loop": BoolProperty(
+            name="Loop?",
+            description=tr("exporter.prop.blockyanim_is_loop", lang),
+            default=False,
+        ),
+        "force_start_end_keying": BoolProperty(
+            name="Keep First & Last Frame",
+            description=tr("exporter.prop.blockyanim_force_start_end_keying", lang),
+            default=True,
+        ),
+        "show_optimization": BoolProperty(name="Optimization", default=False),
+        "show_stretch": BoolProperty(name="Stretch Animation", default=False),
+        "show_uv": BoolProperty(name="Texture Picker", default=False),
+        "show_rig": BoolProperty(name="Rig Setup", default=False),
+        "show_format": BoolProperty(name="File Format", default=False),
+        "show_reexport": BoolProperty(name="Re-Export", default=False),
+        # v0.12.2 -- checkbox por exportação (não persiste com o arquivo --
+        # mesmo espírito de 'Bake Parent Scale into Children' dentro de
+        # Stretch Animation). Fica DENTRO da caixa colapsável show_uv (ver
+        # draw()) -- configurar as instâncias em si fica na aba Export do
+        # Object Properties; este liga/desliga só decide se ESTA exportação
+        # inclui shapeUvOffset ou não, sem apagar nenhuma instância.
+        "export_texture_picker": BoolProperty(
+            name="Export Texture Picker",
+            description=tr("exporter.prop.blockyanim_export_texture_picker", lang),
+            default=True,
+        ),
+        # ---------------- Avançado (cada categoria colapsa por conta própria,
+        # ver draw() -- não existe mais um "Advanced Options" único envolvendo
+        # todas elas) ----------------
+        "frame_step": IntProperty(
+            name="Frame Step",
+            description=tr("exporter.prop.blockyanim_frame_step", lang),
+            default=1,
+            min=1,
+        ),
+        "preserved_interpolation": EnumProperty(
+            name="Curve Style",
+            description=tr("exporter.prop.blockyanim_preserved_interpolation", lang),
+            items=[
+                (
+                    "smooth",
+                    "Smooth",
+                    tr("exporter.prop.blockyanim_preserved_interpolation_item_smooth", lang),
+                ),
+                (
+                    "linear",
+                    "Linear",
+                    tr("exporter.prop.blockyanim_preserved_interpolation_item_linear", lang),
+                ),
+            ],
+            default="smooth",
+        ),
+        "quantize_values": BoolProperty(
+            name="Snap to Grid",
+            description=tr("exporter.prop.blockyanim_quantize_values", lang),
+            default=True,
+        ),
+        "position_quantize_step": FloatProperty(
+            name="Position Step",
+            description=tr("exporter.prop.blockyanim_position_quantize_step", lang),
+            default=0.0001,
+            min=0.0,
+        ),
+        "rotation_quantize_step": FloatProperty(
+            name="Rotation Step",
+            description=tr("exporter.prop.blockyanim_rotation_quantize_step", lang),
+            default=0.00001,
+            min=0.0,
+        ),
+        "scale_quantize_step": FloatProperty(
+            name="Stretch Step",
+            description=tr("exporter.prop.blockyanim_scale_quantize_step", lang),
+            default=0.0001,
+            min=0.0,
+        ),
+        "position_zero_epsilon": FloatProperty(
+            name="Position Noise Floor",
+            description=tr("exporter.prop.blockyanim_position_zero_epsilon", lang),
+            default=0.001,
+            min=0.0,
+        ),
+        "rotation_zero_epsilon": FloatProperty(
+            name="Rotation Noise Floor",
+            description=tr("exporter.prop.blockyanim_rotation_zero_epsilon", lang),
+            default=0.0001,
+            min=0.0,
+        ),
+        "skip_redundant_frames": BoolProperty(
+            name="Remove Extra Frames",
+            description=tr("exporter.prop.blockyanim_skip_redundant_frames", lang),
+            default=False,
+        ),
+        "position_epsilon": FloatProperty(
+            name="Position Tolerance",
+            description=tr("exporter.prop.blockyanim_position_epsilon", lang),
+            default=0.001,
+            min=0.0,
+        ),
+        "rotation_epsilon": FloatProperty(
+            name="Rotation Tolerance",
+            description=tr("exporter.prop.blockyanim_rotation_epsilon", lang),
+            default=0.0001,
+            min=0.0,
+        ),
+        "export_scale": BoolProperty(
+            name="Export Stretch (Scale)",
+            description=tr("exporter.prop.blockyanim_export_scale", lang),
+            default=True,
+        ),
+        "scale_zero_epsilon": FloatProperty(
+            name="Stretch Noise Floor",
+            description=tr("exporter.prop.blockyanim_scale_zero_epsilon", lang),
+            default=0.001,
+            min=0.0,
+        ),
+        # v0.10.18 -- diferente de Blender (onde escalar um bone pai encolhe os
+        # filhos JUNTO na viewport por padrão -- "Inherit Scale"), o Hytale/
+        # Blockbench NÃO herda escala pela hierarquia: cada bone tem seu
+        # 'shapeStretch' totalmente independente (confirmado ao vivo pelo
+        # usuário -- escalar um bone pai dentro do próprio Blockbench não
+        # afeta os filhos). Sem esse toggle, uma animação que só escala o bone
+        # PAI no Blender (esperando que os filhos encolham visualmente junto,
+        # como aparece na viewport) exporta um shapeStretch que só existe no
+        # pai -- os filhos saem parados em 1.0, e no Blockbench/jogo eles NÃO
+        # encolhem (só o pai). Ligado, cada bone exportável recebe o produto
+        # do seu próprio scale local com o de TODOS os ancestrais exportáveis
+        # (mesmo espírito do "Inherit Scale: Full" do Blender) -- calculado só
+        # na hora de amostrar pro export (ver sample_action()), sem alterar
+        # nenhum keyframe de verdade na Action.
+        #
+        # v0.10.19 -- CORRIGIDO: só o tamanho (shapeStretch) não bastava --
+        # relatado ao vivo pelo usuário depois de testar a v0.10.18 (os filhos
+        # encolhiam, mas cada um em torno do PRÓPRIO pivot, em vez de se
+        # aproximar do pivot do pai, como a composição de matriz de verdade do
+        # Blender faz). Agora também corrige a POSIÇÃO de cada filho (ver
+        # rest_local_positions() + fórmula em sample_action()), puxando o
+        # pivot dele em direção ao pivot do pai proporcionalmente à escala em
+        # cascata -- reconstrói o efeito completo de "child_world = parent_
+        # world @ child_local" que o Hytale não faz sozinho.
+        "bake_scale_hierarchy": BoolProperty(
+            name="Bake Parent Scale into Children",
+            description=tr("exporter.prop.blockyanim_bake_scale_hierarchy", lang),
+            default=False,
+        ),
+        # v0.6.5 -- uv_offset_step_x/px_x/step_y/px_y MOVIDOS pra
+        # HYTALE_export_bone_settings (persistido na Armature) -- eram
+        # Property de Operator aqui, resetavam pro default toda vez que
+        # este diálogo abria (não persistiam com o arquivo), o que
+        # impedia o Rigger (Texture Picker) de pré-preencher isso de verdade.
+        # v0.12 -- moveram de novo, agora pra HYTALE_texture_picker_export_item
+        # (uma calibração por INSTÂNCIA, dentro de armature.hytale_texture_
+        # picker_exports). draw() abaixo mostra os 4 campos da entrada ATIVA
+        # da lista (hytale_texture_picker_exports_index); sample_action() já
+        # itera a lista inteira sozinho.
+        "unit_scale": FloatProperty(
+            name="Blender Units per Game Unit",
+            description=tr("exporter.prop.blockyanim_unit_scale", lang),
+            default=UNIT_SCALE_DEFAULT,
+            min=0.0001,
+            max=10.0,
+        ),
+        "output_decimal_places": IntProperty(
+            name="Decimal Places",
+            description=tr("exporter.prop.blockyanim_output_decimal_places", lang),
+            default=6,
+            min=1,
+            max=12,
+        ),
+        "pretty_print_json": BoolProperty(
+            name="Readable JSON",
+            description=tr("exporter.prop.blockyanim_pretty_print_json", lang),
+            default=False,
+        ),
+        "use_source_metadata": BoolProperty(
+            name="Keep Imported Timing",
+            description=tr("exporter.prop.blockyanim_use_source_metadata", lang),
+            default=False,
+        ),
+    }
+
+
+@localized_props(_blockyanim_export_props)
 class EXPORT_OT_hytale_blockyanim(Operator):
     """Batch-export one or more Actions of the selected/active Armature to Hytale's .blockyanim format -- one file per Action, into a chosen folder"""
 
     bl_idname = "export_scene.hytale_blockyanim"
     bl_label = "Export Hytale Animations (.blockyanim)"
+    description = tooltip("exporter.tooltip.blockyanim")
     bl_options = {"REGISTER"}
-
-    directory: StringProperty(subtype="DIR_PATH")
-
-    action_items: CollectionProperty(type=HYTALE_action_export_item)
-    action_items_index: IntProperty()
-
-    # ---------------- Geral (sempre visível) ----------------
-
-    bake_animation: BoolProperty(
-        name="Bake Every Frame",
-        description=(
-            "ON (recommended): samples the final pose at every single "
-            "frame, exactly as it looks in the viewport (IK, constraints, "
-            "everything). Always safe, but makes bigger files. OFF: only "
-            "samples frames that actually have a keyframe -- smaller "
-            "files, but can look wrong if your rig uses IK, since IK "
-            "poses aren't simple straight lines between keyframes"
-        ),
-        default=True,
-    )
-
-    is_loop: BoolProperty(
-        name="Loop?",
-        description=(
-            "ON: the animation eases back to its starting pose at the "
-            "end, so it can repeat seamlessly (walk, run, idle). OFF: the "
-            "animation just stops and holds its last pose (attacks, "
-            "deaths, one-off actions). This setting applies to every file "
-            "in this export, EXCEPT Actions re-exported with 'Keep "
-            "Imported Timing' ON (Advanced Options > Re-Export), which use "
-            "their own original value instead"
-        ),
-        default=False,
-    )
-
-    force_start_end_keying: BoolProperty(
-        name="Keep First & Last Frame",
-        description=(
-            "Only matters when 'Bake Every Frame' is OFF: makes sure the "
-            "very first and last frame of each Action always get written, "
-            "even if nothing was explicitly keyed exactly there. Without "
-            "this, the exported clip could start or end a few frames "
-            "early/late. Always on automatically when 'Bake Every Frame' "
-            "is ON"
-        ),
-        default=True,
-    )
-
-    show_optimization: BoolProperty(name="Optimization", default=False)
-    show_stretch: BoolProperty(name="Stretch Animation", default=False)
-    show_uv: BoolProperty(name="Texture Picker", default=False)
-    show_rig: BoolProperty(name="Rig Setup", default=False)
-    show_format: BoolProperty(name="File Format", default=False)
-    show_reexport: BoolProperty(name="Re-Export", default=False)
-    # v0.12.2 -- checkbox por exportação (não persiste com o arquivo --
-    # mesmo espírito de 'Bake Parent Scale into Children' dentro de
-    # Stretch Animation). Fica DENTRO da caixa colapsável show_uv (ver
-    # draw()) -- configurar as instâncias em si fica na aba Export do
-    # Object Properties; este liga/desliga só decide se ESTA exportação
-    # inclui shapeUvOffset ou não, sem apagar nenhuma instância.
-    export_texture_picker: BoolProperty(
-        name="Export Texture Picker",
-        description=(
-            "Include 'shapeUvOffset' data for every configured Texture "
-            "Picker instance (see the 'Hytale Export' panel in Object "
-            "Properties to add/edit/remove instances). Turn off to skip "
-            "this channel for this export only, without deleting any "
-            "configured instance"
-        ),
-        default=True,
-    )
-
-    # ---------------- Avançado (cada categoria colapsa por conta própria,
-    # ver draw() -- não existe mais um "Advanced Options" único envolvendo
-    # todas elas) ----------------
-
-    frame_step: IntProperty(
-        name="Frame Step",
-        description=(
-            "Only used when 'Bake Every Frame' is ON: 1 writes every "
-            "single frame (safest). A higher number skips frames to save "
-            "space, at the cost of smoothness -- only raise this if file "
-            "size is a real problem"
-        ),
-        default=1,
-        min=1,
-    )
-
-    preserved_interpolation: EnumProperty(
-        name="Curve Style",
-        description=(
-            "Only used when 'Bake Every Frame' is OFF: how the game "
-            "should smoothly move between two keyframes. Blockyanim only "
-            "understands two styles (not full Bezier handles like "
-            "Blender), so this one style is used for every keyframe"
-        ),
-        items=[
-            ("smooth", "Smooth", "Eases in and out between keyframes -- closest to Blender's default curves"),
-            ("linear", "Linear", "Moves at a constant speed between keyframes, no easing"),
-        ],
-        default="smooth",
-    )
-
-    quantize_values: BoolProperty(
-        name="Snap to Grid",
-        description=(
-            "ON (recommended): rounds every written number to a fixed "
-            "precision (see the three Step values below), which cleans up "
-            "invisible floating-point jitter that Blender's math produces "
-            "even for a bone that looks perfectly still. OFF: writes "
-            "numbers exactly as Blender computed them, decimals and all"
-        ),
-        default=True,
-    )
-
-    position_quantize_step: FloatProperty(
-        name="Position Step",
-        description="Smallest position change 'Snap to Grid' will keep, in game units. Smaller = more precise, larger file",
-        default=0.0001,
-        min=0.0,
-    )
-    rotation_quantize_step: FloatProperty(
-        name="Rotation Step",
-        description="Smallest rotation change 'Snap to Grid' will keep. Smaller = more precise, larger file",
-        default=0.00001,
-        min=0.0,
-    )
-    scale_quantize_step: FloatProperty(
-        name="Stretch Step",
-        description="Smallest stretch/scale change 'Snap to Grid' will keep. Smaller = more precise, larger file",
-        default=0.0001,
-        min=0.0,
-    )
-
-    position_zero_epsilon: FloatProperty(
-        name="Position Noise Floor",
-        description=(
-            "A bone that should be perfectly still can still end up with "
-            "a microscopic position value due to floating-point math -- "
-            "in-game this can look like tiny, invisible-in-Blender "
-            "shaking. Any position smaller than this (in game units) gets "
-            "snapped to exactly zero instead"
-        ),
-        default=0.001,
-        min=0.0,
-    )
-
-    rotation_zero_epsilon: FloatProperty(
-        name="Rotation Noise Floor",
-        description=(
-            "Same idea as Position Noise Floor, but for rotation: a bone "
-            "that should be perfectly still can end up with a "
-            "microscopic rotation instead of none at all (very common on "
-            "IK legs/arms, where the solver rarely lands on an EXACT "
-            "answer). Any rotation closer to 'no rotation at all' than "
-            "this gets snapped to exactly zero"
-        ),
-        default=0.0001,
-        min=0.0,
-    )
-
-    skip_redundant_frames: BoolProperty(
-        name="Remove Extra Frames",
-        description=(
-            "OFF (default): writes every sampled frame, guaranteeing an "
-            "exact match to what you see in Blender. ON: additionally "
-            "drops frames that don't add any real information -- for "
-            "example, a long straight stretch of motion doesn't need a "
-            "point every single frame if a few points already describe "
-            "the same curve. This makes the file noticeably smaller but "
-            "is LOSSY (can very slightly change the curve) -- only turn "
-            "it on if file size is still a problem after 'Snap to Grid' "
-            "and compact JSON formatting, which already help for free"
-        ),
-        default=False,
-    )
-
-    position_epsilon: FloatProperty(
-        name="Position Tolerance",
-        description=(
-            "Only used when 'Remove Extra Frames' is ON: how far (in game "
-            "units) a position/stretch frame is allowed to drift from a "
-            "straight line before it's considered necessary to keep. "
-            "Higher = more frames removed, less precise"
-        ),
-        default=0.001,
-        min=0.0,
-    )
-    rotation_epsilon: FloatProperty(
-        name="Rotation Tolerance",
-        description=(
-            "Only used when 'Remove Extra Frames' is ON: how far a "
-            "rotation frame is allowed to drift from a smooth curve "
-            "before it's considered necessary to keep. Higher = more "
-            "frames removed, less precise"
-        ),
-        default=0.0001,
-        min=0.0,
-    )
-
-    export_scale: BoolProperty(
-        name="Export Stretch (Scale)",
-        description=(
-            "ON (recommended): includes bone scale/stretch animation in "
-            "the file (the 'shapeStretch' channel -- e.g. an eyebrow "
-            "squashing/stretching). Turn OFF only if this rig never "
-            "animates stretch and you want to skip sampling it entirely"
-        ),
-        default=True,
-    )
-
-    scale_zero_epsilon: FloatProperty(
-        name="Stretch Noise Floor",
-        description="Same idea as Position Noise Floor, but for stretch: any scale closer to 1.0 (no stretch) than this on every axis gets snapped to exactly 1.0",
-        default=0.001,
-        min=0.0,
-    )
-
-    # v0.10.18 -- diferente de Blender (onde escalar um bone pai encolhe os
-    # filhos JUNTO na viewport por padrão -- "Inherit Scale"), o Hytale/
-    # Blockbench NÃO herda escala pela hierarquia: cada bone tem seu
-    # 'shapeStretch' totalmente independente (confirmado ao vivo pelo
-    # usuário -- escalar um bone pai dentro do próprio Blockbench não
-    # afeta os filhos). Sem esse toggle, uma animação que só escala o bone
-    # PAI no Blender (esperando que os filhos encolham visualmente junto,
-    # como aparece na viewport) exporta um shapeStretch que só existe no
-    # pai -- os filhos saem parados em 1.0, e no Blockbench/jogo eles NÃO
-    # encolhem (só o pai). Ligado, cada bone exportável recebe o produto
-    # do seu próprio scale local com o de TODOS os ancestrais exportáveis
-    # (mesmo espírito do "Inherit Scale: Full" do Blender) -- calculado só
-    # na hora de amostrar pro export (ver sample_action()), sem alterar
-    # nenhum keyframe de verdade na Action.
-    #
-    # v0.10.19 -- CORRIGIDO: só o tamanho (shapeStretch) não bastava --
-    # relatado ao vivo pelo usuário depois de testar a v0.10.18 (os filhos
-    # encolhiam, mas cada um em torno do PRÓPRIO pivot, em vez de se
-    # aproximar do pivot do pai, como a composição de matriz de verdade do
-    # Blender faz). Agora também corrige a POSIÇÃO de cada filho (ver
-    # rest_local_positions() + fórmula em sample_action()), puxando o
-    # pivot dele em direção ao pivot do pai proporcionalmente à escala em
-    # cascata -- reconstrói o efeito completo de "child_world = parent_
-    # world @ child_local" que o Hytale não faz sozinho.
-    bake_scale_hierarchy: BoolProperty(
-        name="Bake Parent Scale into Children",
-        description=(
-            "Hytale/Blockbench bones don't inherit scale from their parent the way Blender's viewport "
-            "does -- if you only keyframed scale on a parent bone (e.g. shrinking it to hide it, expecting "
-            "children inside it to shrink and move closer together), the children would export with no "
-            "scale/position change at all and stay full-size, spread out, in Blockbench/the game. Turn "
-            "this ON to bake the parent's scale into every child's exported 'shapeStretch' AND pull each "
-            "child's pivot toward the parent's, matching what you see in the Blender viewport. Only "
-            "affects the exported file -- doesn't touch your actual keyframes"
-        ),
-        default=False,
-    )
-
-    # v0.6.5 -- uv_offset_step_x/px_x/step_y/px_y MOVIDOS pra
-    # HYTALE_export_bone_settings (persistido na Armature) -- eram
-    # Property de Operator aqui, resetavam pro default toda vez que
-    # este diálogo abria (não persistiam com o arquivo), o que
-    # impedia o Rigger (Texture Picker) de pré-preencher isso de verdade.
-    # v0.12 -- moveram de novo, agora pra HYTALE_texture_picker_export_item
-    # (uma calibração por INSTÂNCIA, dentro de armature.hytale_texture_
-    # picker_exports). draw() abaixo mostra os 4 campos da entrada ATIVA
-    # da lista (hytale_texture_picker_exports_index); sample_action() já
-    # itera a lista inteira sozinho.
-
-    unit_scale: FloatProperty(
-        name="Blender Units per Game Unit",
-        description=(
-            "MUST match the exact value used when this character was "
-            "imported (Hytale Blockymodel Importer) -- if they don't "
-            "match, every position in the exported file will be wrong by "
-            "a consistent scale factor. When in doubt, leave this at the "
-            "default"
-        ),
-        default=UNIT_SCALE_DEFAULT,
-        min=0.0001,
-        max=10.0,
-    )
-
-    output_decimal_places: IntProperty(
-        name="Decimal Places",
-        description=(
-            "How many digits after the decimal point to keep for every "
-            "number in the file. Purely cosmetic and doesn't drop any "
-            "keyframes -- just keeps the file from being full of numbers "
-            "like 0.30000000000000004"
-        ),
-        default=6,
-        min=1,
-        max=12,
-    )
-
-    pretty_print_json: BoolProperty(
-        name="Readable JSON",
-        description=(
-            "OFF (default): writes the file as one compact line -- "
-            "smaller, and nothing normally needs to read it by hand. ON: "
-            "writes it nicely indented across many lines instead, purely "
-            "so a human can open and read/compare it (roughly doubles "
-            "file size; the game and Blockbench read either format "
-            "identically)"
-        ),
-        default=False,
-    )
-
-    use_source_metadata: BoolProperty(
-        name="Keep Imported Timing",
-        description=(
-            "Only matters for an Action that was imported by 'Import "
-            "Hytale Animation' and hasn't been edited since. ON: reuse "
-            "that file's exact original Duration/Loop values instead of "
-            "the 'Loop?' option above and the current timeline length -- "
-            "useful for a verification export, to check that reimporting "
-            "an unedited file gives back exactly the same file. OFF "
-            "(default, and what you want for normal editing work): always "
-            "compute Duration/Loop fresh from the current timeline and "
-            "the 'Loop?' option above. Leave this OFF whenever you've "
-            "actually changed the animation, or a stale imported Duration "
-            "shorter than your edit could silently cut off frames in the "
-            "exported file"
-        ),
-        default=False,
-    )
 
 
     @classmethod
@@ -1916,26 +1804,54 @@ classes = (
 )
 
 
-def register():
-    for cls in classes:
-        bpy.utils.register_class(cls)
+def _redo_armature_property_assignments():
+    """HYTALE_export_settings e HYTALE_texture_picker_export_item usam
+    @localized_props, mas também são o ALVO de um type= usado fora do
+    ciclo normal de register_class -- as duas linhas abaixo, que
+    atribuem PointerProperty/CollectionProperty direto em Armature.
+    Só re-registrar as PropertyGroups em si (feito por
+    refresh_localized_properties, via register_localized_class/
+    unregister_localized_class) pode não bastar pra essa atribuição
+    EXTERNA continuar apontando pro RNA struct certo depois de uma
+    troca de idioma -- por isso esta função é chamada tanto no
+    register() normal quanto de novo, via register_refresh_hook, no
+    fim de todo refresh_localized_properties() (ver translations/
+    __init__.py). Reatribuir aqui sem 'del' antes é seguro -- é como o
+    Blender espera que um addon atualize uma property dinâmica já
+    existente."""
     Armature.hytale_export_settings = PointerProperty(type=HYTALE_export_settings)
     # v0.12 -- CollectionProperty (uma entrada por instância de Texture
     # Picker) + índice do item ativo -- mesmo padrão de
     # Armature.hytale_ik_chains/_index em rigger/rig.py. Ver
     # HYTALE_texture_picker_export_item e get_texture_picker_exports.
     Armature.hytale_texture_picker_exports = CollectionProperty(type=HYTALE_texture_picker_export_item)
+
+
+def register():
+    # v0.14 -- register_localized_class() cuida das classes com
+    # @localized_props (HYTALE_export_settings, HYTALE_texture_picker_
+    # export_item, EXPORT_OT_hytale_blockyanim) e funciona igual a
+    # bpy.utils.register_class() pras outras -- ver translations/
+    # __init__.py, seção "Tooltip de campo".
+    for cls in classes:
+        register_localized_class(cls)
+    _redo_armature_property_assignments()
     Armature.hytale_texture_picker_exports_index = IntProperty(default=0)
+    # Ver docstring de _redo_armature_property_assignments -- garante
+    # que a atribuição em Armature seja refeita toda vez que o idioma
+    # do addon mudar, não só nesta chamada inicial.
+    register_refresh_hook(_redo_armature_property_assignments)
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
 
 
 def unregister():
+    unregister_refresh_hook(_redo_armature_property_assignments)
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
     del Armature.hytale_texture_picker_exports_index
     del Armature.hytale_texture_picker_exports
     del Armature.hytale_export_settings
     for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+        unregister_localized_class(cls)
 
 
 if __name__ == "__main__":

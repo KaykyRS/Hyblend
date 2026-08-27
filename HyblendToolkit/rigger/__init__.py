@@ -34,6 +34,14 @@ from ..templates import (
     rig_template_enum_items,
     shape_template_enum_items,
 )
+from ..translations import (
+    get_language,
+    register_localized_class,
+    register_refresh_hook,
+    tr,
+    unregister_localized_class,
+    unregister_refresh_hook,
+)
 
 # ---------------------------------------------------------------------------
 # Reexport -- tudo que interface.py e anim_importer.py importavam de
@@ -98,6 +106,7 @@ from .constants import (  # noqa: F401
 from .rig import (  # noqa: F401
     HytaleBoneCollectionItem,
     HytaleIKChainItem,
+    RIG_MT_hytale_clear_generated_menu,
     RIG_MT_hytale_ik_chain_add_menu,
     RIG_OT_hytale_bone_collection_add,
     RIG_OT_hytale_bone_collection_load_defaults,
@@ -112,6 +121,7 @@ from .rig import (  # noqa: F401
     RIG_OT_hytale_collection_template_save,
     RIG_OT_hytale_generate_rig,
     RIG_OT_hytale_ik_chain_add,
+    RIG_OT_hytale_ik_chain_auto_detect,
     RIG_OT_hytale_ik_chain_load_defaults,
     RIG_OT_hytale_ik_chain_move,
     RIG_OT_hytale_ik_chain_pick_bone,
@@ -129,16 +139,21 @@ from .rig import (  # noqa: F401
     RIG_OT_hytale_shape_template_save,
     RIG_OT_hytale_shape_vertex_edit_mode_enter,
     RIG_OT_hytale_shape_vertex_edit_mode_finish,
+    RIG_OT_hytale_use_selected_as_widget,
     RIG_OT_hytale_validate_rig,
     RIG_UL_hytale_bone_collections,
     RIG_UL_hytale_ik_chains,
-    PARENT_COLLECTION_ROOT,
+    SECTION_ROOT,
     _collection_sort_key,
+    _iter_sections_in_order,
     _resolve_collection_parent,
+    _resolve_collection_section_name,
+    _section_sort_key,
     ensure_default_bone_collections,
     find_org_path,
     register_bone_collection_defaults_handler,
     register_shape_edit_border,
+    resolve_collection_override_target,
     switch_property_name,
     unregister_bone_collection_defaults_handler,
     unregister_shape_edit_border,
@@ -162,6 +177,12 @@ _CLASSES = (
     RIG_OT_hytale_ik_chain_pick_bone,
     RIG_OT_hytale_ik_chain_load_defaults,
     RIG_OT_hytale_ik_chain_move,
+    # Auto-Detect Bones (novo) -- sem dependência de ordem conhecida com
+    # o resto da lista de cadeias (mesmo espírito de
+    # RIG_OT_hytale_validate_rig/RIG_OT_hytale_mirror_shape mais abaixo)
+    # -- só precisa vir depois de HytaleIKChainItem (já garantido, é o
+    # primeiro item de _CLASSES).
+    RIG_OT_hytale_ik_chain_auto_detect,
     # v0.9 -- Collection Settings (Etapa 1). HytaleBoneCollectionItem
     # precisa registrar ANTES de qualquer coisa que a referencie via
     # CollectionProperty(type=...) logo abaixo (mesmo motivo pelo qual
@@ -182,6 +203,7 @@ _CLASSES = (
     RIG_OT_hytale_collection_template_apply,
     RIG_OT_hytale_collection_template_delete,
     RIG_OT_hytale_clear_generated,
+    RIG_MT_hytale_clear_generated_menu,
     RIG_OT_hytale_shape_edit_mode_enter,
     RIG_OT_hytale_shape_edit_mode_finish,
     # v0.16 -- Vertex Edit Mode, sub-modo de Shape Edit Mode -- registrados
@@ -193,6 +215,11 @@ _CLASSES = (
     RIG_OT_hytale_generate_rig,
     RIG_OT_hytale_validate_rig,
     RIG_OT_hytale_mirror_shape,
+    # Embutir malha nos Shape Templates (caso 2, "widget totalmente
+    # próprio") -- mesma família de Mirror Shape/Vertex Edit Mode acima
+    # (só ativo durante Shape Edit Mode), sem dependência de ordem
+    # conhecida com o resto -- acrescentado logo depois delas.
+    RIG_OT_hytale_use_selected_as_widget,
     # v0.10 -- Texture Picker (era "Mouth Atlas", generalizado na v0.11 pra
     # qualquer picker de atlas de textura, não só boca). Sem dependência
     # de ordem conhecida com o
@@ -208,56 +235,64 @@ _CLASSES = (
 )
 
 
-def register():
-    for cls in _CLASSES:
-        bpy.utils.register_class(cls)
+def _assign_dynamic_properties(lang=None):
+    """Atribui (ou REATRIBUI, no refresh de idioma) todas as properties
+    dinâmicas deste pacote -- direto em Armature, fora do ciclo normal
+    de register_class. Chamada uma vez em register() (idioma atual) e
+    de novo, via register_refresh_hook, toda vez que o idioma do addon
+    mudar (ver translations/__init__.py) -- cobre dois casos que
+    exigem isso:
+
+    1. Armature.hytale_ik_chains/hytale_bone_collections -- CollectionProperty
+       cujo type= aponta pra HytaleIKChainItem/HytaleBoneCollectionItem
+       (rig.py), que também usam @localized_props -- precisa ser
+       refeita depois que elas forem re-registradas no idioma novo,
+       senão a atribuição EXTERNA pode ficar apontando pro RNA struct
+       antigo (mesmo motivo documentado em exporter.py,
+       _redo_armature_property_assignments -- mesmo padrão aqui).
+    2. As 6 properties "soltas" abaixo (Bool/StringProperty direto em
+       Armature, sem PropertyGroup nenhum por trás) que têm description=
+       própria -- essas não têm classe nenhuma pra decorar com
+       @localized_props (só existe pra PropertyGroup/Operator/
+       AddonPreferences), então a description= só pode ficar dinâmica
+       REATRIBUINDO a property inteira aqui, do mesmo jeito.
+
+    As 3 do WindowManager (seleção de template) ficam de fora de
+    propósito -- não têm description= própria pra traduzir, só
+    precisam existir uma vez (ver register()/unregister() abaixo)."""
+    if lang is None:
+        lang = get_language(bpy.context)
+
     Armature.hytale_ik_chains = CollectionProperty(type=HytaleIKChainItem)
     Armature.hytale_ik_chains_index = IntProperty(default=0)
     Armature.hytale_apply_ik_joint_fix = BoolProperty(
         name="Apply IK Joint Fix",
-        description=(
-            "Corrects the X position of specific IK chain joints, using the values defined by the active "
-            "rig template (see 'ik_joint_x_overrides' in templates/rig/*.json) -- leave off for a template "
-            "that hasn't defined/calibrated these values yet"
-        ),
+        description=tr("rigger.prop.armature_apply_ik_joint_fix", lang),
         default=False,
     )
     Armature.hytale_active_rig_template = StringProperty(
         name="Active Rig Template",
-        description="Name of the rig template (templates/rig/*.json) currently loaded on this armature -- "
-        "set automatically by 'Load Hytale IK Chain Preset', used to resolve pole_angle_presets/"
-        "ik_joint_x_overrides/widget_translation_x_overrides at generation time",
+        description=tr("rigger.prop.armature_active_rig_template", lang),
         default="",
     )
     Armature.hytale_active_shape_template = StringProperty(
         name="Active Shape Template",
-        description="Name of the shape template (templates/shapes/*.json) currently active for this "
-        "armature's custom shapes -- set automatically together with the rig template (or manually via "
-        "'Set Hytale Shape Template')",
+        description=tr("rigger.prop.armature_active_shape_template", lang),
         default="",
     )
     Armature.hytale_active_collection_template = StringProperty(
         name="Active Collection Template",
-        description="Name of the collection template (templates/collections/*.json) most recently saved to "
-        "or applied on this armature -- purely informational (unlike the rig/shape templates, this one is "
-        "never auto-applied by 'Create Rig')",
+        description=tr("rigger.prop.armature_active_collection_template", lang),
         default="",
     )
     Armature.hytale_shape_edit_mode = BoolProperty(
         name="Shape Edit Mode",
-        description="True while RIG_OT_hytale_shape_edit_mode_enter's mute is in effect on this armature's "
-        "FK/IK shape-scale drivers -- set/cleared automatically by 'Enter'/'Finish Shape Edit Mode', read by "
-        "interface.py to decide which of the two buttons to show and by 'Create Rig'/'Remove Generated Hytale "
-        "Rig Bones' to refuse running mid-edit",
+        description=tr("rigger.prop.armature_shape_edit_mode", lang),
         default=False,
     )
     Armature.hytale_shape_vertex_edit_mode = BoolProperty(
         name="Shape Vertex Edit Mode",
-        description="True while a custom shape's mesh (the widget used by the active pose bone) is open in "
-        "Edit Mode via 'Edit Shape Vertices' -- set/cleared automatically by that operator and 'Finish Vertex "
-        "Edit', read by interface.py to draw the right panel (active_object is the widget MESH in this state, "
-        "not the Armature) and by 'Create Rig'/'Remove Generated Hytale Rig Bones'/'Finish Shape Edit Mode' to "
-        "refuse running with a vertex edit session left dangling",
+        description=tr("rigger.prop.armature_shape_vertex_edit_mode", lang),
         default=False,
     )
 
@@ -272,9 +307,27 @@ def register():
     # RIG_OT_hytale_bone_collection_load_defaults) ou do handler automático
     # register_bone_collection_defaults_handler logo abaixo -- NUNCA de
     # dentro de draw() (ver docstring de ensure_default_bone_collections).
+    # v0.7.7 -- lista UNIFICADA (Collection + Section, ver
+    # HytaleBoneCollectionItem.entry_type em rig.py) -- ERA duas
+    # CollectionProperty separadas (hytale_bone_collections +
+    # hytale_bone_sections, v0.7.6), voltou a ser uma só.
     Armature.hytale_bone_collections = CollectionProperty(type=HytaleBoneCollectionItem)
     Armature.hytale_bone_collections_index = IntProperty(default=0)
     Armature.hytale_bone_collections_initialized = BoolProperty(default=False)
+
+
+def register():
+    # v0.14 -- register_localized_class() cuida das classes com
+    # @localized_props (ver topo de rig.py) e funciona igual a
+    # bpy.utils.register_class() pras outras -- ver translations/
+    # __init__.py, seção "Tooltip de campo".
+    for cls in _CLASSES:
+        register_localized_class(cls)
+
+    _assign_dynamic_properties()
+    # Refaz as atribuições acima toda vez que o idioma do addon mudar
+    # -- ver docstring de _assign_dynamic_properties.
+    register_refresh_hook(_assign_dynamic_properties)
 
     # Seleção de template (Rig/Shape/Collection) do dropdown compacto da
     # box "Character Templates" do interface.py. No WindowManager (não no
@@ -310,6 +363,8 @@ def unregister():
     del WindowManager.hytale_collection_template_selected
     del WindowManager.hytale_shape_template_selected
     del WindowManager.hytale_rig_template_selected
+
+    unregister_refresh_hook(_assign_dynamic_properties)
     del Armature.hytale_bone_collections_initialized
     del Armature.hytale_bone_collections_index
     del Armature.hytale_bone_collections
@@ -322,4 +377,4 @@ def unregister():
     del Armature.hytale_ik_chains_index
     del Armature.hytale_ik_chains
     for cls in reversed(_CLASSES):
-        bpy.utils.unregister_class(cls)
+        unregister_localized_class(cls)

@@ -68,6 +68,7 @@ from ..templates import (
     save_rig_template,
     save_shape_template,
 )
+from ..translations import get_language, localized_props, tooltip, tr
 # Constantes puras (rigger/constants.py) -- wildcard de propósito: este
 # arquivo usa a grande maioria delas (é o "coração do pipeline" que a
 # Tarefa A já previa), então uma lista explícita de import só cresceria
@@ -513,7 +514,7 @@ def switch_property_name(tip_org_name, side):
     return f"{prefix_word}_{PROP_FK_IK_SWITCH}_{suffix}"
 
 
-def ensure_switch_property(pose_bone, prop_name, description="0 = FK, 1 = IK", default_value=0):
+def ensure_switch_property(pose_bone, prop_name, description=None, default_value=0):
     """Cria (ou reaproveita) uma custom property inteira 0..1 em
     `pose_bone`, com UI configurada (min/max/default/description) --
     usado por QUALQUER switch de constraint por driver deste addon
@@ -530,7 +531,18 @@ def ensure_switch_property(pose_bone, prop_name, description="0 = FK, 1 = IK", d
     pose_bone.keys()`) -- não sobrescreve um valor que o usuário já
     tenha ajustado numa execução anterior, mesmo espírito de idempotência
     do resto do arquivo (ex.: create_bone_like nunca reseta um bone já
-    existente)."""
+    existente).
+
+    v0.14 -- `description=None` (era um texto fixo em Inglês, "0 = FK, 1
+    = IK") resolve pro idioma ATUAL via tr()/bpy.context -- diferente do
+    resto do sistema de tradução (tooltip()/@localized_props, que mexem
+    com registro de CLASSE), esta é uma custom property RUNTIME (criada
+    de novo toda vez que "Create Rig" roda, não fixada no registro de
+    addon nenhum) -- então nem precisa de re-registro pra mudar de
+    idioma, só de ler tr() na hora certa. Passe um texto explícito pra
+    sobrescrever esse default (ver call site em _build_head_follow)."""
+    if description is None:
+        description = tr("rigger.runtime.fk_ik_switch_description", get_language(bpy.context))
     if prop_name not in pose_bone.keys():
         pose_bone[prop_name] = default_value
     try:
@@ -1145,7 +1157,108 @@ def _bone_widget_name(armature_name, bone_name):
     return f"WGT - {armature_name} - {bone_name}"
 
 
-def _ensure_bone_widget_copy(base_name, armature_obj, bone_name, widgets_collection):
+def _mesh_dict_to_pydata(mesh_data):
+    """Converte o dict `{"vertices": [[x,y,z],...], "edges": [[i,j],...],
+    "faces": [[i,j,k,...],...]}` (schema da chave "mesh" em
+    shapes/<nome>.json -- ver embutir malha nos Shape Templates, docstring
+    de _widget_mesh_differs_from_template mais abaixo) pras três listas
+    cruas que `Mesh.from_pydata` espera: `(vertices, edges, faces)`, cada
+    item já convertido pra tupla (from_pydata aceita qualquer sequência,
+    mas tupla evita surpresa se o JSON vier com listas aninhadas
+    "erradas" de algum editor externo). `edges`/`faces` ausentes no dict
+    viram lista vazia -- from_pydata deriva edges das faces sozinho
+    quando `edges=[]`, mas um widget SÓ-wireframe (ex. WGT_POLE_LINE, sem
+    face nenhuma) precisa das edges GRAVADAS explicitamente no dict, não
+    dá pra reconstruir a partir de faces que não existem."""
+    vertices = [tuple(v) for v in mesh_data.get("vertices", [])]
+    edges = [tuple(e) for e in mesh_data.get("edges", [])]
+    faces = [tuple(f) for f in mesh_data.get("faces", [])]
+    return vertices, edges, faces
+
+
+def _mesh_object_to_dict(mesh, precision=6):
+    """Inverso de _mesh_dict_to_pydata -- serializa um bpy.types.Mesh de
+    verdade pro mesmo schema de dict (vertices/edges/faces, cada
+    coordenada arredondada em `precision` casas -- suficiente pra
+    geometria de um shape de controle, evita inchar o .json com ruído de
+    ponto flutuante tipo 0.0899999999999999). Usado só por
+    RIG_OT_hytale_shape_template_save na hora de embutir a malha de um
+    bone customizado no template (ver _widget_mesh_differs_from_template
+    pra quando isso deve acontecer). Não grava UV/material/normal --
+    widget nunca é renderizado, só serve de referência visual em Pose
+    Mode."""
+    return {
+        "vertices": [[round(c, precision) for c in v.co] for v in mesh.vertices],
+        "edges": [list(e.vertices) for e in mesh.edges],
+        "faces": [list(p.vertices) for p in mesh.polygons],
+    }
+
+
+def _build_widget_object_from_mesh_data(name, mesh_data):
+    """Reconstrói um Object+Mesh novo (ainda não linkado em collection
+    nenhuma -- o chamador linka) a partir da malha EMBUTIDA num Shape
+    Template (chave "mesh" de shapes/<nome>.json), via `Mesh.from_pydata`
+    -- usado por _ensure_bone_widget_copy quando o objeto por-bone não
+    existe mais LOCALMENTE (create do zero, ou depois de um "Delete
+    All") e o template da biblioteca (hytale_widgets.blend) também não
+    resolve esse candidato (o caso normal pra um override por-personagem
+    -- ver _widget_candidates_for_bone). Devolve None (nunca levanta
+    exceção -- mesmo espírito 100%-cosmético do resto deste sistema) se
+    `mesh_data` estiver vazio/corrompido, ou se from_pydata falhar por
+    qualquer motivo (índice de edge/face fora do range, por exemplo) --
+    o chamador (_ensure_bone_widget_copy) cai pro resto da cadeia de
+    candidatos (papel genérico -> cubo) como rede de segurança."""
+    try:
+        vertices, edges, faces = _mesh_dict_to_pydata(mesh_data)
+        if not vertices:
+            return None
+        mesh = bpy.data.meshes.new(name)
+        mesh.from_pydata(vertices, edges, faces)
+        mesh.update()
+        return bpy.data.objects.new(name, mesh)
+    except Exception:
+        return None
+
+
+def _widget_mesh_differs_from_template(shape_obj, base_name, armature_name, precision=6):
+    """True se a malha de `shape_obj` (a cópia por-bone) for
+    GEOMETRICAMENTE diferente do TEMPLATE do papel `base_name` (o mesmo
+    que _ensure_bone_widget_copy usou como fonte na hora de duplicar --
+    ver PROP_WIDGET_SOURCE_ROLE, gravado nesse momento) -- usado por
+    RIG_OT_hytale_shape_template_save pra decidir SE embute a malha no
+    .json (ver docstring da classe): se o bone nunca foi customizado
+    (continua idêntico ao template do papel), NÃO embute -- deixa só o
+    nome, pra continuar recebendo remodelagens futuras da biblioteca
+    automaticamente (comportamento documentado em
+    RIG_OT_hytale_clear_generated). Se divergir (Vertex Edit de
+    propósito, OU edição feita por fora do addon direto na malha,
+    diff pega os dois casos igual), embute.
+
+    Devolve True (trata como "customizado, embute por segurança") se o
+    template não existir mais pra comparar contra (biblioteca sem esse
+    papel, apendado nunca, ou removido) -- sem uma referência confiável,
+    a opção mais segura é preservar a edição em vez de arriscar perdê-la
+    silenciosamente."""
+    template = bpy.data.objects.get(_widget_instance_name(base_name, armature_name))
+    if template is None or template.type != "MESH":
+        return True
+
+    mesh_a, mesh_b = shape_obj.data, template.data
+    if (
+        len(mesh_a.vertices) != len(mesh_b.vertices)
+        or len(mesh_a.edges) != len(mesh_b.edges)
+        or len(mesh_a.polygons) != len(mesh_b.polygons)
+    ):
+        return True
+
+    for va, vb in zip(mesh_a.vertices, mesh_b.vertices):
+        for ca, cb in zip(va.co, vb.co):
+            if round(ca, precision) != round(cb, precision):
+                return True
+    return False
+
+
+def _ensure_bone_widget_copy(base_name, armature_obj, bone_name, widgets_collection, embedded_mesh=None):
     """Devolve a cópia ÚNICA (Object E Mesh independentes, nunca
     compartilhados com nenhum outro bone) do custom shape de
     `bone_name` -- duplicada, na primeira vez, do TEMPLATE do papel
@@ -1168,9 +1281,27 @@ def _ensure_bone_widget_copy(base_name, armature_obj, bone_name, widgets_collect
     matrix_world do objeto) -- só importa quando alguém entra em Edit
     Mode direto na malha.
 
+    `embedded_mesh` (feature de embutir malha nos Shape Templates): dict
+    no schema de _mesh_dict_to_pydata, vindo da chave "mesh" de
+    shape_overrides[bone_name] (ver shapes/<nome>.json) -- só é
+    considerado quando NEM a cópia local NEM o template de `base_name`
+    existem (ver _build_custom_shapes, que só passa isto pro candidato
+    de TIER 1 -- o nome por-personagem vindo do template ativo -- nunca
+    pro papel genérico/fallback, que sempre tem que vir da biblioteca
+    compartilhada de verdade). Reconstrói o Object+Mesh direto via
+    _build_widget_object_from_mesh_data em vez de tentar (e falhar) achar
+    um template na biblioteca -- cobre o cenário que motivou esta
+    feature: "Remove Generated Bones" > "Delete All" apagou a cópia
+    editada, mas a edição sobrevive porque foi embutida no .json na hora
+    do save. Objeto reconstruído assim NUNCA recebe PROP_WIDGET_SOURCE_ROLE
+    (não veio de nenhum template de papel -- ver _widget_mesh_differs_
+    from_template, que trata "sem proveniência" como "sempre customizado,
+    sempre embute de novo no próximo save").
+
     Devolve None se o template de `base_name` não existir (biblioteca
-    sem esse shape, ou ainda não apendado) -- chamador decide o
-    fallback, mesmo espírito 100%-cosmético do resto deste sistema."""
+    sem esse shape, ou ainda não apendado) E `embedded_mesh` também não
+    resolver -- chamador decide o fallback, mesmo espírito 100%-cosmético
+    do resto deste sistema."""
     target_name = _bone_widget_name(armature_obj.name, bone_name)
     obj = bpy.data.objects.get(target_name)
     if obj is not None:
@@ -1181,6 +1312,12 @@ def _ensure_bone_widget_copy(base_name, armature_obj, bone_name, widgets_collect
 
     template = bpy.data.objects.get(_widget_instance_name(base_name, armature_obj.name))
     if template is None:
+        if embedded_mesh:
+            obj = _build_widget_object_from_mesh_data(target_name, embedded_mesh)
+            if obj is not None:
+                obj.hide_render = True
+                widgets_collection.objects.link(obj)
+                return obj
         return None
 
     obj = template.copy()
@@ -1188,6 +1325,7 @@ def _ensure_bone_widget_copy(base_name, armature_obj, bone_name, widgets_collect
     obj.name = target_name
     obj.data.name = target_name
     obj.hide_render = True
+    obj[PROP_WIDGET_SOURCE_ROLE] = base_name
     widgets_collection.objects.link(obj)
     return obj
 
@@ -1221,51 +1359,83 @@ def _compute_bone_widget_world_matrix(armature_obj, pose_bone):
     return armature_obj.matrix_world @ pose_bone.matrix @ scale_matrix @ shape_transform
 
 
-def _widget_name_for_bone(bone_name, layer, ik_tip_names, shape_overrides=None):
-    """Decide qual widget (nome PREFERIDO na biblioteca) um bone deve
-    usar, ou None se esse bone não deve ganhar custom shape nenhum
-    (MCH/MCH-IK/ORG). TODOS os bones CTRL/CTRL-IK/ROOT-CTRL ganham shape
-    -- inclusive os segmentos do MEIO de uma cadeia IK (ex.: Arm_IK,
-    Forearm_IK), não só a ponta -- porque o driver de FK/IK
-    (_build_ik_fk_shape_visibility) já cobre a cadeia inteira, e esses
-    bones do meio também são visíveis/selecionáveis durante animação.
-    Attachments (nome contém ATTACHMENT_NAME_HINT) ganham um widget
-    próprio (WGT_ATTACHMENT), vencendo o genérico WGT_FK_RING -- mesmo
-    princípio de BONE_COLOR_ATTACHMENT/ATTACHMENT_SHAPE_SCALE.
+def _widget_candidates_for_bone(bone_name, layer, ik_tip_names, shape_overrides=None):
+    """Devolve uma lista ORDENADA de nomes de widget candidatos pra esse
+    bone (mais preferido primeiro) -- [] pra bone que não deve ganhar
+    custom shape nenhum (MCH/MCH-IK/ORG). TODOS os bones CTRL/CTRL-IK/
+    ROOT-CTRL ganham shape -- inclusive os segmentos do MEIO de uma
+    cadeia IK (ex.: Arm_IK, Forearm_IK), não só a ponta -- porque o
+    driver de FK/IK (_build_ik_fk_shape_visibility) já cobre a cadeia
+    inteira, e esses bones do meio também são visíveis/selecionáveis
+    durante animação. Attachments (nome contém ATTACHMENT_NAME_HINT)
+    ganham um widget próprio (WGT_ATTACHMENT), vencendo o genérico
+    WGT_FK_RING -- mesmo princípio de BONE_COLOR_ATTACHMENT/
+    ATTACHMENT_SHAPE_SCALE.
 
-    Ordem de prioridade: (1) campo "widget" do bone no TEMPLATE DE SHAPES
-    ativo (shape_overrides -- ver shape_template["bones"][bone_name] em
-    templates/shapes/*.json), pra qualquer personagem poder escolher um
-    shape diferente por bone sem tocar em código; (2) WIDGET_NAME_OVERRIDES
-    fixo (bones utilitários que existem em TODO personagem -- root
-    master/spine/pelvis, Head_CTRL, Origin_CTRL -- não são "calibração de
-    personagem", são convenção estrutural do próprio pipeline); (3) a
-    regra genérica por layer/papel, abaixo.
+    Ordem de prioridade (cada nível só é TENTADO se o nível anterior não
+    existir de verdade -- ver _build_custom_shapes): (1) campo "widget"
+    do bone no TEMPLATE DE SHAPES ativo (shape_overrides -- ver
+    shape_template["bones"][bone_name] em templates/shapes/*.json) --
+    quase sempre um nome JÁ por-personagem (RIG_OT_hytale_shape_template_
+    save grava pb.custom_shape.name literal, que já inclui o nome do
+    Armature -- ver _bone_widget_name); (2) WIDGET_NAME_OVERRIDES fixo
+    (bones utilitários que existem em TODO personagem -- root master/
+    spine/pelvis, Head_CTRL, Origin_CTRL); (3) a regra genérica por
+    layer/papel (WGT_FK_RING/WGT_IK_BOX/WGT_POLE/WGT_ATTACHMENT); (4)
+    WGT_DEFAULT_FALLBACK, sempre por último, como último recurso.
 
-    "Preferido" porque não garante que esse nome exista na biblioteca
-    ainda -- _build_custom_shapes cai pro WGT_DEFAULT_FALLBACK se não
-    existir (ver comentário perto de WGT_DEFAULT_FALLBACK, no topo do
-    arquivo)."""
+    v0.18 -- ANTES (_widget_name_for_bone) devolvia só o nível (1)/(2)/
+    (3) que batesse primeiro, sem next-best: se ESSE nome específico
+    não existisse de verdade (ex.: cópia por-bone/por-personagem salva
+    num shape_template, mas apagada por "Remove Generated Bones" >
+    "Delete All" -- ver RIG_OT_hytale_clear_generated), o bone caía
+    DIRETO pro cubo genérico (nível 4), mesmo que o shape GENÉRICO do
+    papel dele (nível 3) continuasse disponível na biblioteca sem
+    problema nenhum -- bug relatado pelo usuário. Devolver a cadeia
+    INTEIRA (em vez de só o primeiro nível que bate) permite que
+    _build_custom_shapes tente cada degrau em ordem, sem pular direto
+    pro cubo quando só o nível MAIS específico está ausente."""
+    candidates = []
+
     if shape_overrides:
         template_widget = shape_overrides.get(bone_name, {}).get("widget")
         if template_widget:
-            return template_widget
-    override = WIDGET_NAME_OVERRIDES.get(bone_name)
-    if override:
-        return override
-    if layer is None:
-        return None
-    if bone_name.endswith(SUFFIX_POLE_LINE):
-        return WGT_POLE_LINE
-    if bone_name.endswith(SUFFIX_POLE):
-        return WGT_POLE
-    if ATTACHMENT_NAME_HINT in bone_name.lower():
-        return WGT_ATTACHMENT
-    if layer == "CTRL-IK":
-        return WGT_IK_BOX
-    if layer in ("CTRL", "ROOT-CTRL"):
-        return WGT_FK_RING
-    return None
+            candidates.append(template_widget)
+
+    fixed_override = WIDGET_NAME_OVERRIDES.get(bone_name)
+    if fixed_override:
+        candidates.append(fixed_override)
+
+    if layer is not None:
+        if bone_name.endswith(SUFFIX_POLE_LINE):
+            candidates.append(WGT_POLE_LINE)
+        elif bone_name.endswith(SUFFIX_POLE):
+            candidates.append(WGT_POLE)
+        elif ATTACHMENT_NAME_HINT in bone_name.lower():
+            candidates.append(WGT_ATTACHMENT)
+        elif layer == "CTRL-IK":
+            candidates.append(WGT_IK_BOX)
+        elif layer in ("CTRL", "ROOT-CTRL"):
+            candidates.append(WGT_FK_RING)
+
+    if not candidates:
+        # Nenhum override e layer não elegível (MCH/MCH-IK/ORG/None) --
+        # mesmo "return None" de antes: este bone não deveria ganhar
+        # NENHUM widget, nem o cubo de fallback.
+        return []
+
+    candidates.append(WGT_DEFAULT_FALLBACK)
+
+    # Remove duplicatas preservando ordem -- caso de borda, mas possível
+    # (ex.: um override no shape_template apontando, por acaso, pro
+    # próprio nome do fallback genérico).
+    seen = set()
+    ordered = []
+    for name in candidates:
+        if name not in seen:
+            ordered.append(name)
+            seen.add(name)
+    return ordered
 
 
 def compute_widget_transform_correction(old_axes, old_length, new_axes, new_length, old_translation, old_rotation, old_scale):
@@ -1474,10 +1644,7 @@ class RIG_OT_hytale_shape_edit_mode_enter(Operator):
 
     bl_idname = "armature.hytale_shape_edit_mode_enter"
     bl_label = "Shape Edit Mode"
-    bl_description = (
-        "Mute the FK/IK shape-scale drivers so you can freely resize each control's custom shape -- use "
-        "'Finish Shape Edit Mode' afterwards to lock in the new size as the driver's new max value"
-    )
+    description = tooltip("rigger.tooltip.shape_edit_mode_enter")
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -1533,10 +1700,7 @@ class RIG_OT_hytale_shape_edit_mode_finish(Operator):
 
     bl_idname = "armature.hytale_shape_edit_mode_finish"
     bl_label = "Finish Shape Edit Mode"
-    bl_description = (
-        "Lock in the custom shape sizes set while in Shape Edit Mode as the new max size, and restore the "
-        "FK/IK shape-scale drivers"
-    )
+    description = tooltip("rigger.tooltip.shape_edit_mode_finish")
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -1643,10 +1807,7 @@ class RIG_OT_hytale_shape_vertex_edit_mode_enter(Operator):
 
     bl_idname = "armature.hytale_shape_vertex_edit_mode_enter"
     bl_label = "Edit Shape Vertices"
-    bl_description = (
-        "Enter Edit Mode directly on the active bone's custom shape mesh, hiding every other widget of this "
-        "character -- use 'Finish Vertex Edit' afterwards to return to Pose Mode"
-    )
+    description = tooltip("rigger.tooltip.shape_vertex_edit_mode_enter")
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -1756,7 +1917,7 @@ class RIG_OT_hytale_shape_vertex_edit_mode_finish(Operator):
 
     bl_idname = "armature.hytale_shape_vertex_edit_mode_finish"
     bl_label = "Finish Vertex Edit"
-    bl_description = "Leave the widget's Edit Mode, re-hide this character's widgets, and return to Pose Mode"
+    description = tooltip("rigger.tooltip.shape_vertex_edit_mode_finish")
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -1889,10 +2050,7 @@ class RIG_OT_hytale_mirror_shape(Operator):
 
     bl_idname = "armature.hytale_mirror_shape"
     bl_label = "Mirror Shape"
-    bl_description = (
-        "Delete the L-/R- opposite bone's own shape (if any) and replace it with a mirrored copy of this "
-        "bone's shape mesh, including its Location/Rotation/Scale"
-    )
+    description = tooltip("rigger.tooltip.mirror_shape")
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -2000,6 +2158,104 @@ class RIG_OT_hytale_mirror_shape(Operator):
         return {"FINISHED"}
 
 
+class RIG_OT_hytale_use_selected_as_widget(Operator):
+    """Embutir malha nos Shape Templates -- caso 2 ("widget totalmente
+    próprio"): copia a GEOMETRIA de um objeto de malha qualquer,
+    selecionado junto com o Armature (ele = seleção extra, Armature =
+    ativo), pra DENTRO da cópia por-bone já existente do bone pose ativo
+    (a mesma Mesh que _ensure_bone_widget_copy mantém, nome 'WGT -
+    <armature> - <bone>') -- não troca o Object atribuído como
+    custom_shape, só o CONTEÚDO da Mesh dele, de propósito: trocar o
+    Object deixaria o novo fora da collection 'WGT - <nome>' e fora do
+    nome canônico que o resto do sistema (Vertex Edit Mode, purge do
+    'Delete All', a chave "widget" salva no template) depende pra
+    reconhecer esse widget como "gerenciado" -- o próximo 'Create Rig'
+    (que roda _ensure_bone_widget_copy de novo, idempotente) provavelmente
+    sobrescreveria uma atribuição direta ao Object externo, achando que o
+    bone ainda não tinha shape.
+
+    Fluxo esperado: selecionar o objeto-fonte na viewport -> Shift+clique
+    no Armature (deixa ele ativo, com o bone certo ativo em Pose Mode) ->
+    clicar este botão, com Shape Edit Mode já ligado.
+
+    Remove PROP_WIDGET_SOURCE_ROLE do widget alvo, se tiver -- este
+    conteúdo não veio de nenhum template de papel da biblioteca, não tem
+    contra o que comparar depois (ver _widget_mesh_differs_from_
+    template), então o próximo 'Save Shape Template' sempre embute essa
+    geometria no .json (mesmo espírito de "sem proveniência = sempre
+    customizado" do resto da feature de embutir malha).
+
+    Não mexe no objeto-fonte selecionado (não apaga, não linka em
+    collection nenhuma) -- só lê a Mesh dele; o usuário decide se quer
+    apagá-lo depois. Copia só a GEOMETRIA (bmesh, espaço LOCAL do
+    objeto-fonte) -- nunca a matrix_world dele, senão a escala/rotação
+    do objeto na cena vazaria pro "shape space" do bone (relativo ao head
+    do bone, ver _compute_bone_widget_world_matrix) -- por isso avisa no
+    report() se o objeto-fonte tiver transform não aplicado, mas segue em
+    frente mesmo assim (100% cosmético, nunca trava)."""
+
+    bl_idname = "armature.hytale_use_selected_as_widget"
+    bl_label = "Use Selected Object as Widget"
+    description = tooltip("rigger.tooltip.use_selected_as_widget")
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        if obj is None or obj.type != "ARMATURE":
+            return False
+        if not getattr(obj.data, "hytale_shape_edit_mode", False):
+            cls.poll_message_set("Only available during Shape Edit Mode.")
+            return False
+        active_pb = context.active_pose_bone
+        if active_pb is None or active_pb.custom_shape is None:
+            cls.poll_message_set("Active bone must have a custom shape assigned.")
+            return False
+        source_candidates = [
+            o for o in context.selected_objects if o.type == "MESH" and o is not active_pb.custom_shape
+        ]
+        if len(source_candidates) != 1:
+            cls.poll_message_set(
+                "Select exactly one other mesh object (besides the armature) to use as the widget.",
+            )
+            return False
+        return True
+
+    def execute(self, context):
+        active_pb = context.active_pose_bone
+        target_obj = active_pb.custom_shape
+        source_obj = next(
+            o for o in context.selected_objects if o.type == "MESH" and o is not target_obj
+        )
+
+        bm = bmesh.new()
+        bm.from_mesh(source_obj.data)
+        bm.to_mesh(target_obj.data)
+        bm.free()
+        target_obj.data.update()
+
+        # Sem proveniência conhecida a partir de agora -- ver docstring
+        # da classe e _widget_mesh_differs_from_template.
+        if PROP_WIDGET_SOURCE_ROLE in target_obj:
+            del target_obj[PROP_WIDGET_SOURCE_ROLE]
+
+        has_transform = (
+            tuple(source_obj.scale) != (1.0, 1.0, 1.0)
+            or tuple(source_obj.rotation_euler) != (0.0, 0.0, 0.0)
+        )
+        message = (
+            f"Copied geometry from '{source_obj.name}' into the widget of bone '{active_pb.name}' "
+            f"('{target_obj.name}')."
+        )
+        if has_transform:
+            message += (
+                " Note: the source object had a non-applied scale/rotation -- only its raw local-space "
+                "geometry was copied (Object > Apply > All Transforms on the source first if the shape "
+                "looks off)."
+            )
+        self.report({"INFO"}, message)
+        return {"FINISHED"}
+
 
 # ---------------------------------------------------------------------------
 # PropertyGroup: uma entrada de "Collection Settings" (v0.9, Etapa 1) --
@@ -2014,6 +2270,70 @@ class RIG_OT_hytale_mirror_shape(Operator):
 # `collection_override` de cada item de hytale_ik_chains (ou nada, se o
 # usuário deixou "Auto").
 # ---------------------------------------------------------------------------
+def _on_collection_name_update(self, context):
+    """v0.13.5 -- FIX (bug relatado pelo usuário): renomear uma entrada
+    em "Collection Settings" (ex. "Head Left" -> "Head L") não
+    atualizava quem apontava pra ela via `collection_override` (ex. a
+    entrada "Head" de Bone Settings) -- essas referências guardam só o
+    NOME (ver `collection_override_name`/_collection_override_get/_set
+    acima), então um rename deixava tudo apontando pro nome ANTIGO, que
+    não existe mais -- _apply_bone_collection_overrides cai no fallback
+    de "Auto (default)" com aviso na próxima vez que "Create Rig" rodar
+    (mesmo comportamento de "collection apagada", só que sem o usuário
+    ter apagado nada de propósito).
+
+    `update=` de uma StringProperty só recebe o valor NOVO (`self.name`
+    já é o pós-edição) -- pra saber qual era o nome ANTIGO, precisa de
+    um campo-sombra próprio (`previous_name`, também em
+    _bone_collection_item_props) que este callback mantém sincronizado
+    com `name` a cada chamada. Primeira vez que uma entrada é criada
+    (`previous_name` ainda vazio) não conta como rename -- só grava o
+    nome inicial e sai, sem tentar recadastrar nada.
+
+    v0.13.6 -- FIX (bug relatado pelo usuário, mesma raiz): a bone
+    collection REAL do Blender (armature.collections, já materializada
+    por um "Create Rig" anterior) ficava ÓRFÃ num rename -- continuava
+    existindo com o NOME ANTIGO, com todos os bones que já estavam nela,
+    enquanto a próxima "Create Rig" (usando resolve_collection_override_
+    target, que busca/cria por nome) criava uma collection NOVA e VAZIA
+    com o nome atualizado -- os bones pareciam "sumir" da collection
+    certa (na real, tinham ficado numa collection duplicada e escondida,
+    já que o painel nativo mostra as duas com nomes parecidos). Este
+    callback agora renomeia a collection real JUNTO, na hora, se ela já
+    existir -- assim ela nunca duplica, e o nome real fica sempre igual
+    ao configurado. Se por acaso já existir OUTRA collection real com o
+    nome NOVO (colisão de verdade -- ex. usuário girando dois nomes
+    entre si), não força o rename (Blender resolveria sozinho com um
+    sufixo ".001", te deixando com o mesmo problema de novo, só que
+    disfarçado) -- só avisa no console e deixa como está; fundir/
+    renomear esse caso é decisão do usuário."""
+    old_name = self.get("previous_name", "")
+    new_name = self.name
+    if old_name and old_name != new_name and self.entry_type == "COLLECTION":
+        obj = context.active_object
+        armature = obj.data if obj is not None and obj.type == "ARMATURE" else None
+        if armature is not None:
+            renamed = 0
+            for chain_item in getattr(armature, "hytale_ik_chains", []):
+                if chain_item.get("collection_override_name", None) == old_name:
+                    chain_item["collection_override_name"] = new_name
+                    renamed += 1
+            real_coll = _find_bone_collection_anywhere(armature, old_name)
+            if real_coll is not None:
+                colliding = _find_bone_collection_anywhere(armature, new_name)
+                if colliding is not None and colliding.name != real_coll.name:
+                    print(
+                        f"[Hyblend] Collection Settings: renamed '{old_name}' to '{new_name}', but a real bone "
+                        f"collection named '{new_name}' already exists on '{armature.name}' -- couldn't rename "
+                        f"the real collection automatically (would collide). Merge or pick another name by hand."
+                    )
+                else:
+                    real_coll.name = new_name
+            if renamed or real_coll is not None:
+                _redraw_all_areas(context)
+    self["previous_name"] = new_name
+
+
 def _on_collection_grid_update(self, context):
     """update= de HytaleBoneCollectionItem.row/column -- roda toda vez
     que o usuário edita um desses dois campos direto na UI (o dropdown
@@ -2031,50 +2351,77 @@ def _on_collection_grid_update(self, context):
         _redraw_all_areas(context)
 
 
-# v0.9.6 -- identificador reservado pro item "Main (root)" do dropdown
-# de Parent (ver _parent_collection_enum_items/HytaleBoneCollectionItem.
-# parent abaixo) -- "não tem parent" = fica direto embaixo de Main, a
-# ÚNICA raiz fixa que sobrou (Face deixou de ser hardcoded -- pedido
-# explícito: "remover a collection Face", ver changelog). Feio de
-# propósito (duplo underscore) pra não colidir por acaso com um nome
-# de collection que o usuário digitar.
-PARENT_COLLECTION_ROOT = "__MAIN_ROOT__"
+# v0.7.7 -- "Section" virou um TIPO de entrada dentro da MESMA lista de
+# Collection Settings (armature.hytale_bone_collections), não uma lista
+# separada -- pedido explícito do usuário: "o Section ainda é relacionado
+# as collections", uma lista só, com um seletor Collection/Section por
+# entrada. ERA duas listas (hytale_bone_collections + hytale_bone_sections,
+# v0.7.6) -- unificado de volta numa só. `entry_type` decide o que a
+# entrada é; `parent` é o MESMO campo pras duas (pra uma Collection: em
+# qual Section o botão aparece na aba Animation; pra uma Section: dentro
+# de qual outra Section ela está aninhada) -- só a lista de opções do
+# dropdown muda (sempre só outras Sections + o sentinel SECTION_ROOT,
+# nunca outra Collection). SECTION_ROOT serve pras duas situações: pra
+# uma Section, "nível raiz"; pra uma Collection, "não escolhida
+# explicitamente" -- caem no MESMO fallback (_resolve_collection_section_name:
+# primeira Section por ordem), então um sentinel só já basta pros dois
+# casos (não precisa mais de SECTION_UNSET separado).
+SECTION_ROOT = "__SECTION_ROOT__"
 
-# Cache reaproveitado por _parent_collection_enum_items, mesmo motivo
-# de _bone_collection_enum_cache logo abaixo (bug conhecido do Blender
-# com EnumProperty(items=<função>) que devolve lista nova a cada
-# chamada).
-_parent_collection_enum_cache = []
+# v0.13.11 -- FIX (bug relatado pelo usuário: "passar o mouse muda a
+# Bone Collection sozinho"): ERA uma lista ÚNICA a nível de módulo,
+# limpa e recheada NO LUGAR (list.clear() + list.append()) a cada
+# chamada -- comentário antigo dizia que isso era necessário porque
+# devolver uma lista NOVA a cada chamada crasha o Blender (bug
+# documentado: o Blender guarda só um ponteiro cru pras strings do
+# último `items` computado, e se o objeto Python for coletado pelo
+# GC antes do Blender terminar de usar, é use-after-free). Isso é
+# verdade, mas resolver mutando a MESMA lista compartilhada por TODAS
+# as entradas de Bone Settings/Collection Settings ao mesmo tempo criou
+# um problema DIFERENTE: várias dessas dropdowns (Head, Spine, Texture
+# Picker, etc.) ficam desenhadas na tela SIMULTANEAMENTE, e QUALQUER
+# redraw -- inclusive os disparados só por passar o mouse em cima de
+# QUALQUER campo da UI, pra tooltip -- reavalia essa função de novo.
+# Se a reavaliação de UM item acontece ANTES do Blender terminar de
+# usar a lista que tinha acabado de pegar pra desenhar OUTRO item
+# (mesmo objeto de lista, conteúdo agora diferente por baixo), o
+# widget errado lê o índice contra o conteúdo NOVO -- e mostra (ou
+# pior, GRAVA, já que o campo é settable) a Collection de OUTRO item.
+# Exatamente o sintoma relatado.
+#
+# Fix: mantém MUITAS listas vivas ao mesmo tempo (um "pool" com janela
+# deslizante, via deque(maxlen=...)) em vez de UMA SÓ sendo mutada --
+# cada chamada monta e devolve uma lista TOTALMENTE NOVA (nunca mutada
+# depois de criada, então nenhum widget que já pegou uma referência
+# antiga corre risco de vê-la mudar debaixo dele), e o pool só existe
+# pra manter essas listas vivas por tempo suficiente (até saírem da
+# janela) -- resolve o crash-por-GC original SEM reintroduzir o
+# cross-contamination entre widgets. maxlen generoso (bem mais que o
+# número de dropdowns visíveis de uma vez, mesmo em personagens
+# grandes) -- custo desprezível (listas pequenas, poucas dezenas de
+# tuplas cada).
+_collection_parent_enum_cache_pool = deque(maxlen=128)
 
 
-def _parent_collection_enum_items(self, context):
-    """items= de HytaleBoneCollectionItem.parent E do `parent` do
-    operador RIG_OT_hytale_bone_collection_add (mesma função pros dois
-    -- ver lá) -- lista TODAS as outras entradas de armature.hytale_
-    bone_collections como opção de parent (permite aninhar QUALQUER
-    collection dentro de qualquer outra, pedido explícito: "usar o Head
-    como parent" de uma nova collection), mais o sentinel
-    PARENT_COLLECTION_ROOT ("Main (root)") pra quem não quer aninhar em
-    nada -- vai direto embaixo de Main.
-
-    `getattr(self, "name", None)` exclui o PRÓPRIO item da lista (uma
-    collection não pode ser parent de si mesma) quando `self` é um
-    HytaleBoneCollectionItem de verdade sendo editado; quando `self` é
-    o operador Add (criando uma entrada NOVA, que ainda nem tem nome
-    na lista), isso simplesmente não exclui nada -- sem erro, mesmo
-    código pros dois casos.
-
-    NÃO detecta ciclos mais profundos (A -> B -> A) aqui -- isso é
-    responsabilidade de _resolve_collection_parent (que tem uma guarda
-    de `visited` e cai pra Main como fallback seguro se topar com um
-    ciclo em tempo de "Create Rig"); police isso na hora de MONTAR a
-    lista seria caro (teria que andar a árvore inteira a cada redraw) e
-    a guarda de resolução já cobre o caso de quebrar, então não trava o
-    Blender de jeito nenhum, só cai pro fallback.
+def _collection_parent_enum_items(self, context):
+    """items= de HytaleBoneCollectionItem.parent -- lista só as OUTRAS
+    entradas do tipo Section (entry_type == "SECTION") como opção, mais
+    o sentinel SECTION_ROOT ("Root / None"). Nunca lista uma Collection
+    como opção -- só Sections podem ser "parent" de outra entrada,
+    Collection não aninha mais em Collection nenhuma (ver
+    _resolve_collection_parent). `getattr(self, "name", None)` exclui a
+    PRÓPRIA entrada da lista (uma Section não pode ser parent de si
+    mesma); ciclos mais profundos são resolvidos por
+    _iter_sections_in_order, não aqui.
 
     Mesma proteção de contexto=None que _bone_collection_enum_items já
-    tem (ver comentário lá) -- Blender chama isto com self=None,
-    context=None em tempo de registro pra validar o `default=0`."""
+    tem -- Blender chama isto com self=None, context=None em tempo de
+    registro pra validar o `default=0`.
+
+    v0.13.11 -- ver comentário grande em cima de
+    _collection_parent_enum_cache_pool: devolve uma lista NOVA a cada
+    chamada (nunca mutada depois), só mantida viva pelo pool -- não
+    mais uma única lista compartilhada mutada no lugar."""
     armature = None
     edit_obj = getattr(context, "edit_object", None)
     if edit_obj is not None and edit_obj.type == "ARMATURE":
@@ -2086,94 +2433,221 @@ def _parent_collection_enum_items(self, context):
 
     exclude_name = getattr(self, "name", None)
 
-    _parent_collection_enum_cache.clear()
-    _parent_collection_enum_cache.append(
-        (PARENT_COLLECTION_ROOT, "Main (root)", "No parent -- goes directly under 'Main'")
-    )
+    items = [
+        (SECTION_ROOT, "Root / None", "Top level (for a Section) or falls back to 'Main' (for a Collection)")
+    ]
     if armature is not None:
-        for item in armature.hytale_bone_collections:
-            if not item.name or item.name == exclude_name:
+        for entry in armature.hytale_bone_collections:
+            if not entry.name or entry.name == exclude_name or entry.entry_type != "SECTION":
                 continue
-            _parent_collection_enum_cache.append(
-                (item.name, item.name, f"Nest under '{item.name}'")
-            )
-    return _parent_collection_enum_cache
+            items.append((entry.name, entry.name, f"Show under '{entry.name}'"))
+    _collection_parent_enum_cache_pool.append(items)
+    return items
 
 
+def _section_sort_key(entry):
+    """Ordem entre Sections IRMÃS (mesmo parent) -- mesmo espírito de
+    _collection_sort_key, só sem `column` (Sections só empilham
+    verticalmente, nunca lado a lado -- ver mockup do usuário)."""
+    return (entry.row, entry.name)
+
+
+def _iter_sections_in_order(armature):
+    """Percorre as entradas do tipo Section (entry_type == "SECTION") de
+    armature.hytale_bone_collections em ordem de árvore (depth-first):
+    Sections de nível raiz primeiro (por _section_sort_key), cada uma
+    seguida imediatamente de suas próprias filhas, recursivamente.
+    Guarda contra ciclo (A dentro de B dentro de A) -- se uma Section já
+    visitada aparecer de novo no caminho, ela é pulada em vez de
+    recursar pra sempre.
+
+    Cada item devolvido é (section, depth) -- depth = 0 pras Sections de
+    nível raiz, +1 a cada nível de aninhamento. interface.py usa depth
+    pra indentar visualmente uma Section aninhada dentro de outra na aba
+    Animation; sync_bone_collection_order (abaixo) ignora, só precisa da
+    ordem."""
+    by_parent = {}
+    for entry in armature.hytale_bone_collections:
+        if entry.entry_type != "SECTION" or not entry.name:
+            continue
+        parent_name = (entry.parent or "").strip()
+        if not parent_name or parent_name == SECTION_ROOT:
+            parent_name = SECTION_ROOT
+        by_parent.setdefault(parent_name, []).append(entry)
+
+    def walk(parent_name, visited, depth):
+        for sec in sorted(by_parent.get(parent_name, []), key=_section_sort_key):
+            if sec.name in visited:
+                continue  # ciclo detectado -- não recursa de novo nesse ramo
+            yield (sec, depth)
+            yield from walk(sec.name, visited | {sec.name}, depth + 1)
+
+    yield from walk(SECTION_ROOT, frozenset(), 0)
+
+
+def _resolve_collection_section_name(armature, item):
+    """Devolve o NOME da Section onde `item` (uma entrada entry_type ==
+    "COLLECTION") deve aparecer na aba Animation -- item.parent (se
+    apontar pra uma Section que ainda existe), ou a Section "Main" como
+    fallback (mesmo nome da bone collection real, ver COLL_MAIN em
+    constants.py) -- cobre tanto SECTION_ROOT (nunca escolhida) quanto
+    um nome órfão (Section renomeada/apagada depois, ou que virou uma
+    Collection).
+
+    v0.7.8 -- FIX (bug relatado pelo usuário): o fallback ERA "a
+    primeira Section por ORDEM (row, name)" -- isso fazia QUALQUER
+    Section nova, ou até só REORDENAR (mudar o campo Order de alguém pra
+    um valor menor que o de Main), "roubar" de repente todas as
+    collections não-atribuídas explicitamente, só por ter ficado em
+    primeiro na ordenação. Order deveria controlar SÓ a posição visual
+    das Sections na aba Animation -- nunca pra quem uma collection
+    "pertence". Agora o fallback é por NOME: sempre a Section chamada
+    "Main" (se existir) -- criar uma Section nova ou reordenar nunca
+    mais move nenhuma collection de lugar. Main só deixa de ser o
+    fallback se o usuário mesmo renomeá-la ou apagá-la -- nesse caso
+    extremo (não deveria acontecer no fluxo normal: Remove já bloqueia
+    apagar a ÚLTIMA Section, mas não protege o NOME "Main" especificamente
+    se sobrar outra), cai pra primeira Section por ordem como último
+    recurso -- rede de segurança, nunca retorna algo que não existe."""
+    name = (item.parent or "").strip()
+    if name and name != SECTION_ROOT and any(
+        e.name == name and e.entry_type == "SECTION" for e in armature.hytale_bone_collections
+    ):
+        return name
+    default_section = next(
+        (e for e in armature.hytale_bone_collections if e.entry_type == "SECTION" and e.name == COLL_MAIN), None
+    )
+    if default_section is not None:
+        return default_section.name
+    sections = sorted(
+        (e for e in armature.hytale_bone_collections if e.entry_type == "SECTION"), key=_section_sort_key
+    )
+    return sections[0].name if sections else COLL_MAIN
+
+
+# v0.14 -- todas as properties de HytaleBoneCollectionItem vêm desta
+# função -- @localized_props precisa do dict COMPLETO pra reconstruir a
+# classe quando o idioma muda (ver translations/__init__.py, seção
+# "Tooltip de campo"). CUIDADO ESPECIAL -- esta classe é o ALVO de
+# `Armature.hytale_bone_collections = CollectionProperty(type=...)`
+# em rigger/__init__.py, fora do ciclo normal de register_class -- ver
+# comentário lá (_redo_armature_property_assignments), registrado como
+# refresh hook por causa disso.
+def _bone_collection_item_props(lang):
+    return {
+        "name": StringProperty(
+            name="Name",
+            description=tr("rigger.prop.bone_collection_item_name", lang),
+            default="Collection",
+            update=_on_collection_name_update,
+        ),
+        # v0.13.5 -- campo-sombra escondido, só pra _on_collection_name_update
+        # saber qual era o nome ANTES do rename (update= de uma
+        # StringProperty só recebe o valor DEPOIS de já ter mudado) --
+        # nunca desenhado na UI, nunca lido em nenhum outro lugar.
+        "previous_name": StringProperty(
+            name="Name (previous, internal)",
+            description="Internal -- tracks the name before a rename, so cross-references can follow along. Not shown in the UI.",
+            default="",
+            options={"HIDDEN"},
+        ),
+        # v0.7.7 -- entrada única, dois tipos possíveis (pedido explícito do
+        # usuário: uma lista só, com um seletor Collection/Section). Uma
+        # Collection vira uma bone collection REAL do Blender (ver
+        # _apply_bone_collection_overrides); uma Section é puramente um
+        # cabeçalho visual na aba Animation, nunca cria nada no Blender.
+        "entry_type": EnumProperty(
+            name="Type",
+            items=[
+                (
+                    "COLLECTION",
+                    "Collection",
+                    tr("rigger.prop.bone_collection_item_entry_type_item_collection", lang),
+                ),
+                (
+                    "SECTION",
+                    "Section",
+                    tr("rigger.prop.bone_collection_item_entry_type_item_section", lang),
+                ),
+            ],
+            default="COLLECTION",
+        ),
+        # v0.7.7 -- campo ÚNICO reaproveitado pelos dois tipos (ver
+        # _collection_parent_enum_items acima) -- pra uma Collection, em
+        # qual Section o botão aparece na aba Animation; pra uma Section,
+        # dentro de qual outra Section ela está aninhada. Nunca afeta a
+        # hierarquia REAL de bone collection do Blender (que fica sempre
+        # plana, direto embaixo de Main -- ver _resolve_collection_parent) --
+        # puramente visual.
+        "parent": EnumProperty(
+            name="Parent",
+            description=tr("rigger.prop.bone_collection_item_parent", lang),
+            items=_collection_parent_enum_items,
+            default=0,
+        ),
+        # v0.9.6 -- controla só se aparece um botão de mostrar/esconder pra
+        # esta collection na box "Bone Collections" da aba Animation (pedido
+        # explícito: "às vezes queremos criar uma collection, mas ela não
+        # apareça na UI"). Só faz sentido pra entry_type == "COLLECTION" --
+        # interface.py esconde este campo quando a entrada é uma Section.
+        # NÃO afeta nada mais -- a collection continua sendo criada
+        # normalmente em "Create Rig", continua disponível no dropdown
+        # "Collection" de Bone Settings, continua aparecendo no painel
+        # nativo "Bone Collections" do Blender (isso é controlado pelo
+        # próprio Blender, fora do nosso alcance) -- só o BOTÃO nesta box
+        # nossa que some.
+        "show_in_animation_tab": BoolProperty(
+            name="Show in Animation Tab",
+            description=tr("rigger.prop.bone_collection_item_show_in_animation_tab", lang),
+            default=True,
+        ),
+        # v0.9.5 -- layout em grade (pedido explícito, pra poder pôr duas
+        # collections lado a lado -- ex. "Arm R"/"Arm L" na mesma linha --
+        # em vez de uma embaixo da outra). row = linha (0 = topo, quanto
+        # maior, mais pra baixo); column = coluna (0 = mais à esquerda,
+        # quanto maior, mais à direita). Duas entradas com o MESMO row
+        # aparecem lado a lado, ordenadas por column; column empatada
+        # desempata por ordem alfabética do nome (`name`) -- ver
+        # _collection_sort_key. v0.7.7 -- pra uma entrada entry_type ==
+        # "SECTION", só `row` importa (ordem entre Sections irmãs -- ver
+        # _section_sort_key); `column` fica sem efeito nenhum (Sections só
+        # empilham verticalmente, nunca lado a lado -- interface.py esconde
+        # o campo Column quando a entrada é uma Section). row/column são
+        # relativos aos IRMÃOS (mesma Section pai), não à lista inteira --
+        # dois itens em Sections diferentes podem ter o mesmo (row, column)
+        # sem conflito nenhum.
+        "row": IntProperty(
+            name="Row",
+            description=tr("rigger.prop.bone_collection_item_row", lang),
+            default=0, min=0,
+            update=_on_collection_grid_update,
+        ),
+        "column": IntProperty(
+            name="Column",
+            description=tr("rigger.prop.bone_collection_item_column", lang),
+            default=0, min=0,
+            update=_on_collection_grid_update,
+        ),
+    }
+
+
+@localized_props(_bone_collection_item_props)
 class HytaleBoneCollectionItem(PropertyGroup):
-    name: StringProperty(
-        name="Name",
-        description="Bone collection name, as it will appear both here and in the real Blender bone "
-        "collections list after 'Create Rig'",
-        default="Collection",
-    )
-    # v0.9.6 -- ERA um EnumProperty fixo (Main/Face) -- agora qualquer
-    # collection criada aqui pode ser o parent de qualquer outra
-    # (aninhamento livre, pedido explícito), com "Main" como a única
-    # raiz que sempre existe. Ver _resolve_collection_parent pra como
-    # isso vira uma bone collection REAL (com toda a cadeia de
-    # ancestrais) em "Create Rig".
-    parent: EnumProperty(
-        name="Parent",
-        description="Which other collection (created here) this one is nested under -- 'Main (root)' "
-        "means no parent, straight under 'Main'",
-        items=_parent_collection_enum_items,
-        default=0,
-    )
-    # v0.9.6 -- controla só se aparece um botão de mostrar/esconder pra
-    # esta collection na box "Bone Collections" da aba Animation (pedido
-    # explícito: "às vezes queremos criar uma collection, mas ela não
-    # apareça na UI"). NÃO afeta nada mais -- a collection continua
-    # sendo criada normalmente em "Create Rig", continua disponível no
-    # dropdown "Collection" de Bone Settings, continua aparecendo no
-    # painel nativo "Bone Collections" do Blender (isso é controlado
-    # pelo próprio Blender, fora do nosso alcance) -- só o BOTÃO nesta
-    # box nossa que some.
-    show_in_animation_tab: BoolProperty(
-        name="Show in Animation Tab",
-        description="Whether a visibility toggle button for this collection appears in the Animation "
-        "tab's 'Bone Collections' box. Off just hides the button here -- the collection itself is "
-        "unaffected everywhere else",
-        default=True,
-    )
-    # v0.9.5 -- layout em grade (pedido explícito, pra poder pôr duas
-    # collections lado a lado -- ex. "Arm R"/"Arm L" na mesma linha --
-    # em vez de uma embaixo da outra). row = linha (0 = topo, quanto
-    # maior, mais pra baixo); column = coluna (0 = mais à esquerda,
-    # quanto maior, mais à direita). Duas entradas com o MESMO row
-    # aparecem lado a lado, ordenadas por column; column empatada
-    # desempata por ordem alfabética do nome (`name`) -- ver
-    # _collection_sort_key. Essa ordenação (row, column, name) SUBSTITUI
-    # a ordem "crua" da lista (a que os botões ▲▼ do Collection Settings
-    # movem) como fonte de verdade pra tudo que É desenhado a partir daqui
-    # (painel nativo "Bone Collections", as duas boxes da aba Animation)
-    # -- ▲▼ continuam existindo só pra reorganizar a lista em si (edição
-    # mais fácil), não têm mais efeito sobre o layout final. v0.9.6: row/
-    # column são relativos aos IRMÃOS (mesmo parent), não à lista
-    # inteira -- dois itens com parents diferentes podem ter o mesmo
-    # (row, column) sem conflito nenhum (cada nível da árvore tem sua
-    # própria grade).
-    row: IntProperty(
-        name="Row",
-        description="Vertical position among siblings (0 = top, higher = further down). Siblings sharing "
-        "the same Row are placed side by side on the same line, ordered by Column",
-        default=0, min=0,
-        update=_on_collection_grid_update,
-    )
-    column: IntProperty(
-        name="Column",
-        description="Horizontal position within the Row (0 = leftmost, higher = further right). Entries "
-        "with the same Row AND Column are ordered alphabetically",
-        default=0, min=0,
-        update=_on_collection_grid_update,
-    )
+    pass
 
 
-# Cache reaproveitado por _bone_collection_enum_items -- ver comentário
-# em HytaleIKChainItem.collection_override sobre por que isso não pode
-# virar uma lista nova a cada chamada (bug conhecido do Blender com
-# EnumProperty(items=<função>)).
-_bone_collection_enum_cache = []
+# v0.13.11 -- FIX (bug relatado pelo usuário: "passar o mouse muda a
+# Bone Collection sozinho") -- ver comentário grande em cima de
+# _collection_parent_enum_cache_pool (mesma causa raiz, mesmo fix):
+# pool com janela deslizante em vez de UMA lista compartilhada mutada
+# no lugar entre chamadas -- cada chamada devolve uma lista NOVA, nunca
+# mutada depois de criada, então nenhuma dropdown de Bone Settings
+# (Head/Spine/Texture Picker/etc., todas desenhadas ao mesmo tempo,
+# todas usando esta MESMA função) corre risco de ler o índice contra um
+# conteúdo que mudou debaixo dela só porque outra dropdown irmã foi
+# redesenhada no meio (inclusive por um redraw disparado só de passar o
+# mouse em cima de QUALQUER campo, pra tooltip).
+_bone_collection_enum_cache_pool = deque(maxlen=128)
 
 # v0.9.3 -- identificador do item "Auto" do dropdown de Collection.
 # ERA "" (string vazia) -- Blender tem um bug/quirk conhecido em
@@ -2209,20 +2683,79 @@ def _bone_collection_enum_items(self, context):
         if obj is not None and obj.type == "ARMATURE":
             armature = obj.data
 
-    _bone_collection_enum_cache.clear()
-    _bone_collection_enum_cache.append(
+    # v0.13.11 -- lista NOVA a cada chamada (ver
+    # _bone_collection_enum_cache_pool acima) -- nunca mais
+    # list.clear()+list.append() numa lista compartilhada.
+    items = [
         (COLLECTION_OVERRIDE_AUTO, "Auto (default)",
          "Use the built-in collection for this chain type (Arm L/Arm R/Leg L/Leg R/Head/Spine/Main-Tail)")
-    )
+    ]
     if armature is not None:
         for item in armature.hytale_bone_collections:
-            if not item.name:
+            # v0.7.7 -- filtra por entry_type == "COLLECTION": lista
+            # unificada agora (Collection Settings tem os dois tipos, ver
+            # changelog) -- uma Section não é uma bone collection de
+            # verdade, não pode receber bones, então nunca aparece aqui.
+            if not item.name or item.entry_type != "COLLECTION":
                 continue
-            parent_label = "Main" if item.parent in ("", PARENT_COLLECTION_ROOT) else item.parent
-            _bone_collection_enum_cache.append(
-                (item.name, item.name, f"Assign to '{item.name}' (under {parent_label})")
+            section_label = _resolve_collection_section_name(armature, item)
+            items.append(
+                (item.name, item.name, f"Assign to '{item.name}' (in Section '{section_label}')")
             )
-    return _bone_collection_enum_cache
+    _bone_collection_enum_cache_pool.append(items)
+    return items
+
+
+# v0.13.5 -- FIX (bug relatado pelo usuário): "Head" com Collection
+# apontando pra uma collection custom (ex. "Head Left") 'desconfigurava'
+# sozinho ao criar uma NOVA bone collection que ficasse ACIMA dela na
+# lista. Causa raiz: bug/limitação conhecida do Blender com
+# EnumProperty(items=<função>) -- o valor guardado de verdade no .blend
+# NÃO é o identificador ("Head Left"), é a POSIÇÃO NUMÉRICA dentro da
+# lista devolvida por `items` no momento em que o usuário escolheu.
+# `_bone_collection_enum_items` sempre devolve "Auto (default)" primeiro
+# e depois as collections NA ORDEM de armature.hytale_bone_collections
+# -- então inserir uma collection nova ANTES de "Head Left" nessa lista
+# (ex. Add com row/column empatados em 0/0, que cai antes por ordem
+# alfabética -- ver _collection_sort_key) empurra "Head Left" pra uma
+# posição diferente. Na próxima vez que o Blender ler o valor guardado
+# (a posição antiga), o índice agora aponta pra outra collection
+# (ou pra "Auto" mesmo, se a lista encolheu) -- SEM nenhum aviso, sem
+# nenhum código deste addon ter tocado no campo. Puramente um efeito
+# colateral de reordenar a lista.
+#
+# Fix: `collection_override` (abaixo) ganha get()/set() próprios,
+# guardando o valor de VERDADE numa StringProperty escondida
+# (collection_override_name) -- o NOME, que não muda de posição nunca.
+# O índice numérico que o Blender exige pro Enum é recalculado NA HORA,
+# a partir desse nome, contra a lista atual -- então reordenar
+# Collection Settings não pode mais bagunçar um override já escolhido.
+# Downstream (_apply_bone_collection_overrides etc.) não muda nada: ler
+# `item.collection_override` continua devolvendo a STRING normal (ex.
+# "Head Left" ou "AUTO"), só a forma de guardar por baixo mudou.
+def _collection_override_get(self):
+    items = _bone_collection_enum_items(self, bpy.context)
+    stored = self.get("collection_override_name", None)
+    if stored is None:
+        # Migração best-effort pra entradas salvas ANTES desta correção
+        # -- só existe o índice cru antigo (sujeito ao mesmo bug),
+        # guardado pelo Blender sob a MESMA chave "collection_override"
+        # (ID property crua, não passa pelo get() novo). Não dá pra
+        # recuperar com 100% de certeza qual era a collection original,
+        # mas ler esse índice contra a lista de HOJE reproduz exatamente
+        # o que já aparecia pra esse personagem antes de instalar esta
+        # versão -- não piora nada, só deixa de proteger daqui pra trás.
+        legacy_index = self.get("collection_override", 0)
+        stored = items[legacy_index][0] if 0 <= legacy_index < len(items) else COLLECTION_OVERRIDE_AUTO
+    for index, entry in enumerate(items):
+        if entry[0] == stored:
+            return index
+    return 0  # nome guardado não existe mais (apagado/renomeado) -- cai em "Auto (default)"
+
+
+def _collection_override_set(self, value):
+    items = _bone_collection_enum_items(self, bpy.context)
+    self["collection_override_name"] = items[value][0] if 0 <= value < len(items) else COLLECTION_OVERRIDE_AUTO
 
 
 # v0.9.9 -- extraído de dentro de ensure_default_bone_collections pra
@@ -2243,14 +2776,38 @@ _DEFAULT_BONE_COLLECTION_GRID = (
     (COLL_MAIN_LEG_R, 4, 0),
     (COLL_MAIN_LEG_L, 4, 1),
     (COLL_MAIN_ROOT, 5, 0),
-    (COLL_MAIN_TAIL, 6, 0),
+    (COLL_MAIN_CHAIN, 6, 0),
     (COLL_ATTACHMENTS, 7, 0),
-    (COLL_MAIN_TEXTURE_PICKER, 8, 0),  # v0.10.5 -- faltava aqui (Texture Picker é v0.10, esta grade só tinha
-    # sido atualizada até Attachments em v0.9.7); sem isso, armatures NOVOS não ganhavam a entrada
-    # "Texture Picker" em "Collection Settings"/aba Animation mesmo com a bone collection real sendo criada
-    # normalmente por _build_texture_picker -- ver também ensure_texture_picker_collection_entry logo abaixo,
-    # que cobre o mesmo problema pra armatures que já existiam ANTES deste fix (onde este seed
-    # abaixo não roda de novo, ver hytale_bone_collections_initialized).
+    # v0.7.12 -- FIX (bug relatado pelo usuário, causa raiz de verdade):
+    # COLL_MAIN_TEXTURE_PICKER foi REMOVIDA desta grade -- ERA incluída
+    # aqui desde v0.10.5 (ver histórico abaixo), o que significava que
+    # TODO personagem novo ganhava a entrada "Texture Picker" em
+    # Collection Settings desde o primeiro seed (ensure_default_bone_
+    # collections, logo abaixo), mesmo sem NENHUMA cadeia Texture Picker
+    # configurada -- e, pior, mesmo depois de configurar uma cadeia e
+    # redirecioná-la pra outra collection (ex. "Mouth"), a entrada
+    # "Texture Picker" ficava lá pra sempre, órfã, dando a impressão de
+    # que "Create Rig" continuava criando/usando ela à toa. Diferente
+    # dos outros 10 defaults acima (que fazem sentido em TODO
+    # personagem -- são a estrutura básica do esqueleto humanoide),
+    # Texture Picker é uma feature OPT-IN: só deveria aparecer se
+    # alguém de fato configurar uma cadeia TEXTURE_PICKER usando a
+    # collection default (Auto). Essa é exatamente a checagem que
+    # ensure_texture_picker_collection_entry já fazia (v0.10.5) -- só
+    # que agora é a ÚNICA fonte de verdade pra esta entrada; não é mais
+    # duplicada aqui na grade incondicional. `ensure_default_bone_
+    # collection_entries` (backfill do "Create Rig"/"Reset Row/Column
+    # to Defaults") também já excluía Texture Picker explicitamente por
+    # nome -- essa exclusão ali virou redundante agora que nem está
+    # mais nesta tupla, mas foi mantida como rede de segurança.
+    #
+    # v0.10.5 (histórico) -- Texture Picker é v0.10, esta grade só tinha
+    # sido atualizada até Attachments em v0.9.7; sem isso, armatures
+    # NOVOS não ganhavam a entrada "Texture Picker" em "Collection
+    # Settings"/aba Animation mesmo com a bone collection real sendo
+    # criada normalmente por _build_texture_picker -- ver também
+    # ensure_texture_picker_collection_entry logo abaixo, que cobria o
+    # mesmo problema pra armatures que já existiam ANTES deste fix.
 )
 
 
@@ -2275,13 +2832,22 @@ def ensure_default_bone_collections(armature):
     nessa lista (antes era uma raiz separada, fora de Main e fora de
     Collection Settings por completo -- pedido explícito: "precisa ser
     criada dentro do Main e aparecer como aquelas collections
-    defaults... configurável"), na última row (abaixo de Tail)."""
+    defaults... configurável"), na última row (abaixo de Tail).
+
+    v0.7.7 -- também semeia a Section default ("Main", entry_type ==
+    "SECTION") ANTES das 10 collections -- mesma lista agora (ver
+    changelog: Section deixou de ser uma lista separada), mesma flag de
+    controle (hytale_bone_collections_initialized) cobrindo os dois."""
     if armature.hytale_bone_collections_initialized:
         return
+    main_section = armature.hytale_bone_collections.add()
+    main_section.name = "Main"
+    main_section.entry_type = "SECTION"
+    main_section.parent = SECTION_ROOT
+    main_section.row = 0
     for name, row, column in _DEFAULT_BONE_COLLECTION_GRID:
         item = armature.hytale_bone_collections.add()
         item.name = name
-        item.parent = PARENT_COLLECTION_ROOT
         item.row = row
         item.column = column
     armature.hytale_bone_collections_initialized = True
@@ -2299,8 +2865,12 @@ def ensure_texture_picker_collection_entry(armature):
     apagar. Corrige só isso, sem tocar em mais nada da lista:
 
     - só adiciona se já existe pelo menos uma cadeia chain_type == "TEXTURE_PICKER"
-      configurada (ou seja, o usuário está de fato usando Texture Picker --
-      não põe a collection à toa em armatures que nunca vão precisar dela);
+      configurada E usando a collection default de verdade (collection_override
+      vazio ou "Auto" -- v0.7.12, FIX de bug relatado pelo usuário: ERA só
+      "existe uma cadeia TEXTURE_PICKER", sem olhar pro override -- uma
+      cadeia redirecionada pra outra collection (ex. "Mouth") ainda contava
+      como "usando Texture Picker" e a entrada aparecia à toa em Collection
+      Settings, mesmo sem nenhuma cadeia usando-a de fato);
     - só adiciona se NENHUMA entrada com o nome ATUAL (COLL_MAIN_TEXTURE_PICKER,
       "Texture Picker") já existe -- idempotente pra quem já rodou este mesmo
       backfill antes. v0.11: COLL_MAIN_TEXTURE_PICKER deixou de valer "Mouth"
@@ -2321,18 +2891,122 @@ def ensure_texture_picker_collection_entry(armature):
     pra escrita em dados de ID (ver docstring de ensure_default_bone_
     collections sobre por que isso não pode rodar de dentro de draw())."""
     has_texture_picker_chain = any(
-        getattr(item, "chain_type", None) == "TEXTURE_PICKER" for item in getattr(armature, "hytale_ik_chains", [])
+        getattr(item, "chain_type", None) == "TEXTURE_PICKER"
+        and (getattr(item, "collection_override", "") or "").strip() in ("", COLLECTION_OVERRIDE_AUTO)
+        for item in getattr(armature, "hytale_ik_chains", [])
     )
     if not has_texture_picker_chain:
         return
-    already_present = any(item.name == COLL_MAIN_TEXTURE_PICKER for item in armature.hytale_bone_collections)
+    # v0.7.7 -- filtra por entry_type == "COLLECTION": lista unificada
+    # agora (ver changelog), então uma Section por acaso chamada "Texture
+    # Picker" não deveria contar como "já presente" aqui.
+    already_present = any(
+        item.name == COLL_MAIN_TEXTURE_PICKER and item.entry_type == "COLLECTION"
+        for item in armature.hytale_bone_collections
+    )
     if already_present:
         return
     item = armature.hytale_bone_collections.add()
     item.name = COLL_MAIN_TEXTURE_PICKER
-    item.parent = PARENT_COLLECTION_ROOT
     item.row = 8
     item.column = 0
+
+
+def ensure_default_bone_section_backfill(armature):
+    """v0.7.8 -- FIX (bug relatado pelo usuário): backfill pra armatures
+    que já tinham Collection Settings inicializado ANTES de "Section"
+    virar um TIPO de entrada dessa mesma lista (ver changelog -- ERA
+    duas listas separadas, unificado em v0.7.7). Nesses armatures,
+    hytale_bone_collections_initialized já é True, então
+    ensure_default_bone_collections() é um no-op e a lista NUNCA ganha a
+    Section "Main" sozinha -- sintomas exatos relatados: (1) a Section
+    não aparece na lista mesmo depois de "Remove Generated Bones" +
+    "Create Rig" de novo (só a criação DAS 10 collections roda de novo
+    a partir do zero se a lista tiver sido limpa manualmente -- não é o
+    caso aqui, a lista continua com as 10 antigas, só sem NENHUMA
+    Section); (2) sem nenhuma Section chamada "Main" pra achar por nome,
+    _resolve_collection_section_name cai pra 'a primeira Section por
+    ordem' como último recurso -- e como a única Section que existe de
+    verdade é a que o usuário acabou de criar na mão, ela vira essa
+    "primeira" sozinha, parecendo "roubar" tudo que devia estar em Main.
+
+    Mesmo padrão de ensure_texture_picker_collection_entry logo acima:
+    só adiciona se NÃO existir nenhuma entrada entry_type == "SECTION"
+    ainda -- idempotente, nunca duplica. Insere no TOPO da lista (não no
+    fim -- diferente do Texture Picker) só por clareza visual: numa
+    lista já com 10+ collections, a Section "Main" apareceria escondida
+    lá embaixo se fosse só um append.
+
+    Chamada nos mesmos dois lugares que ensure_texture_picker_collection_entry:
+    dentro de RIG_OT_hytale_generate_rig.execute() (logo depois de
+    ensure_default_bone_collections) e do handler automático (ver
+    register_bone_collection_defaults_handler) -- nunca de dentro de
+    draw()."""
+    has_section = any(e.entry_type == "SECTION" for e in armature.hytale_bone_collections)
+    if has_section:
+        return
+    item = armature.hytale_bone_collections.add()
+    item.name = "Main"
+    item.entry_type = "SECTION"
+    item.parent = SECTION_ROOT
+    item.row = 0
+    armature.hytale_bone_collections.move(len(armature.hytale_bone_collections) - 1, 0)
+
+
+def ensure_default_bone_collection_entries(armature):
+    """v0.7.9 -- FIX (bug relatado pelo usuário): a collection REAL de
+    um dos 10 defaults (Head/Spine/Body/Arm L/Arm R/Leg L/Leg R/Root/
+    Tail/Attachments) sempre é recriada normalmente em "Create Rig" --
+    _build_main_collections/_apply_bone_collection_overrides não
+    dependem desta lista de config pra nada, andam por conta própria via
+    nome de bone fixo/chain_type. O que NÃO voltava sozinho, se o
+    usuário tivesse apagado uma dessas entradas de Collection Settings
+    (só a config, não a collection real): o BOTÃO dela na aba Animation
+    (que lê APENAS desta lista, não o armature.collections_all direto) e
+    a entrada em si em Collection Settings -- a única forma de trazer de
+    volta era clicar manualmente em "Reset Row/Column to Defaults".
+
+    Backfill igual ensure_texture_picker_collection_entry/
+    ensure_default_bone_section_backfill (mesmo padrão, mesmos dois
+    lugares que chamam: dentro de execute() de RIG_OT_hytale_generate_rig,
+    nunca de draw()) -- só que pros outros 10 defaults.
+
+    Só ADICIONA o que estiver faltando -- nunca mexe no row/column de
+    quem já existe (diferente de RIG_OT_hytale_bone_collection_reset_grid,
+    que é uma ação EXPLÍCITA do usuário e pode sobrescrever customização
+    de propósito; esta função roda toda vez que "Create Rig" é clicado
+    -- mexer no row/column de uma entrada que o usuário já reorganizou
+    seria surpreendente). Devolve quantas entradas foram adicionadas
+    (reaproveitado pelo report() de RIG_OT_hytale_bone_collection_reset_grid,
+    que chama esta mesma função pra não duplicar a lógica).
+
+    v0.7.11 -- FIX (bug relatado pelo usuário): EXCLUI Texture Picker
+    (COLL_MAIN_TEXTURE_PICKER) deste backfill -- diferente dos outros 10
+    defaults (que _build_main_collections sempre recria de qualquer
+    jeito, incondicional, faz sentido a entrada de config sempre
+    acompanhar), Texture Picker só deveria existir em Collection
+    Settings se houver DE FATO uma cadeia chain_type == "TEXTURE_PICKER"
+    configurada -- essa checagem já existe, separada, em
+    ensure_texture_picker_collection_entry (chamada logo depois desta
+    função em RIG_OT_hytale_generate_rig.execute()). Sem esta exclusão,
+    esta função (que roda incondicional em TODO "Create Rig") reintroduzia
+    "Texture Picker" em Collection Settings mesmo em personagens SEM
+    nenhuma cadeia Texture Picker, ou com a única cadeia redirecionada
+    via collection_override pra outra collection (ex. "Mouth") -- exatamente
+    o cenário relatado."""
+    existing_names = {item.name for item in armature.hytale_bone_collections}
+    added = 0
+    for name, row, column in _DEFAULT_BONE_COLLECTION_GRID:
+        if name == COLL_MAIN_TEXTURE_PICKER:
+            continue  # tratada à parte por ensure_texture_picker_collection_entry
+        if name in existing_names:
+            continue
+        item = armature.hytale_bone_collections.add()
+        item.name = name
+        item.row = row
+        item.column = column
+        added += 1
+    return added
 
 
 def _collection_sort_key(item):
@@ -2348,35 +3022,43 @@ def _collection_sort_key(item):
     return (item.row, item.column, item.name)
 
 
-def _resolve_collection_parent(armature, item, visited=None):
-    """v0.9.6 -- devolve a bone collection REAL (já criada, com
-    ensure_bone_collection) que deve ser o PARENT de `item`, criando
-    toda a cadeia de ancestrais que faltar no caminho (recursivo -- se
-    o parent de `item` também não existir de verdade ainda, cria o
-    parent DELE primeiro). PARENT_COLLECTION_ROOT (ou vazio, por
-    segurança com dado antigo) = Main direto, a única raiz fixa que
-    sobrou (Face deixou de ser hardcoded -- pedido explícito).
+def _resolve_collection_parent(armature, item=None, visited=None):
+    """v0.7.6 -- SIMPLIFICADO: aninhamento REAL de bone collection (uma
+    dentro de outra, no Blender de verdade) não existe mais aqui --
+    virou puramente "Sections", visual só na aba Animation. Toda
+    collection criada por Collection Settings agora fica sempre PLANA,
+    direto embaixo de Main de verdade. `item`/`visited` continuam nos
+    parâmetros só pra não quebrar quem já chama esta função passando um
+    HytaleBoneCollectionItem -- nenhum dos dois é usado."""
+    return ensure_bone_collection(armature, COLL_MAIN)
 
-    `visited` protege contra ciclo (A -> B -> A, ou mais longo) que a
-    UI não impede na hora de escolher o parent (ver
-    _parent_collection_enum_items) -- se detectar que já passou por
-    esse nome nesta MESMA chamada, cai pra Main como fallback seguro
-    em vez de estourar recursão infinita. Mesmo tratamento pra um
-    `parent` que aponta pra um nome que não existe mais na lista
-    (renomeado/apagado) -- cai pra Main também, sem erro."""
-    if visited is None:
-        visited = set()
-    parent_name = (item.parent or "").strip()
-    if not parent_name or parent_name == PARENT_COLLECTION_ROOT:
-        return ensure_bone_collection(armature, COLL_MAIN)
-    if parent_name in visited:
-        return ensure_bone_collection(armature, COLL_MAIN)  # ciclo detectado -- fallback seguro
-    visited.add(parent_name)
-    parent_item = next((c for c in armature.hytale_bone_collections if c.name == parent_name), None)
-    if parent_item is None:
-        return ensure_bone_collection(armature, COLL_MAIN)  # nome órfão (renomeado/apagado) -- fallback
-    grandparent = _resolve_collection_parent(armature, parent_item, visited)
-    return ensure_bone_collection(armature, parent_item.name, parent=grandparent)
+
+def resolve_collection_override_target(armature, target_name):
+    """v0.7.7 -- extraído de dentro de _apply_bone_collection_overrides
+    (_resolve_target, que virou um wrapper fino em cima disto) pra
+    poder ser reaproveitado por QUALQUER lugar que precise honrar um
+    `collection_override` -- não só o redirect principal de Arm/Leg/
+    Head/Spine/Tail/Attachments, mas também _build_texture_picker (ver
+    comentário lá: bug real corrigido, os bones root.ui/cursor do
+    Texture Picker ignoravam collection_override por completo e sempre
+    criavam a collection default "Texture Picker", mesmo com um
+    collection_override configurado).
+
+    Resolve `target_name` (nome de uma entrada da lista de Collection
+    Settings) pra uma bone collection REAL (já criada, ou criada agora
+    -- ver ensure_bone_collection), só se essa entrada existir E for do
+    tipo Collection (entry_type == "COLLECTION" -- nunca resolve pra uma
+    Section, que não é uma bone collection de verdade). Devolve None se
+    o nome não corresponder a nada válido (apagado/renomeado, ou é uma
+    Section) -- quem chama decide o fallback."""
+    settings_item = next(
+        (c for c in armature.hytale_bone_collections if c.name == target_name and c.entry_type == "COLLECTION"),
+        None,
+    )
+    if settings_item is None:
+        return None
+    parent = _resolve_collection_parent(armature, settings_item)
+    return ensure_bone_collection(armature, target_name, parent=parent)
 
 
 def _head_spine_bone_names(item):
@@ -2420,65 +3102,98 @@ def _head_spine_bone_names(item):
     return list(dict.fromkeys(n for n in names if n))
 
 
+def _spine_ctrl_override_transform_bone_name(armature):
+    """v0.13.12 -- pedido do usuário: nome do bone _CTRL (não o ORG) do
+    ÚLTIMO bone preenchido na entrada SPINE de Bone Settings (pelvis_bone
+    ou spine_bone_1..4, o que estiver mais embaixo respeitando
+    spine_count -- ver _head_spine_bone_names, mesma fonte/ordem), pra
+    servir de Override Transform (custom_shape_transform) do custom
+    shape de root.spine_CTRL (ver _build_custom_shapes) -- o widget
+    continua desenhado NA posição/tamanho do root.spine_CTRL de sempre,
+    só a ORIENTAÇÃO/transform que o shape em si usa pra se desenhar
+    passa a copiar a do último bone do Spine, em vez da do próprio
+    root.spine_CTRL.
+
+    None se não houver entrada SPINE nenhuma, ou se ela ainda não tiver
+    nenhum bone preenchido -- _build_custom_shapes trata isso limpando
+    o Override Transform (fica None, comportamento default do
+    Blender)."""
+    spine_item = next((it for it in armature.hytale_ik_chains if it.chain_type == "SPINE"), None)
+    if spine_item is None:
+        return None
+    names = _head_spine_bone_names(spine_item)
+    if not names:
+        return None
+    return names[-1] + SUFFIX_CTRL
+
+
+
 def sync_bone_collection_order(armature):
     """v0.9 (Etapa 2, pedido explícito) -- reordena as bone collections
     REAIS do Blender (armature.collections, o que aparece no painel
-    'Bone Collections' de Object Data Properties) pra bater com a
-    árvore de armature.hytale_bone_collections (a lista editável de
-    "Collection Settings" -- ver HytaleBoneCollectionItem.parent). Usa
-    `child_number` (índice de uma bone collection DENTRO da lista de
-    filhos do próprio parent -- mesma API que _move_main_child_before
-    já usa, ver docstring lá pra detalhe de como setar child_number
-    reposiciona) -- só reordena entradas que JÁ EXISTEM de verdade
-    nesse armature; entradas que só existem na lista de config (nunca
-    materializadas por um 'Create Rig') são ignoradas, sem erro.
+    'Bone Collections' de Object Data Properties) pra bater com a ordem
+    configurada em "Collection Settings". Usa `child_number` (índice de
+    uma bone collection DENTRO da lista de filhos do próprio parent --
+    mesma API que _move_main_child_before já usa) -- só reordena
+    entradas que JÁ EXISTEM de verdade nesse armature; entradas que só
+    existem na lista de config (nunca materializadas por um 'Create
+    Rig') são ignoradas, sem erro.
 
-    v0.9.5 -- a "ordem" vem de _collection_sort_key (row, column, name
-    -- ver HytaleBoneCollectionItem), não mais da ordem crua da lista
-    (a que os botões ▲▼ movem). O painel nativo do Blender não tem
-    conceito de "coluna" -- é sempre uma lista vertical -- então aqui a
-    grade (row, column) simplesmente vira uma ordem linear (row major,
-    column como desempate), igual uma leitura de cima pra baixo e
-    esquerda pra direita.
-
-    v0.9.6 -- ERA hardcoded em só duas raízes (Main/Face) -- agora
-    agrupa DINAMICAMENTE por parent resolvido (item.parent, ou "Main"
-    se vazio/sentinel/órfão -- ver _resolve_collection_parent), então
-    funciona pra qualquer profundidade de aninhamento (uma collection
-    dentro de outra dentro de outra...) sem precisar saber de antemão
-    quantos níveis existem. row/column de cada item são relativos aos
-    IRMÃOS (mesmo grupo/parent), não à lista inteira -- por isso ordena
-    DENTRO de cada grupo separadamente, não a lista toda de uma vez.
+    v0.7.6 -- REESCRITA: aninhamento real de collection (uma dentro da
+    outra no Blender) não existe mais -- toda collection fica SEMPRE
+    filha direta de Main (ver _resolve_collection_parent). A ordem
+    agora vem de duas fontes, na prática uma única passada plana: (1) a
+    árvore de SECTIONS (_iter_sections_in_order -- puramente visual,
+    não corresponde a nenhuma bone collection real), que decide em que
+    BLOCO cada collection cai e em que ordem os blocos aparecem; (2)
+    dentro de cada bloco, _collection_sort_key (row, column, name) --
+    mesma regra de sempre, só que agora relativa aos irmãos da MESMA
+    Section, não de um parent de collection. O resultado final (uma
+    lista plana, seção por seção) vira o child_number sequencial de
+    Main -- assim o painel nativo do Blender já sai na mesma ordem que
+    a aba Animation mostra, mesmo sem ter nenhuma nesting real por trás.
 
     Chamada em dois lugares: (1) sempre no fim de 'Create Rig' (idempotente),
     e (2) direto pelos operadores Add/Remove/Move/de Row/Column de
-    Collection Settings (RIG_OT_hytale_bone_collection_*), pra a
-    reordenação no painel nativo acontecer NA HORA, sem precisar rodar
-    'Create Rig' de novo -- só afeta collections que já existem; se o
-    personagem nunca gerou rig nenhum ainda, não há nada pra reordenar
-    (sem erro, sem-op)."""
-    groups = {}  # nome do parent resolvido -> [HytaleBoneCollectionItem, ...]
-    for item in armature.hytale_bone_collections:
-        if not item.name:
-            continue
-        parent_name = (item.parent or "").strip()
-        if not parent_name or parent_name == PARENT_COLLECTION_ROOT:
-            parent_name = COLL_MAIN
-        groups.setdefault(parent_name, []).append(item)
+    Collection Settings/Sections, pra a reordenação no painel nativo
+    acontecer NA HORA, sem precisar rodar 'Create Rig' de novo -- só
+    afeta collections que já existem; se o personagem nunca gerou rig
+    nenhum ainda, não há nada pra reordenar (sem erro, sem-op)."""
+    main_coll = _find_bone_collection_anywhere(armature, COLL_MAIN)
+    if main_coll is None:
+        return  # rig ainda não gerado -- nada a reordenar
 
-    for parent_name, children in groups.items():
-        parent_coll = _find_bone_collection_anywhere(armature, parent_name)
-        if parent_coll is None:
-            continue  # parent ainda não materializado de verdade -- nada a reordenar aqui
-        for target_index, child_item in enumerate(sorted(children, key=_collection_sort_key)):
-            child = next((c for c in parent_coll.children if c.name == child_item.name), None)
-            if child is None:
-                continue  # este filho ainda não materializado de verdade -- nada a reordenar
-            try:
-                if child.child_number != target_index:
-                    child.child_number = target_index
-            except Exception:
-                pass  # cosmético -- não impede o rig de funcionar
+    by_section = {}  # nome da Section -> [HytaleBoneCollectionItem, ...]
+    for item in armature.hytale_bone_collections:
+        if not item.name or item.entry_type != "COLLECTION":
+            continue
+        section_name = _resolve_collection_section_name(armature, item)
+        by_section.setdefault(section_name, []).append(item)
+
+    ordered_items = []
+    for sec, _depth in _iter_sections_in_order(armature):
+        ordered_items.extend(sorted(by_section.get(sec.name, []), key=_collection_sort_key))
+    # Rede de segurança: uma collection cuja Section resolvida não bateu
+    # com NENHUMA Section percorrida acima (não deveria acontecer, já
+    # que _resolve_collection_section_name sempre cai pra uma Section
+    # real -- mas cobre o caso raro de hytale_bone_sections estar vazio)
+    # entra no fim, na ordem que já estava.
+    seen_names = {i.name for i in ordered_items}
+    for names in by_section.values():
+        for item in names:
+            if item.name not in seen_names:
+                ordered_items.append(item)
+                seen_names.add(item.name)
+
+    for target_index, child_item in enumerate(ordered_items):
+        child = next((c for c in main_coll.children if c.name == child_item.name), None)
+        if child is None:
+            continue  # este filho ainda não materializado de verdade -- nada a reordenar
+        try:
+            if child.child_number != target_index:
+                child.child_number = target_index
+        except Exception:
+            pass  # cosmético -- não impede o rig de funcionar
 
 
 
@@ -2504,9 +3219,8 @@ def _seed_active_armature_bone_collections(scene=None, depsgraph=None):
     if obj is None or obj.type != "ARMATURE":
         return
     armature = obj.data
-    if armature.hytale_bone_collections_initialized:
-        return
-    ensure_default_bone_collections(armature)
+    if not armature.hytale_bone_collections_initialized:
+        ensure_default_bone_collections(armature)
 
 
 def register_bone_collection_defaults_handler():
@@ -2529,562 +3243,371 @@ def unregister_bone_collection_defaults_handler():
 # ---------------------------------------------------------------------------
 
 
-class HytaleIKChainItem(PropertyGroup):
-    # v0.7: cada item da lista agora descreve um "tipo" de bone/estrutura,
-    # não só uma cadeia de IK genérica -- ARM e LEG usam EXATAMENTE a
-    # mesma lógica de geração que a antiga "IK Chain" única (mesmos
-    # campos root_bone/tip_bone/pole_bone/parent_override, mesmo
-    # _build_ik_layer/_build_pose_constraints); a única diferença hoje é
-    # o RÓTULO desses campos na UI, por tipo (ver interface.py). TAIL é
-    # o primeiro tipo genuinamente diferente: sem IK, sem pole/lado --
-    # ver _build_tail_layer/_build_tail_pose_constraints. Novos tipos
-    # (orelha, asa, etc.) entram aqui no futuro do mesmo jeito.
-    #
-    # v0.9 (Etapa 2) -- HEAD e SPINE são o segundo tipo genuinamente
-    # diferente: NÃO criam bone nenhum (diferente de Arm/Leg/Tail) --
-    # só REFERENCIAM bones _CTRL que já existem (o loop genérico cria um
-    # _CTRL por bone ORG, sempre; ver _build_edit_bones), pra dar nome
-    # explícito e configurável a quem antes era hardcoded (HEAD_COLLECTION_
-    # ROOT/SPINE_COLLECTION_BONES, ver constants.py). Puramente
-    # organizacional -- ver _head_spine_bone_names/_apply_bone_collection_
-    # overrides. O comportamento HARDCODED antigo continua rodando
-    # também (_build_main_collections, sem mudança nenhuma) -- uma
-    # entrada HEAD/SPINE é um jeito OPCIONAL de apontar bones adicionais
-    # (ou com nomenclatura diferente da 'Player') pra essas collections,
-    # não uma substituição obrigatória.
-    chain_type: EnumProperty(
-        name="Type",
-        description="What this entry configures. 'Arm'/'Leg' behave exactly like the old generic IK chain "
-        "(root/tip/pole path -> switchable FK/IK chain) -- only the field labels differ today. 'Tail' has "
-        "no IK: it builds a continuous chain of connected control bones (no gap between segments) "
-        "meant to be hooked into physics add-ons. 'Head'/'Spine'/'Attachments' create no bones at all -- "
-        "they just identify existing control bones, for collection organization. 'Texture Picker' identifies a "
-        "single texture-atlas control bone and builds a UV picker rig (a dedicated root.ui/cursor bone "
-        "pair + a reference atlas plane) for it -- see 'Create Texture Picker'",
-        items=[
-            ("ARM", "Arm", "Two-segment limb (shoulder-arm-forearm-hand pattern) -- IK/FK-switchable chain"),
-            ("LEG", "Leg", "Two-segment limb (pelvis-thigh-calf-foot pattern) -- IK/FK-switchable chain"),
-            ("TAIL", "Tail", "Chain of bones from root to tip, no IK -- continuous bridge chain for physics"),
-            ("HEAD", "Head", "Identifies the Neck (1-5 bones) + Head + Head End control bones -- no IK, "
-             "organizational only"),
-            ("SPINE", "Spine", "Identifies the Pelvis + Spine (1-4 bones) control bones -- no IK, "
-             "organizational only"),
-            ("ATTACHMENTS", "Attachments", "Identifies specific Attachment control bones (1-5) by name -- "
-             "no IK, organizational only. Separate from (and in addition to) the automatic name-based "
-             "attachment detection that already happens regardless of this entry"),
-            ("TEXTURE_PICKER", "Texture Picker", "Identifies a single control bone (e.g. a mouth or face bone) whose "
-             "material is a texture atlas of cells (expressions, shapes, etc.) -- 'Create Texture Picker' builds "
-             "a UV-picker rig for it. No IK"),
-        ],
-        default="ARM",
-    )
-    label: StringProperty(
-        name="Label",
-        description="Free-form name just to identify this entry in the list (e.g. Arm L)",
-        default="",
-    )
-    root_bone: StringProperty(
-        name="Root Bone",
-        description="First bone of the chain (e.g. L-Arm, L-Thigh, or the first tail bone). For a chain with "
-        "more than 2 segments in between (e.g. a 4-bone leg: Thigh/Calf/Heel/Foot), just point Root/Tip at "
-        "the two ends -- the bones in between are resolved automatically by walking the skeleton",
-        default="",
-    )
-    tip_bone: StringProperty(
-        name="Tip Bone",
-        description="Last bone of the chain -- the target/effector for Arm/Leg (e.g. L-Hand, L-Foot), or "
-        "the last tail bone for Tail",
-        default="",
-    )
-    pole_bone: StringProperty(
-        name="Pole Reference",
-        description="Arm/Leg only. Bone used as the position/orientation reference for the pole target "
-        "(e.g. L-Forearm). Empty = automatically uses the middle bone of the root->tip path",
-        default="",
-    )
-    parent_override: StringProperty(
-        name="Root Parent",
-        description="Optional bone that becomes the parent of this chain's root (e.g. L-Shoulder_CTRL, "
-        "Pelvis -- also used by Tail, to attach it to the body). Empty = left unparented. Some names are "
-        "automatically resolved to utility bones that only exist after generation (see "
-        "PARENT_OVERRIDE_ALIASES) -- e.g. typing 'Pelvis' resolves to 'root.pelvis_CTRL'.",
-        default="",
-    )
-    tail_tip_rotation_axis: EnumProperty(
-        name="Tip Rotation Axis",
-        description="Tail only. Which LOCAL axis of the last bone the Tip Rotation angle rotates around -- "
-        "X and Z bend the tail direction (perpendicular to the bone itself), Y just spins the roll in place. "
-        "Which one lines up with the correction you want depends on how this specific bone's roll came out",
-        items=[
-            ("X", "X (Local)", "Local X axis"),
-            ("Y", "Y (Local)", "Local Y axis (the bone's own direction -- spins roll only, doesn't bend it)"),
-            ("Z", "Z (Local)", "Local Z axis"),
-        ],
-        default="Z",
-    )
-    tail_tip_rotation_deg: FloatProperty(
-        name="Tip Rotation (deg)",
-        description="Tail only. Extra rotation (degrees, around Tip Rotation Axis, LOCAL to the last bone) "
-        "applied to its rest pose. The tip has no next segment to point its tail at, so by default it keeps "
-        "the ORG's original (untouched) direction -- use this to manually angle it so it lines up visually "
-        "with the rest of the chain",
-        default=0.0,
-    )
-    side: EnumProperty(
-        name="Side",
-        description="Body side of this chain -- used by pole_angle presets (e.g. Arm mode) that need a "
-        "different value per side",
-        items=[
-            ("LEFT", "Left", ""),
-            ("RIGHT", "Right", ""),
-            ("CENTER", "Center", ""),
-        ],
-        default="CENTER",
-    )
-    pole_invert: BoolProperty(
-        name="Pole in Front (+Z)",
-        description="Pole in front (positive Z axis of the reference bone) instead of behind (default, -Z)",
-        default=False,
-    )
-    pole_distance: FloatProperty(
-        name="Pole Distance",
-        description="Distance from the pole target to the reference bone (pole_bone)",
-        default=0.35,
-        min=0.001,
-    )
-    pole_angle_mode: EnumProperty(
-        name="Pole Angle Mode",
-        items=[
-            ("AUTO", "Auto", "Calculates pole_angle automatically from the rest pose -- works for ANY "
-             "character, the safe starting point for a template that hasn't been calibrated yet"),
-            ("PRESET", "Preset (from Template)", "Uses a calibrated value defined by the active rig "
-             "template (see 'Pole Angle Preset' field below and the template's pole_angle_presets, keyed "
-             "by the Side field) -- only makes sense if a template that actually defines that preset name "
-             "was loaded via 'Load Hytale IK Chain Preset'. For a character with no calibrated preset yet, "
-             "use Auto or Manual instead"),
-            ("MANUAL", "Manual", "Uses the value typed in Pole Angle directly, without calculating anything "
-             "-- the right way to hand-tune the pole for a character with no calibrated preset"),
-        ],
-        default="AUTO",
-    )
-    pole_angle_preset_name: StringProperty(
-        name="Pole Angle Preset",
-        description="Name of the entry (as defined in the active rig template's pole_angle_presets, e.g. "
-        "'ARM') to use when Pole Angle Mode = Preset. Ignored in Auto/Manual mode",
-        default="ARM",
-    )
-    pole_angle_manual: FloatProperty(
-        name="Pole Angle (deg)",
-        description="Final pole_angle value, used only in Manual mode. Suggested starting point: 90 or "
-        "-90 (typical elbow/knee) -- adjust the sign/value visually until the pole centers",
-        default=90.0,
-    )
-    pole_angle_fine_tune: FloatProperty(
-        name="Pole Angle Fine-Tune (deg)",
-        description="Added to the automatically calculated value -- used only in Auto mode",
-        default=0.0,
-    )
-    extra_ik_location: BoolProperty(
-        name="Also Copy Location on IK (root)",
-        description="Adds IK_CopyLocation (with switch) to the MCH of this chain's root bone, in addition "
-        "to Rotation/Scale. Needed when the root doesn't follow the normal ORG hierarchy (e.g. Thigh, "
-        "parented to a shared root.pelvis_CTRL).",
-        default=False,
-    )
-    # v0.9 (Etapa 2) -- campos exclusivos de HEAD. neck_count controla
-    # quantos dos 5 slots neck_bone_1..5 aparecem na UI (0 = pescoço
-    # direto no corpo, sem bone de neck nenhum) -- head_bone/head_end_bone
-    # ficam sempre visíveis, fora da contagem (mesmo padrão do
-    # "Neck Bones Amount" separado de "Head"/"Head End" no Auto Rig Pro,
-    # referência usada pra esta feature).
-    #
-    # v0.9.3 -- IMPORTANTE: todos os campos abaixo (neck_bone_*/head_bone/
-    # head_end_bone) esperam o nome do bone ORG (ex. "Head", "Neck"), a
-    # MESMA convenção de root_bone/tip_bone em Arm/Leg -- NÃO o "_CTRL".
-    # _apply_bone_collection_overrides soma SUFFIX_CTRL sozinho na hora
-    # de decidir qual bone de verdade vai pra collection (é o _CTRL que
-    # o usuário anima, não o ORG) -- ver bugfix no changelog.
-    _HEAD_SPINE_FIELD_HINT = (
-        " -- type/pick the ORIGINAL bone name (e.g. 'Head'), not '_CTRL': the matching control bone is "
-        "resolved automatically"
-    )
-    neck_count: IntProperty(
-        name="Neck Bones Amount",
-        description="How many Neck bone fields to show below (0-5). Head/Head End are separate, always shown",
-        default=1, min=0, max=5,
-    )
-    neck_bone_1: StringProperty(name="Neck", description="Original bone name" + _HEAD_SPINE_FIELD_HINT, default="")
-    neck_bone_2: StringProperty(name="Neck 2", description="Original bone name" + _HEAD_SPINE_FIELD_HINT, default="")
-    neck_bone_3: StringProperty(name="Neck 3", description="Original bone name" + _HEAD_SPINE_FIELD_HINT, default="")
-    neck_bone_4: StringProperty(name="Neck 4", description="Original bone name" + _HEAD_SPINE_FIELD_HINT, default="")
-    neck_bone_5: StringProperty(name="Neck 5", description="Original bone name" + _HEAD_SPINE_FIELD_HINT, default="")
-    head_bone: StringProperty(
-        name="Head",
-        description="Head original bone (defaults to the same bone HEAD_COLLECTION_ROOT already points to "
-        "for the 'Player' rig, minus the '_CTRL' suffix -- see constants.py)" + _HEAD_SPINE_FIELD_HINT,
-        default="",
-    )
-    head_end_bone: StringProperty(
-        name="Head End",
-        description="Optional bone at the very tip of the head (e.g. a jaw/chin end bone) -- leave empty "
-        "if this rig doesn't have one" + _HEAD_SPINE_FIELD_HINT,
-        default="",
-    )
-    # v0.9 (Etapa 2) -- campos exclusivos de SPINE. spine_count é o total
-    # DE BONES DA CADEIA, Pelvis incluso (1 = só Pelvis, sem nenhum
-    # Spine1/2/3/4) -- pelvis_bone sempre visível, spine_bone_1..4
-    # mostrados conforme spine_count - 1 (mesmo padrão de "Spine Amount"
-    # do Auto Rig Pro). Mesma convenção de nome ORG que HEAD, acima.
-    spine_count: IntProperty(
-        name="Spine Amount",
-        description="Total number of bones in this spine, including Pelvis (1-5). E.g. 3 = Pelvis + Spine1 + Spine2",
-        default=3, min=1, max=5,
-    )
-    pelvis_bone: StringProperty(name="Pelvis", description="Original bone name" + _HEAD_SPINE_FIELD_HINT, default="")
-    spine_bone_1: StringProperty(name="Spine1", description="Original bone name" + _HEAD_SPINE_FIELD_HINT, default="")
-    spine_bone_2: StringProperty(name="Spine2", description="Original bone name" + _HEAD_SPINE_FIELD_HINT, default="")
-    spine_bone_3: StringProperty(name="Spine3", description="Original bone name" + _HEAD_SPINE_FIELD_HINT, default="")
-    spine_bone_4: StringProperty(name="Spine4", description="Original bone name" + _HEAD_SPINE_FIELD_HINT, default="")
-    # v0.13 -- "Continuous Chain": generaliza o truque que a cadeia TAIL
-    # já usava (ver _build_tail_layer/SUFFIX_MCH_TRANSFER) pra HEAD e
-    # SPINE também. Diferente de TAIL (que sempre redireciona), aqui é
-    # OPT-IN por entrada -- default False, não muda nenhum rig já
-    # existente até o usuário ligar explicitamente. Quando ligado, o
-    # `_CTRL` de cada bone listado (ver _head_spine_bone_names) tem o
-    # TAIL redirecionado pro HEAD do próximo da lista -- o HEAD de cada
-    # bone NUNCA muda (fica na posição original do ORG, sempre). Ver
-    # _apply_continuous_chain_redirect.
-    #
-    # v0.13.4 -- SEM UI pra ligar/desligar (removida de interface.py --
-    # pedido explícito, ficou complexo demais validar a combinação
-    # certa entre entradas SPINE/HEAD só pra alimentar o Head Follow,
-    # que agora se resolve sozinho via "Head Free/Lock", bem mais
-    # simples -- ver head_follow_enabled abaixo). O campo, a property, e
-    # _apply_continuous_chain_redirect CONTINUAM existindo/rodando (só
-    # não têm mais UI) -- mantidos de propósito pra um uso futuro que
-    # precise da cadeia INTEIRA redirecionada (não só um bone), não só o
-    # Head Follow. Um template/.json antigo com continuous_chain=True
-    # continua funcionando normalmente se carregado.
-    continuous_chain: BoolProperty(
-        name="Continuous Chain",
-        description="Redirects each listed bone's _CTRL Tail to touch the next one's Head (same trick the "
-        "Tail chain type already uses) -- makes the chain look/behave like a connected sequence of bones "
-        "instead of independent floating controls. Off by default, doesn't affect existing rigs unless "
-        "turned on -- only the Tail moves, each bone's Head always stays at its original position.",
-        default=False,
-    )
-    continuous_chain_link_bone: StringProperty(
-        name="Connect Last Bone To",
-        description="Optional. Original bone name whose Head this entry's LAST listed bone should point "
-        "its Tail at (e.g. a Spine ending at 'Chest' connecting into a Head chain starting at 'Neck') -- "
-        "leave empty to keep the last bone's own original Tail instead" + _HEAD_SPINE_FIELD_HINT,
-        default="",
-    )
-    # v0.13.4 -- "Head Free/Lock" -- campo EXCLUSIVO de HEAD (v0.13.3
-    # tentou resolver isso medindo geometria automaticamente/sem toggle
-    # nenhum -- ver histórico em _apply_head_follow_parent; simplificado
-    # de volta pra um toggle explícito, mas BEM mais simples que o
-    # "Continuous Chain" genérico: só precisa de UM redirect -- o Tail
-    # do predecessor imediato de "Head" (Neck, se existir; Chest, se
-    # não -- resolvido automaticamente, sem precisar configurar nada
-    # além deste único toggle) pro Head de "Head". Ligado: monta o
-    # redirect + reparenta Head_CTRL pro Origin_CTRL + os dois
-    # constraints (Child Of + Copy Location, ver _build_head_follow) +
-    # a custom property PROP_HEAD_FOLLOW_SWITCH. Desligado (default):
-    # nada disso existe -- Head_CTRL segue o parent NATURAL (mesmo
-    # comportamento de antes desta feature inteira ter sido cogitada).
-    # Ver _apply_head_follow_parent.
-    head_follow_enabled: BoolProperty(
-        name="Head Free/Lock",
-        description="Lets Head_CTRL's rotation be locked to (or freed from) its predecessor bone "
-        "(Neck, or Chest if there's no Neck) at pose time, via a runtime switch -- see the "
-        "'head_follow_switch' custom property created on the PROPERTIES bone. Enabling this "
-        "automatically redirects the predecessor's Tail to Head's own Head (no other setup needed) and "
-        "reparents Head_CTRL to Origin_CTRL. Off by default -- Head_CTRL keeps following its predecessor "
-        "the normal way (real bone parenting, no switch).",
-        default=False,
-    )
-    # v0.15 -- "Create First Person Camera" (pedido explícito do
-    # usuário), exclusivo de HEAD. Ativa um botão dedicado
-    # (RIG_OT_hytale_camera_create/_remove, mesmo espírito de "Create
-    # Texture Picker" -- separado de "Create Rig" porque não precisa
-    # regenerar o resto do rig sempre que só a câmera muda) que cria um
-    # Object Camera de verdade, bone-parented (mesmo mecanismo do Atlas
-    # Plane do Texture Picker -- ver _build_first_person_camera) no bone
-    # escolhido. Diferente de Texture Picker, o campo de bone aqui é
-    # LIVRE (pode ser qualquer bone da armature, não só um bone de
-    # HEAD) -- pedido explícito. Puramente ferramenta de
-    # preview/animação no Blender -- exporter.py não sabe nem precisa
-    # saber que esta câmera existe (não faz parte do .blockyanim).
-    head_camera_enabled: BoolProperty(
-        name="Create First Person Camera",
-        description="Adds a 'Create Camera' button below that parents a real Blender Camera object to the "
-        "chosen bone -- useful for previewing/animating a first-person view",
-        default=False,
-    )
-    head_camera_parent_bone: StringProperty(
-        name="Camera Parent Bone",
-        description="Which bone the camera should be parented to (bone parenting -- follows the bone's pose "
-        "automatically). Can be any bone on this armature, not just a Head/Neck bone" + _HEAD_SPINE_FIELD_HINT,
-        default="",
-    )
-    # Ajuste fino manual, mesmo espírito de texture_picker_plane_offset_x/_y
-    # (Texture Picker) -- posição nasce em (0,0,0) = exatamente no
-    # Head/pivot do bone escolhido, ainda um chute (não temos a posição
-    # exata dos olhos do personagem no jogo) -- por isso o campo fica
-    # aberto, o usuário calibra uma vez por personagem (mesmo fluxo do
-    # Atlas Plane).
-    #
-    # v0.15.1 -- rotação default CORRIGIDA: a v0.15 assumia 90° em X (
-    # derivado da mesma convenção de eixo do Atlas Plane do Texture
-    # Picker), mas o usuário testou ao vivo no Blender e confirmou que
-    # X:0 / Y:180 / Z:0 é o que deixa a câmera de frente de verdade
-    # pro personagem -- a suposição original (eixo Y do bone = frente)
-    # não valia igual pro bone usado como parent da câmera. Mantido
-    # como default agora (valor CONFIRMADO, não mais um chute), mas os
-    # campos continuam abertos -- cada personagem/bone escolhido como
-    # parent pode ter uma orientação de rest ligeiramente diferente.
-    head_camera_offset_x: FloatProperty(
-        name="Camera Offset X", default=0.0,
-        description="Nudge the camera left/right, local to the parent bone's rest orientation",
-    )
-    head_camera_offset_y: FloatProperty(
-        name="Camera Offset Y", default=0.0,
-        description="Nudge the camera forward/back, local to the parent bone's rest orientation",
-    )
-    head_camera_offset_z: FloatProperty(
-        name="Camera Offset Z", default=0.0,
-        description="Nudge the camera up/down, local to the parent bone's rest orientation",
-    )
-    head_camera_rotation_x: FloatProperty(
-        name="Camera Rotation X (deg)", default=0.0,
-        description="Extra rotation (degrees, local X to the parent bone)",
-    )
-    head_camera_rotation_y: FloatProperty(
-        name="Camera Rotation Y (deg)", default=180.0,
-        description="Extra rotation (degrees, local Y to the parent bone) -- default confirmed to face the "
-        "camera forward on the parent bone's rest orientation",
-    )
-    head_camera_rotation_z: FloatProperty(
-        name="Camera Rotation Z (deg)", default=0.0,
-        description="Extra rotation (degrees, local Z to the parent bone)",
-    )
-    # v0.15.1 -- FOV exposto como campo de verdade (pedido explícito do
-    # usuário) em vez de fixo no código -- pode ser ajustado ANTES de
-    # clicar "Create Camera" (e reaplicado a qualquer momento rodando o
-    # botão de novo, mesmo espírito idempotente do resto do rigger).
-    # Default 90° continua sendo um chute razoável de "FOV parecido com
-    # FPS de jogo" -- não é um valor confirmado do Hytale (sem acesso à
-    # câmera real do jogo).
-    head_camera_fov: FloatProperty(
-        name="Camera FOV (deg)", default=90.0, min=1.0, max=179.0,
-        description="Horizontal field of view of the generated camera, in degrees -- not a confirmed Hytale "
-        "value, just a reasonable FPS-game starting point",
-    )
-    # v0.9.7 -- campos exclusivos de ATTACHMENTS. Mesmo padrão de
-    # HEAD/SPINE (amount + N campos de bone ORG) -- attachments_count é
-    # simplesmente quantos dos slots attachment_bone_N aparecem na UI
-    # (não tem um "sempre visível" tipo Head/Head End -- aqui todos os
-    # slots são do mesmo tipo). Separado (e adicional a) a detecção
-    # automática por nome que já roda sempre (is_attachment_bone, ver
-    # _build_main_collections) -- serve pra apontar bones que não seguem
-    # a convenção de nome esperada, ou só pra ter controle explícito de
-    # quais vão pra qual collection via o dropdown "Collection" abaixo.
-    #
-    # v0.9.8 -- ERA só 5 slots fixos (attachment_bone_1..5, escritos na
-    # mão igual neck_bone_1..5/spine_bone_1..4 acima) -- pedido
-    # explícito pra um teto bem mais alto (25) sem precisar escrever 25
-    # linhas repetidas nem ficar recontando toda vez que o número mudar.
-    # ATTACHMENTS_MAX_COUNT (rigger/constants.py) é a ÚNICA fonte da
-    # verdade pra esse teto -- pra mudar, edita só o número lá; nada
-    # aqui (nem em interface.py, que também lê a mesma constante)
-    # precisa mudar.
-    #
-    # Blender NÃO tem um "CampoDeTextoInfinito" de verdade dentro de um
-    # PropertyGroup -- cada StringProperty precisa existir como um campo
-    # de verdade, declarado como ANOTAÇÃO da classe (`nome: Tipo(...)`,
-    # não atribuição direta -- Blender recusa registrar atribuição
-    # direta nas versões atuais). O truque abaixo gera essas anotações
-    # NUM LOOP em vez de escrever uma linha por campo: `__annotations__`
-    # já existe neste ponto do corpo da classe (Python cria esse dict
-    # sozinho assim que a PRIMEIRA anotação `campo: Tipo` aparece em
-    # QUALQUER lugar do corpo -- e isso já aconteceu muito antes daqui,
-    # com `label:` etc.) -- então só precisa inserir mais entradas nesse
-    # MESMO dict, o que tem exatamente o mesmo efeito de ter escrito
-    # `attachment_bone_7: StringProperty(...)` à mão, só que 25 vezes
-    # automaticamente. `del _i` no final evita que a variável do loop
-    # vaze como se fosse mais um campo da classe.
-    attachments_count: IntProperty(
-        name="Attachments Bones Amount",
-        description=f"How many Attachment bone fields to show below (0-{ATTACHMENTS_MAX_COUNT})",
-        default=1, min=0, max=ATTACHMENTS_MAX_COUNT,
-    )
+# v0.14 -- todas as properties de HytaleIKChainItem vêm desta função --
+# @localized_props precisa do dict COMPLETO pra reconstruir a classe
+# quando o idioma muda (ver translations/__init__.py, seção "Tooltip
+# de campo"). CUIDADO ESPECIAL -- assim como HytaleBoneCollectionItem
+# acima, esta classe é o ALVO de `Armature.hytale_ik_chains =
+# CollectionProperty(type=...)` em rigger/__init__.py, fora do ciclo
+# normal de register_class -- registrada como refresh hook lá por
+# causa disso.
+#
+# Os campos attachment_bone_N/texture_picker_extra_bone_N (antes
+# gerados por um loop escrevendo direto em __annotations__ do corpo da
+# classe) viraram um loop escrevendo no dict `props` local -- mesmo
+# resultado final (N properties nomeadas dinamicamente), só a mecânica
+# de construção mudou de "manipular __annotations__ de uma classe" pra
+# "montar um dict comum", já que agora isso roda DENTRO de uma função
+# builder, não mais no corpo da classe.
+def _ik_chain_item_props(lang):
+    # Texto compartilhado por TODO campo que pede um nome de bone ORG
+    # (não "_CTRL") -- ver uso abaixo em vários StringProperty. Era a
+    # constante de classe _HEAD_SPINE_FIELD_HINT, concatenada em tempo
+    # de execução -- agora cada key de tradução já vem com o texto
+    # final PRONTO (base + hint), sem precisar reconstruir a
+    # concatenação aqui.
+    props = {
+        # v0.7: cada item da lista agora descreve um "tipo" de bone/estrutura,
+        # não só uma cadeia de IK genérica -- ARM e LEG usam EXATAMENTE a
+        # mesma lógica de geração que a antiga "IK Chain" única (mesmos
+        # campos root_bone/tip_bone/pole_bone/parent_override, mesmo
+        # _build_ik_layer/_build_pose_constraints); a única diferença hoje é
+        # o RÓTULO desses campos na UI, por tipo (ver interface.py). TAIL é
+        # o primeiro tipo genuinamente diferente: sem IK, sem pole/lado --
+        # ver _build_tail_layer/_build_tail_pose_constraints. Novos tipos
+        # (orelha, asa, etc.) entram aqui no futuro do mesmo jeito.
+        #
+        # v0.9 (Etapa 2) -- HEAD e SPINE são o segundo tipo genuinamente
+        # diferente: NÃO criam bone nenhum (diferente de Arm/Leg/Tail) --
+        # só REFERENCIAM bones _CTRL que já existem (o loop genérico cria um
+        # _CTRL por bone ORG, sempre; ver _build_edit_bones), pra dar nome
+        # explícito e configurável a quem antes era hardcoded (HEAD_COLLECTION_
+        # ROOT/SPINE_COLLECTION_BONES, ver constants.py). Puramente
+        # organizacional -- ver _head_spine_bone_names/_apply_bone_collection_
+        # overrides. O comportamento HARDCODED antigo continua rodando
+        # também (_build_main_collections, sem mudança nenhuma) -- uma
+        # entrada HEAD/SPINE é um jeito OPCIONAL de apontar bones adicionais
+        # (ou com nomenclatura diferente da 'Player') pra essas collections,
+        # não uma substituição obrigatória.
+        "chain_type": EnumProperty(
+            name="Type",
+            description=tr("rigger.prop.ik_chain_chain_type", lang),
+            items=[
+                ("ARM", "Arm", tr("rigger.prop.ik_chain_chain_type_item_arm", lang)),
+                ("LEG", "Leg", tr("rigger.prop.ik_chain_chain_type_item_leg", lang)),
+                ("CHAIN", "Chain", tr("rigger.prop.ik_chain_chain_type_item_chain", lang)),
+                ("HEAD", "Head", tr("rigger.prop.ik_chain_chain_type_item_head", lang)),
+                ("SPINE", "Spine", tr("rigger.prop.ik_chain_chain_type_item_spine", lang)),
+                ("ATTACHMENTS", "Attachments", tr("rigger.prop.ik_chain_chain_type_item_attachments", lang)),
+                ("TEXTURE_PICKER", "Texture Picker", tr("rigger.prop.ik_chain_chain_type_item_texture_picker", lang)),
+            ],
+            default="ARM",
+        ),
+        "label": StringProperty(
+            name="Label",
+            description=tr("rigger.prop.ik_chain_label", lang),
+            default="",
+        ),
+        "root_bone": StringProperty(
+            name="Root Bone",
+            description=tr("rigger.prop.ik_chain_root_bone", lang),
+            default="",
+        ),
+        "tip_bone": StringProperty(
+            name="Tip Bone",
+            description=tr("rigger.prop.ik_chain_tip_bone", lang),
+            default="",
+        ),
+        "pole_bone": StringProperty(
+            name="Pole Reference",
+            description=tr("rigger.prop.ik_chain_pole_bone", lang),
+            default="",
+        ),
+        "parent_override": StringProperty(
+            name="Root Parent",
+            description=tr("rigger.prop.ik_chain_parent_override", lang),
+            default="",
+        ),
+        "tail_tip_rotation_axis": EnumProperty(
+            name="Tip Rotation Axis",
+            description=tr("rigger.prop.ik_chain_tail_tip_rotation_axis", lang),
+            items=[
+                ("X", "X (Local)", tr("rigger.prop.ik_chain_tail_tip_rotation_axis_item_x", lang)),
+                ("Y", "Y (Local)", tr("rigger.prop.ik_chain_tail_tip_rotation_axis_item_y", lang)),
+                ("Z", "Z (Local)", tr("rigger.prop.ik_chain_tail_tip_rotation_axis_item_z", lang)),
+            ],
+            default="Z",
+        ),
+        "tail_tip_rotation_deg": FloatProperty(
+            name="Tip Rotation (deg)",
+            description=tr("rigger.prop.ik_chain_tail_tip_rotation_deg", lang),
+            default=0.0,
+        ),
+        "tail_use_connect": BoolProperty(
+            name="Connected",
+            description=tr("rigger.prop.ik_chain_tail_use_connect", lang),
+            default=False,
+        ),
+        "side": EnumProperty(
+            name="Side",
+            description=tr("rigger.prop.ik_chain_side", lang),
+            items=[
+                ("LEFT", "Left", ""),
+                ("RIGHT", "Right", ""),
+                ("CENTER", "Center", ""),
+            ],
+            default="CENTER",
+        ),
+        "pole_invert": BoolProperty(
+            name="Pole in Front (+Z)",
+            description=tr("rigger.prop.ik_chain_pole_invert", lang),
+            default=False,
+        ),
+        "pole_distance": FloatProperty(
+            name="Pole Distance",
+            description=tr("rigger.prop.ik_chain_pole_distance", lang),
+            default=0.35,
+            min=0.001,
+        ),
+        "pole_angle_mode": EnumProperty(
+            name="Pole Angle Mode",
+            items=[
+                ("AUTO", "Auto", tr("rigger.prop.ik_chain_pole_angle_mode_item_auto", lang)),
+                ("PRESET", "Preset (from Template)", tr("rigger.prop.ik_chain_pole_angle_mode_item_preset", lang)),
+                ("MANUAL", "Manual", tr("rigger.prop.ik_chain_pole_angle_mode_item_manual", lang)),
+            ],
+            default="AUTO",
+        ),
+        "pole_angle_preset_name": StringProperty(
+            name="Pole Angle Preset",
+            description=tr("rigger.prop.ik_chain_pole_angle_preset_name", lang),
+            default="ARM",
+        ),
+        "pole_angle_manual": FloatProperty(
+            name="Pole Angle (deg)",
+            description=tr("rigger.prop.ik_chain_pole_angle_manual", lang),
+            default=90.0,
+        ),
+        "pole_angle_fine_tune": FloatProperty(
+            name="Pole Angle Fine-Tune (deg)",
+            description=tr("rigger.prop.ik_chain_pole_angle_fine_tune", lang),
+            default=0.0,
+        ),
+        "extra_ik_location": BoolProperty(
+            name="Also Copy Location on IK (root)",
+            description=tr("rigger.prop.ik_chain_extra_ik_location", lang),
+            default=False,
+        ),
+        "neck_count": IntProperty(
+            name="Neck Bones Amount",
+            description=tr("rigger.prop.ik_chain_neck_count", lang),
+            default=1, min=0, max=5,
+        ),
+        "neck_bone_1": StringProperty(
+            name="Neck", description=tr("rigger.prop.ik_chain_org_bone_name_hint", lang), default=""
+        ),
+        "neck_bone_2": StringProperty(
+            name="Neck 2", description=tr("rigger.prop.ik_chain_org_bone_name_hint", lang), default=""
+        ),
+        "neck_bone_3": StringProperty(
+            name="Neck 3", description=tr("rigger.prop.ik_chain_org_bone_name_hint", lang), default=""
+        ),
+        "neck_bone_4": StringProperty(
+            name="Neck 4", description=tr("rigger.prop.ik_chain_org_bone_name_hint", lang), default=""
+        ),
+        "neck_bone_5": StringProperty(
+            name="Neck 5", description=tr("rigger.prop.ik_chain_org_bone_name_hint", lang), default=""
+        ),
+        "head_bone": StringProperty(
+            name="Head",
+            description=tr("rigger.prop.ik_chain_head_bone", lang),
+            default="",
+        ),
+        "head_end_bone": StringProperty(
+            name="Head End",
+            description=tr("rigger.prop.ik_chain_head_end_bone", lang),
+            default="",
+        ),
+        "spine_count": IntProperty(
+            name="Spine Amount",
+            description=tr("rigger.prop.ik_chain_spine_count", lang),
+            default=3, min=1, max=5,
+        ),
+        # v0.13.12 -- pedido do usuário: liga/desliga a criação de
+        # root.spine_CTRL (e os constraints de Spine Follow em Belly_CTRL/
+        # Chest_CTRL que dependem dele -- ver SPINE_FOLLOW_BONES/
+        # _build_spine_follow) inteira -- pra personagens onde esse
+        # controle extra não faz sentido. default=True: não muda nada
+        # pra quem já tinha "Create Rig" rodado antes desta opção
+        # existir (root.spine_CTRL sempre foi criado incondicionalmente
+        # até agora).
+        "spine_ctrl_enabled": BoolProperty(
+            name="Create root.spine_CTRL",
+            description=tr("rigger.prop.ik_chain_spine_ctrl_enabled", lang),
+            default=True,
+        ),
+        "pelvis_bone": StringProperty(
+            name="Pelvis", description=tr("rigger.prop.ik_chain_org_bone_name_hint", lang), default=""
+        ),
+        "spine_bone_1": StringProperty(
+            name="Spine1", description=tr("rigger.prop.ik_chain_org_bone_name_hint", lang), default=""
+        ),
+        "spine_bone_2": StringProperty(
+            name="Spine2", description=tr("rigger.prop.ik_chain_org_bone_name_hint", lang), default=""
+        ),
+        "spine_bone_3": StringProperty(
+            name="Spine3", description=tr("rigger.prop.ik_chain_org_bone_name_hint", lang), default=""
+        ),
+        "spine_bone_4": StringProperty(
+            name="Spine4", description=tr("rigger.prop.ik_chain_org_bone_name_hint", lang), default=""
+        ),
+        "continuous_chain": BoolProperty(
+            name="Continuous Chain",
+            description=tr("rigger.prop.ik_chain_continuous_chain", lang),
+            default=False,
+        ),
+        "continuous_chain_link_bone": StringProperty(
+            name="Connect Last Bone To",
+            description=tr("rigger.prop.ik_chain_continuous_chain_link_bone", lang),
+            default="",
+        ),
+        "head_follow_enabled": BoolProperty(
+            name="Head Free/Lock",
+            description=tr("rigger.prop.ik_chain_head_follow_enabled", lang),
+            default=False,
+        ),
+        "head_camera_enabled": BoolProperty(
+            name="Create First Person Camera",
+            description=tr("rigger.prop.ik_chain_head_camera_enabled", lang),
+            default=False,
+        ),
+        "head_camera_parent_bone": StringProperty(
+            name="Camera Parent Bone",
+            description=tr("rigger.prop.ik_chain_head_camera_parent_bone", lang),
+            default="",
+        ),
+        "head_camera_offset_x": FloatProperty(
+            name="Camera Offset X", default=0.0,
+            description=tr("rigger.prop.ik_chain_head_camera_offset_x", lang),
+        ),
+        "head_camera_offset_y": FloatProperty(
+            name="Camera Offset Y", default=0.0,
+            description=tr("rigger.prop.ik_chain_head_camera_offset_y", lang),
+        ),
+        "head_camera_offset_z": FloatProperty(
+            name="Camera Offset Z", default=0.0,
+            description=tr("rigger.prop.ik_chain_head_camera_offset_z", lang),
+        ),
+        "head_camera_rotation_x": FloatProperty(
+            name="Camera Rotation X (deg)", default=0.0,
+            description=tr("rigger.prop.ik_chain_head_camera_rotation_x", lang),
+        ),
+        "head_camera_rotation_y": FloatProperty(
+            name="Camera Rotation Y (deg)", default=180.0,
+            description=tr("rigger.prop.ik_chain_head_camera_rotation_y", lang),
+        ),
+        "head_camera_rotation_z": FloatProperty(
+            name="Camera Rotation Z (deg)", default=0.0,
+            description=tr("rigger.prop.ik_chain_head_camera_rotation_z", lang),
+        ),
+        "head_camera_fov": FloatProperty(
+            name="Camera FOV (deg)", default=90.0, min=1.0, max=179.0,
+            description=tr("rigger.prop.ik_chain_head_camera_fov", lang),
+        ),
+        "attachments_count": IntProperty(
+            name="Attachments Bones Amount",
+            description=tr("rigger.prop.ik_chain_attachments_count", lang).format(max=ATTACHMENTS_MAX_COUNT),
+            default=1, min=0, max=ATTACHMENTS_MAX_COUNT,
+        ),
+    }
     for _i in range(1, ATTACHMENTS_MAX_COUNT + 1):
-        __annotations__[f"attachment_bone_{_i}"] = StringProperty(
+        props[f"attachment_bone_{_i}"] = StringProperty(
             name="Attachment" if _i == 1 else f"Attachment {_i}",
-            description="Original bone name" + _HEAD_SPINE_FIELD_HINT,
+            description=tr("rigger.prop.ik_chain_org_bone_name_hint", lang),
             default="",
         )
-    del _i
-    # v0.10 -- campos exclusivos de TEXTURE_PICKER (era MOUTH até v0.10,
-    # renomeado na v0.11 -- ver DEVELOPER_NOTES.md). Só 1 bone (diferente de
-    # ATTACHMENTS, que aceita vários) -- um personagem tem no máximo um
-    # picker por entrada. Não cria bone nenhum sozinho (mesmo espírito de HEAD/SPINE/
-    # ATTACHMENTS -- ver _head_spine_bone_names) -- quem cria bone é o
-    # botão "Create Texture Picker" (RIG_OT_hytale_texture_picker_create),
-    # separado do "Create Rig" principal, porque depende de digitar o
-    # grid da textura (pode precisar rodar de novo independente
-    # do resto do rig).
-    texture_picker_bone: StringProperty(
-        name="Target Bone",
-        description="The bone whose mesh has the texture atlas (e.g. all the mouth expressions in one image)" + _HEAD_SPINE_FIELD_HINT,
-        default="",
-    )
-    # v0.10.5 -- separado de texture_picker_bone: testando, apareceu um caso onde
-    # a malha/textura fica pesada num bone (ex. "Mouth"), mas o
-    # root.ui precisa ser parentado em OUTRO bone (ex. um attachment
-    # point dedicado, "Mouth1:Mouth-Attachment") -- nem sempre é o
-    # mesmo bone. Vazio = usa texture_picker_bone (comportamento de antes,
-    # continua funcionando pro caso comum onde os dois são iguais).
-    texture_picker_ui_parent_bone: StringProperty(
-        name="Root Bone",
-        description="Only needed if the picker should attach somewhere other than Target Bone. Leave "
-        "empty in most cases" + _HEAD_SPINE_FIELD_HINT,
-        default="",
-    )
-    texture_picker_plane_scale: FloatProperty(
-        name="Atlas Plane Scale",
-        description="Size of the reference image shown in the viewport for picking. Doesn't affect the "
-        "exported animation",
-        default=1.0, min=0.001,
-    )
-    # v0.10.3 -- ajuste fino manual da posição do plane de referência,
-    # em cima do que _build_texture_picker já calcula sozinho (offset pela
-    # UV de repouso da malha -- ver _get_texture_picker_mesh_rest_uv). Precisou
-    # existir porque, testando no Blender, ainda sobrava um resíduo que
-    # não bati matematicamente sem ver ao vivo (documentado na conversa
-    # com o usuário) -- fica salvo por entrada, então uma vez ajustado
-    # pra um personagem, "Create Texture Picker" continua aplicando sem
-    # precisar repetir o ajuste.
-    texture_picker_plane_offset_x: FloatProperty(
-        name="Atlas Plane Offset X", default=0.0,
-        description="Nudge the reference image left/right, if it isn't lined up right",
-    )
-    texture_picker_plane_offset_y: FloatProperty(
-        name="Atlas Plane Offset Y", default=0.0,
-        description="Nudge the reference image up/down, if it isn't lined up right",
-    )
-    # v0.10.12 -- Manual Grid, que virou a ÚNICA forma de informar o
-    # grid (v0.11 removeu de vez a detecção automática por alpha --
-    # decisão de produto, não só técnica: já tinha se provado frágil em
-    # mais de um personagem real -- atlas embutido numa textura maior
-    # sempre dava 1x1, e ícones com largura visual desigual dentro de
-    # células uniformes davam medição errada mesmo restringindo a
-    # região de busca; ver DEVELOPER_NOTES.md/histórico pros detalhes
-    # de como isso foi confirmado. O usuário informa direto o tamanho
-    # de célula (pitch) e quantas colunas/linhas existem, do jeito que
-    # ele já vê no Blockbench. Não precisa de X/Y de origem -- todo o
-    # resto do sistema (driver, Limit Location, plane) já opera por
-    # DESLOCAMENTO relativo à pose de repouso (a célula que a malha já
-    # mostra sem nenhum offset -- ver comentário grande no topo desta
-    # seção), nunca por posição absoluta na textura.
-    texture_picker_grid_cols: IntProperty(
-        name="Grid Columns",
-        description="How many texture-atlas cells across (left to right)",
-        default=1, min=1,
-    )
-    texture_picker_grid_rows: IntProperty(
-        name="Grid Rows",
-        description="How many rows of texture-atlas cells -- usually 1",
-        default=1, min=1,
-    )
-    texture_picker_grid_cell_width: IntProperty(
-        name="Cell Width",
-        description="Pixel distance from one texture-atlas cell to the next, as seen in Blockbench",
-        default=16, min=1,
-    )
-    texture_picker_grid_cell_height: IntProperty(
-        name="Cell Height",
-        description="Pixel distance between rows of texture-atlas cells. Doesn't matter if Rows is 1",
-        default=16, min=1,
-    )
-    # v0.14 -- "Crop Texture" REMOVIDO na v0.15.2 (pedido explícito do
-    # usuário): a ideia era mostrar só a região do grid no plane de
-    # referência em vez do atlas inteiro. A matemática de tamanho foi
-    # CONFIRMADA correta por medição direta no Blender (Dimensions do
-    # plane bateram exatamente com o esperado, 0.25/0.046875 -- ver
-    # histórico do chat), mas o resultado visual final não bateu com o
-    # que o usuário queria mesmo assim, e não convergiu depois de
-    # várias rodadas de ajuste remoto -- decisão foi voltar pro fluxo
-    # manual (usuário edita a malha do plane à mão, cortando as faces
-    # de fora, como já fazia antes desse recurso existir). Se for
-    # reintroduzido no futuro, vale considerar que o problema pode não
-    # ser a MATEMÁTICA da malha em si, e sim como ela se relaciona com
-    # o zoom do viewport/escala do personagem na hora de comparar.
-    # v0.10.13 -- Companion Bones: pra personagens cujo alvo animado é
-    # composto por mais de uma malha/bone que precisam mudar de
-    # expressão JUNTOS (ex.: metades L/R espelhadas se encontrando no
-    # meio -- caso testado ao vivo, confirmado funcionando). Target Bone
-    # continua sendo o único usado pra detecção de grid/Manual Grid e
-    # pro plane de referência (só existe UM picker visual); os
-    # companions só recebem material+driver de UV, reaproveitando o
-    # MESMO grid/step calculado pro principal -- ver
-    # _apply_texture_picker_to_companion. Mesmo mecanismo de lista em loop
-    # que ATTACHMENTS (attachment_bone_1..N) usa, com teto BEM menor
-    # (TEXTURE_PICKER_EXTRA_BONES_MAX_COUNT -- ver rigger/constants.py), porque
-    # raramente são mais de 2-3 malhas separadas.
-    texture_picker_extra_bone_count: IntProperty(
-        name="Companion Bones Amount",
-        description=f"How many other bones share this target's texture and should move together with it "
-        f"(0-{TEXTURE_PICKER_EXTRA_BONES_MAX_COUNT})",
-        default=0, min=0, max=TEXTURE_PICKER_EXTRA_BONES_MAX_COUNT,
-    )
+    props.update({
+        "texture_picker_bone": StringProperty(
+            name="Target Bone",
+            description=tr("rigger.prop.ik_chain_texture_picker_bone", lang),
+            default="",
+        ),
+        "texture_picker_ui_parent_bone": StringProperty(
+            name="Root Bone",
+            description=tr("rigger.prop.ik_chain_texture_picker_ui_parent_bone", lang),
+            default="",
+        ),
+        "texture_picker_plane_scale": FloatProperty(
+            name="Atlas Plane Scale",
+            description=tr("rigger.prop.ik_chain_texture_picker_plane_scale", lang),
+            default=1.0, min=0.001,
+        ),
+        "texture_picker_plane_offset_x": FloatProperty(
+            name="Atlas Plane Offset X", default=0.0,
+            description=tr("rigger.prop.ik_chain_texture_picker_plane_offset_x", lang),
+        ),
+        "texture_picker_plane_offset_y": FloatProperty(
+            name="Atlas Plane Offset Y", default=0.0,
+            description=tr("rigger.prop.ik_chain_texture_picker_plane_offset_y", lang),
+        ),
+        "texture_picker_grid_cols": IntProperty(
+            name="Grid Columns",
+            description=tr("rigger.prop.ik_chain_texture_picker_grid_cols", lang),
+            default=1, min=1,
+        ),
+        "texture_picker_grid_rows": IntProperty(
+            name="Grid Rows",
+            description=tr("rigger.prop.ik_chain_texture_picker_grid_rows", lang),
+            default=1, min=1,
+        ),
+        "texture_picker_grid_cell_width": IntProperty(
+            name="Cell Width",
+            description=tr("rigger.prop.ik_chain_texture_picker_grid_cell_width", lang),
+            default=16, min=1,
+        ),
+        "texture_picker_grid_cell_height": IntProperty(
+            name="Cell Height",
+            description=tr("rigger.prop.ik_chain_texture_picker_grid_cell_height", lang),
+            default=16, min=1,
+        ),
+        "texture_picker_extra_bone_count": IntProperty(
+            name="Companion Bones Amount",
+            description=tr("rigger.prop.ik_chain_texture_picker_extra_bone_count", lang).format(
+                max=TEXTURE_PICKER_EXTRA_BONES_MAX_COUNT
+            ),
+            default=0, min=0, max=TEXTURE_PICKER_EXTRA_BONES_MAX_COUNT,
+        ),
+    })
     for _i in range(1, TEXTURE_PICKER_EXTRA_BONES_MAX_COUNT + 1):
-        __annotations__[f"texture_picker_extra_bone_{_i}"] = StringProperty(
+        props[f"texture_picker_extra_bone_{_i}"] = StringProperty(
             name="Companion Bone" if _i == 1 else f"Companion Bone {_i}",
-            description="Another bone whose mesh shares this same mouth texture (e.g. a mirrored left/"
-            "right half) and should change expression together with Target Bone" + _HEAD_SPINE_FIELD_HINT,
+            description=tr("rigger.prop.ik_chain_texture_picker_extra_bone", lang),
             default="",
         )
-    del _i
-    # v0.9 -- Collection Settings (Etapa 1, Tail incluído na Etapa 3 --
-    # nenhum tipo fica travado numa collection fixa, pedido explícito).
-    # EnumProperty com `items` dinâmico (função, não lista fixa) --
-    # populado a partir de armature.hytale_bone_collections (a lista
-    # editável da nova box "Collection Settings"), pra sempre refletir o
-    # que existe HOJE nesse armature, sem precisar duplicar/sincronizar
-    # nomes na mão. Identificador COLLECTION_OVERRIDE_AUTO ("AUTO") =
-    # comportamento antigo (cai na collection fixa Arm L/Arm R/Leg L/
-    # Leg R/Main/Tail, exatamente como antes desta feature existir) --
-    # ver _apply_bone_collection_overrides. v0.9.3: era string VAZIA
-    # ("") antes -- trocado porque um item de EnumProperty dinâmico com
-    # identificador "" faz o próprio botão do dropdown mostrar em
-    # branco no Blender (bug relatado: "quando está vazio, fica
-    # literalmente vazio").
-    #
-    # ATENÇÃO Blender: a função abaixo NÃO pode devolver uma lista nova
-    # a cada chamada -- o Blender só garante que as strings dos itens
-    # ficam vivas enquanto o mesmo objeto Python list que as contém
-    # também ficar vivo; devolver uma lista recém-criada toda vez é a
-    # causa mais comum de crash com EnumProperty dinâmico. Por isso
-    # _bone_collection_enum_items reaproveita (limpa + repopula) o MESMO
-    # objeto _bone_collection_enum_cache, em vez de `return [...]`.
-    #
-    # v0.9.4 -- FIX registro: "default" de um EnumProperty com `items`
-    # DINÂMICO (função) só pode ser ÍNDICE (int), NUNCA string --
-    # limitação documentada da própria API do Blender ("Strings cannot
-    # be specified for dynamic enums"). Passar default=COLLECTION_OVERRIDE_AUTO
-    # (string) foi exatamente a causa do erro "'collection_override'
-    # EnumProperty could not register" -- default=0 funciona porque
-    # _bone_collection_enum_items SEMPRE devolve COLLECTION_OVERRIDE_AUTO
-    # como primeiro item (índice 0), então o efeito é idêntico.
-    collection_override: EnumProperty(
-        name="Collection",
-        description="Which bone collection this chain's bones go into (Main or Face, as organized in "
-        "'Collection Settings'). 'Auto (default)' keeps the built-in behavior -- Arm L/Arm R/Leg L/Leg R",
-        items=_bone_collection_enum_items,
-        default=0,
+    # v0.13.5 -- guarda o valor de VERDADE (nome, imune a reordenação de
+    # Collection Settings -- ver comentário grande em cima de
+    # _collection_override_get/_collection_override_set). Nunca
+    # desenhada na UI (interface.py só usa "collection_override");
+    # existe só pra collection_override ler/escrever nela por baixo.
+    props["collection_override_name"] = StringProperty(
+        name="Collection (internal)",
+        description="Internal storage for the Collection override -- not shown in the UI.",
+        default=COLLECTION_OVERRIDE_AUTO,
+        options={"HIDDEN"},
     )
+    props["collection_override"] = EnumProperty(
+        name="Collection",
+        description=tr("rigger.prop.ik_chain_collection_override", lang),
+        items=_bone_collection_enum_items,
+        get=_collection_override_get,
+        set=_collection_override_set,
+    )
+    return props
+
+
+@localized_props(_ik_chain_item_props)
+class HytaleIKChainItem(PropertyGroup):
+    pass
 
 
 
@@ -3127,7 +3650,7 @@ class RIG_OT_hytale_ik_chain_add(Operator):
 
     bl_idname = "armature.hytale_ik_chain_add"
     bl_label = "Add Hytale Bone Setting"
-    bl_description = "Add an empty entry (Arm/Leg/Tail/Head/Spine) to the list"
+    description = tooltip("rigger.tooltip.ik_chain_add")
     bl_options = {"REGISTER", "UNDO"}
 
     chain_type: StringProperty(default="ARM")
@@ -3145,8 +3668,8 @@ class RIG_OT_hytale_ik_chain_add(Operator):
         # como texto fixo; valida contra os valores conhecidos do Enum
         # real (item.chain_type) antes de atribuir, pra nunca deixar a
         # entrada num estado inválido se o menu mandar algo inesperado.
-        item.chain_type = self.chain_type if self.chain_type in {"ARM", "LEG", "TAIL", "HEAD", "SPINE", "ATTACHMENTS", "TEXTURE_PICKER"} else "ARM"
-        prefix = {"ARM": "Arm", "LEG": "Leg", "TAIL": "Tail", "HEAD": "Head", "SPINE": "Spine", "ATTACHMENTS": "Attachments", "TEXTURE_PICKER": "Texture Picker"}.get(item.chain_type, "Chain")
+        item.chain_type = self.chain_type if self.chain_type in {"ARM", "LEG", "CHAIN", "HEAD", "SPINE", "ATTACHMENTS", "TEXTURE_PICKER"} else "ARM"
+        prefix = {"ARM": "Arm", "LEG": "Leg", "CHAIN": "Chain", "HEAD": "Head", "SPINE": "Spine", "ATTACHMENTS": "Attachments", "TEXTURE_PICKER": "Texture Picker"}.get(item.chain_type, "Chain")
         # v0.13 -- só ganha sufixo ".001" se JÁ existir outro item com esse
         # label exato (ver _unique_bone_setting_label) -- antes usava
         # sempre `len(chains)` cru, então o primeiro "Head" adicionado
@@ -3185,6 +3708,18 @@ class RIG_MT_hytale_ik_chain_add_menu(Menu):
 
     bl_idname = "RIG_MT_hytale_ik_chain_add_menu"
     bl_label = "Add Bone Setting"
+    # v0.14 -- description = tooltip(...) igual Operator (ver tooltip()
+    # em translations/__init__.py). bpy.types.Menu tem bl_description
+    # como atributo real desde versões antigas do Blender, mas NÃO
+    # confirmei com certeza absoluta (sem Blender de verdade pra testar)
+    # se o classmethod description() dinâmico -- que funciona pra
+    # Operator -- também é honrado pra Menu. Testar isto especificamente
+    # depois de instalar: passe o mouse no botão "+" de Bone Settings e
+    # troque o idioma. Sem risco de regressão -- antes disto o botão já
+    # não tinha bl_description nenhum (usava o operador nativo
+    # wm.call_menu em interface.py, tooltip genérico do próprio
+    # Blender) -- ver draw code trocado em interface.py.
+    description = tooltip("rigger.tooltip.ik_chain_add_menu")
 
     def draw(self, context):
         layout = self.layout
@@ -3205,8 +3740,8 @@ class RIG_MT_hytale_ik_chain_add_menu(Menu):
             RIG_OT_hytale_ik_chain_add.bl_idname, text="Leg", icon="CON_KINEMATIC"
         ).chain_type = "LEG"
         layout.operator(
-            RIG_OT_hytale_ik_chain_add.bl_idname, text="Tail", icon="PHYSICS"
-        ).chain_type = "TAIL"
+            RIG_OT_hytale_ik_chain_add.bl_idname, text="Chain", icon="PHYSICS"
+        ).chain_type = "CHAIN"
         layout.operator(
             RIG_OT_hytale_ik_chain_add.bl_idname, text="Attachments", icon="LINKED"
         ).chain_type = "ATTACHMENTS"
@@ -3220,7 +3755,7 @@ class RIG_OT_hytale_ik_chain_remove(Operator):
 
     bl_idname = "armature.hytale_ik_chain_remove"
     bl_label = "Remove Hytale IK Chain"
-    bl_description = "Remove the selected IK chain from the list"
+    description = tooltip("rigger.tooltip.ik_chain_remove")
     bl_options = {"REGISTER", "UNDO"}
 
     index: IntProperty(default=-1)
@@ -3241,6 +3776,19 @@ class RIG_OT_hytale_ik_chain_remove(Operator):
         return {"FINISHED"}
 
 
+def _ik_chain_move_props(lang):
+    return {
+        "direction": EnumProperty(
+            items=(
+                ("UP", "Up", tr("rigger.prop.ik_chain_move_direction_item_up", lang)),
+                ("DOWN", "Down", tr("rigger.prop.ik_chain_move_direction_item_down", lang)),
+            ),
+            default="UP",
+        ),
+    }
+
+
+@localized_props(_ik_chain_move_props)
 class RIG_OT_hytale_ik_chain_move(Operator):
     """Reordena uma entrada da lista (armature.hytale_ik_chains) uma
     posição pra cima ou pra baixo, via CollectionProperty.move() --
@@ -3255,16 +3803,8 @@ class RIG_OT_hytale_ik_chain_move(Operator):
 
     bl_idname = "armature.hytale_ik_chain_move"
     bl_label = "Move Hytale Bone Setting"
-    bl_description = "Move the selected entry up or down in the list"
+    description = tooltip("rigger.tooltip.ik_chain_move")
     bl_options = {"REGISTER", "UNDO"}
-
-    direction: EnumProperty(
-        items=(
-            ("UP", "Up", "Move the entry one position up"),
-            ("DOWN", "Down", "Move the entry one position down"),
-        ),
-        default="UP",
-    )
 
     @classmethod
     def poll(cls, context):
@@ -3293,14 +3833,16 @@ class RIG_OT_hytale_ik_chain_set_count(Operator):
     a quantidade de uma vez. `chain_type` (v0.8) alinha o que este
     operador cria com RIG_MT_hytale_ik_chain_add_menu/RIG_OT_hytale_ik_chain_add
     acima: mesma validação (cai pra "ARM" se vier algo fora de ARM/LEG/
-    TAIL) e mesmo prefixo de label ("Arm N"/"Leg N"/"Tail N", não mais o
-    "Chain N" genérico de antes, que também nunca setava chain_type
-    nenhum -- item novo ficava com o default ARM do Enum, mas rotulado
-    "Chain", inconsistente com o próprio tipo que acabou de receber)."""
+    CHAIN) e mesmo prefixo de label por tipo ("Arm N"/"Leg N"/"Chain N",
+    identificador CHAIN -- ver v0.7.14 no changelog, ERA "TAIL" -- não
+    mais um "Chain N" genérico de antes usado pra QUALQUER tipo, que
+    também nunca setava chain_type nenhum -- item novo ficava com o
+    default ARM do Enum, mas rotulado "Chain", inconsistente com o
+    próprio tipo que acabou de receber)."""
 
     bl_idname = "armature.hytale_ik_chain_set_count"
     bl_label = "Set Hytale IK Chain Count"
-    bl_description = "Set the exact number of IK chains in the list, adding or removing at the end"
+    description = tooltip("rigger.tooltip.ik_chain_set_count")
     bl_options = {"REGISTER", "UNDO"}
 
     count: IntProperty(name="Amount", default=1, min=0)
@@ -3314,8 +3856,8 @@ class RIG_OT_hytale_ik_chain_set_count(Operator):
     def execute(self, context):
         armature = context.active_object.data
         chains = armature.hytale_ik_chains
-        chain_type = self.chain_type if self.chain_type in {"ARM", "LEG", "TAIL", "HEAD", "SPINE", "ATTACHMENTS", "TEXTURE_PICKER"} else "ARM"
-        prefix = {"ARM": "Arm", "LEG": "Leg", "TAIL": "Tail", "HEAD": "Head", "SPINE": "Spine", "ATTACHMENTS": "Attachments", "TEXTURE_PICKER": "Texture Picker"}.get(chain_type, "Chain")
+        chain_type = self.chain_type if self.chain_type in {"ARM", "LEG", "CHAIN", "HEAD", "SPINE", "ATTACHMENTS", "TEXTURE_PICKER"} else "ARM"
+        prefix = {"ARM": "Arm", "LEG": "Leg", "CHAIN": "Chain", "HEAD": "Head", "SPINE": "Spine", "ATTACHMENTS": "Attachments", "TEXTURE_PICKER": "Texture Picker"}.get(chain_type, "Chain")
         while len(chains) < self.count:
             item = chains.add()
             item.chain_type = chain_type
@@ -3340,7 +3882,7 @@ class RIG_OT_hytale_ik_chain_pick_bone(Operator):
 
     bl_idname = "armature.hytale_ik_chain_pick_bone"
     bl_label = "Pick Bone From Selection"
-    bl_description = "Copy the currently selected bone's name into this field"
+    description = tooltip("rigger.tooltip.ik_chain_pick_bone")
     bl_options = {"REGISTER", "UNDO"}
 
     chain_index: IntProperty(default=-1)
@@ -3403,6 +3945,393 @@ class RIG_OT_hytale_ik_chain_pick_bone(Operator):
         return {"FINISHED"}
 
 
+# ---------------------------------------------------------------------------
+# Auto-Detect Bones (novo) -- heurística de nomenclatura pra preencher
+# Bone Settings sozinho num armature QUALQUER, sem depender de um rig
+# template calibrado pra aquele personagem específico (diferente de
+# RIG_OT_hytale_ik_chain_load_defaults acima, que exige um .json feito
+# pra ESSE personagem exato) -- os dois se complementam: Load Defaults é
+# "eu sei exatamente que personagem é esse", Auto-Detect é "eu não sei,
+# tenta adivinhar". Cobre só os 6 slots mais comuns e mais previsíveis
+# por nome (Head, Spine, Arm L/R, Leg L/R) -- Tail/Attachments/Texture
+# Picker dependem demais do personagem específico pra ter heurística de
+# nome confiável, ficam de fora de propósito (usuário configura à mão).
+# ---------------------------------------------------------------------------
+
+# "L-"/"R-" é a convenção confirmada (ver templates/rig/rig_player.json)
+# -- os outros tokens são fallback pra mods que não seguem exatamente
+# essa convenção. Ordem importa dentro de cada lista (mais específico
+# primeiro).
+_AUTO_DETECT_SIDE_PREFIXES = (
+    ("l-", "LEFT"), ("r-", "RIGHT"),
+    ("left_", "LEFT"), ("right_", "RIGHT"),
+    ("left-", "LEFT"), ("right-", "RIGHT"),
+    ("l_", "LEFT"), ("r_", "RIGHT"),
+)
+_AUTO_DETECT_SIDE_SUFFIXES = (
+    ("_left", "LEFT"), ("_right", "RIGHT"),
+    (".l", "LEFT"), (".r", "RIGHT"),
+    ("_l", "LEFT"), ("_r", "RIGHT"),
+)
+
+
+def _auto_detect_split_side(bone_name):
+    """Devolve (side, base) -- side em {"LEFT", "RIGHT", None}, base =
+    nome do bone sem o token de lado, em minúsculo, só pra COMPARAR
+    (nunca usado como nome de bone de verdade -- o nome ORIGINAL entra
+    inteiro nos campos do item). Ex.: "L-Forearm" -> ("LEFT",
+    "forearm"). Bone sem prefixo/sufixo de lado reconhecido -> (None,
+    nome inteiro em minúsculo)."""
+    lower = bone_name.lower()
+    for token, side in _AUTO_DETECT_SIDE_PREFIXES:
+        if lower.startswith(token):
+            return side, lower[len(token):]
+    for token, side in _AUTO_DETECT_SIDE_SUFFIXES:
+        if lower.endswith(token):
+            return side, lower[: -len(token)]
+    return None, lower
+
+
+def _auto_detect_is_excluded_bone(name):
+    """True pra bone que NUNCA deve entrar como candidato de Bone
+    Settings -- já gerado por um "Create Rig" anterior (sufixo _CTRL/
+    _MCH/_IK) ou attachment (ATTACHMENT_NAME_HINT no nome). Usada tanto
+    por _auto_detect_candidates (varredura plana) quanto por
+    _auto_detect_walk_down/_walk_up (varredura de hierarquia) -- as
+    duas precisam da MESMA regra de exclusão, senão a varredura de
+    hierarquia (que anda em bone.children/.parent direto, não na lista
+    já filtrada) acaba puxando um attachment pendurado no meio da
+    coluna/pescoço pra dentro da cadeia (ex.: um "ChestplateAttachment"
+    filho de Chest vira "spine_bone_3" por engano)."""
+    lower = name.lower()
+    if name.endswith(SUFFIX_CTRL) or name.endswith(SUFFIX_MCH) or name.endswith(SUFFIX_IK):
+        return True
+    return ATTACHMENT_NAME_HINT in lower
+
+
+def _auto_detect_candidates(armature_data):
+    """Varre armature_data.bones (só ORG -- ver
+    _auto_detect_is_excluded_bone) e devolve uma lista de (bone_name,
+    side, base) -- base já passou por _auto_detect_split_side, pronta
+    pra bater contra palavra-chave via `in`."""
+    out = []
+    for bone in armature_data.bones:
+        name = bone.name
+        if _auto_detect_is_excluded_bone(name):
+            continue
+        side, base = _auto_detect_split_side(name)
+        out.append((name, side, base))
+    return out
+
+
+def _auto_detect_pick(candidates, keywords, exclude_keywords=(), side=None):
+    """Primeiro candidato cujo `base` contenha alguma palavra de
+    `keywords` (e NENHUMA de `exclude_keywords`) -- side=None casa
+    candidato de QUALQUER lado (inclusive sem lado nenhum -- usado pra
+    bones tipo Pelvis/Head, que normalmente não têm token de lado).
+    Prioriza candidato cujo `base` seja EXATAMENTE a keyword (match mais
+    limpo, ex. "arm") antes de aceitar substring solta (ex.
+    "upperarmtwist") -- assim um nome mais "normal" sempre vence um
+    nome mais estranho quando os dois batem."""
+    exact = None
+    loose = None
+    for name, cand_side, base in candidates:
+        if side is not None and cand_side != side:
+            continue
+        if any(bad in base for bad in exclude_keywords):
+            continue
+        for kw in keywords:
+            if base == kw:
+                if exact is None:
+                    exact = name
+                break
+            if kw in base:
+                if loose is None:
+                    loose = name
+                break
+    return exact or loose
+
+
+def _auto_detect_pick_multi(candidates, keywords, exclude_keywords=(), side=None):
+    """Todos os candidatos que batem (mesma regra de _auto_detect_pick),
+    nomes só, sem duplicar -- usado como FALLBACK pra Neck/Spine quando
+    a varredura de hierarquia (_auto_detect_walk_up/_down, abaixo) não
+    encontra nada (esqueleto sem o parentesco esperado)."""
+    found = []
+    seen = set()
+    for name, cand_side, base in candidates:
+        if side is not None and cand_side != side:
+            continue
+        if any(bad in base for bad in exclude_keywords):
+            continue
+        if any(kw in base for kw in keywords) and name not in seen:
+            found.append(name)
+            seen.add(name)
+    return found
+
+
+def _auto_detect_natural_sort_key(name):
+    """"Spine2" antes de "Spine10" (não como string pura) -- usado só
+    pelo fallback de nome (_auto_detect_pick_multi), quando a varredura
+    de hierarquia não achou nada pra ordenar de verdade."""
+    return [int(tok) if tok.isdigit() else tok.lower() for tok in re.split(r"(\d+)", name)]
+
+
+def _auto_detect_walk_down(bone, keywords, exclude_keywords=()):
+    """A partir de `bone` (NÃO incluído no resultado), desce filho a
+    filho sempre escolhendo o primeiro filho cujo nome bata com
+    `keywords` (e nenhuma de `exclude_keywords`) -- pra cadeias
+    lineares tipo Pelvis -> Belly -> Chest. Devolve a lista de nomes na
+    ordem raiz -> ponta (a ordem que spine_bone_1/2/3/4 espera). Muito
+    mais confiável que ordenar por texto quando o personagem não numera
+    os bones (ex. "Belly"/"Chest" sem número nenhum)."""
+    out = []
+    node = bone
+    while node is not None:
+        nxt = None
+        for child in node.children:
+            if _auto_detect_is_excluded_bone(child.name):
+                continue
+            child_base = child.name.lower()
+            if any(bad in child_base for bad in exclude_keywords):
+                continue
+            if any(kw in child_base for kw in keywords):
+                nxt = child
+                break
+        if nxt is None:
+            break
+        out.append(nxt.name)
+        node = nxt
+    return out
+
+
+def _auto_detect_walk_up(bone, keywords, exclude_keywords=()):
+    """Espelho de _auto_detect_walk_down, subindo por .parent em vez de
+    descer por .children -- a partir do PAI de `bone` (não inclui
+    `bone` em si), sobe enquanto o nome do pai bater com `keywords`.
+    Usada pra Neck: sobe a partir do Head até parar de achar "neck",
+    depois inverte pra devolver na ordem raiz -> ponta (o Neck mais
+    perto do peito primeiro, o mais perto da cabeça por último)."""
+    out = []
+    node = bone.parent if bone is not None else None
+    while node is not None:
+        if _auto_detect_is_excluded_bone(node.name):
+            break
+        base = node.name.lower()
+        if any(bad in base for bad in exclude_keywords):
+            break
+        if not any(kw in base for kw in keywords):
+            break
+        out.append(node.name)
+        node = node.parent
+    out.reverse()
+    return out
+
+
+def _auto_detect_bone_settings(armature_data):
+    """Devolve um dict com o melhor palpite pra cada slot reconhecido --
+    chaves "HEAD"/"SPINE" (sem lado) ou ("ARM"/"LEG", "LEFT"/"RIGHT")
+    (por lado) -- cada valor é um dict {nome_do_campo: valor} pronto pra
+    jogar em setattr(item, campo, valor). Só inclui uma entrada se o
+    bone PRINCIPAL daquele slot foi encontrado (head_bone pra Head,
+    pelvis e/ou 1 segmento de coluna pra Spine, root+tip pra Arm/Leg) --
+    nunca devolve uma entrada vazia. Pura leitura (não mexe em
+    armature.hytale_ik_chains nenhum) -- quem decide o que fazer com o
+    resultado é o Operator abaixo."""
+    candidates = _auto_detect_candidates(armature_data)
+    bones = armature_data.bones
+    results = {}
+
+    # --- Head / Neck --------------------------------------------------
+    head_name = _auto_detect_pick(candidates, ("head",), exclude_keywords=("forehead",))
+    if head_name:
+        entry = {"head_bone": head_name}
+        head_bone_obj = bones.get(head_name)
+        neck_names = _auto_detect_walk_up(head_bone_obj, ("neck",)) if head_bone_obj else []
+        if not neck_names:
+            neck_names = sorted(
+                _auto_detect_pick_multi(candidates, ("neck",)),
+                key=_auto_detect_natural_sort_key,
+            )
+        for i, n in enumerate(neck_names[:5], start=1):
+            entry[f"neck_bone_{i}"] = n
+        if neck_names:
+            entry["neck_count"] = min(len(neck_names), 5)
+        results["HEAD"] = entry
+
+    # --- Spine ----------------------------------------------------------
+    pelvis_name = _auto_detect_pick(candidates, ("pelvis", "hips", "hip"))
+    spine_names = []
+    if pelvis_name:
+        pelvis_obj = bones.get(pelvis_name)
+        if pelvis_obj is not None:
+            spine_names = _auto_detect_walk_down(pelvis_obj, ("spine", "belly", "chest", "torso"))
+    if not spine_names:
+        spine_names = sorted(
+            _auto_detect_pick_multi(candidates, ("spine", "belly", "chest", "torso")),
+            key=_auto_detect_natural_sort_key,
+        )
+    if pelvis_name or spine_names:
+        entry = {}
+        if pelvis_name:
+            entry["pelvis_bone"] = pelvis_name
+        for i, n in enumerate(spine_names[:4], start=1):
+            entry[f"spine_bone_{i}"] = n
+        if pelvis_name or spine_names:
+            # spine_count conta o Pelvis JUNTO (ver _head_spine_bone_names) --
+            # 1 (pelvis, se achado) + segmentos encontrados, respeitando o
+            # teto de 5 do campo (1 pelvis + até 4 spine_bone_*).
+            entry["spine_count"] = max(1, (1 if pelvis_name else 0) + min(len(spine_names), 4))
+        results["SPINE"] = entry
+
+    # --- Arm / Leg, por lado ---------------------------------------------
+    # exclude_keywords aqui não é só pra separar forearm/hand de arm (ver
+    # abaixo) -- também evita que um bone de EQUIPAMENTO/prop com nome
+    # parecido (ex. "L-Handle" de arma, "L-Armor"/"L-Pauldron" de peça de
+    # armadura) roube a vaga de um match "solto" quando não existe (ainda)
+    # nenhum bone "Hand"/"Arm" exato pra ganhar por prioridade -- ver
+    # _auto_detect_pick, que já prioriza match EXATO sobre substring
+    # solta, mas só quando o exato existe.
+    for side in ("LEFT", "RIGHT"):
+        forearm = _auto_detect_pick(candidates, ("forearm", "lowerarm"), side=side)
+        hand = _auto_detect_pick(candidates, ("hand",), exclude_keywords=("handle",), side=side)
+        arm = _auto_detect_pick(
+            candidates, ("upperarm", "arm"),
+            exclude_keywords=("forearm", "lowerarm", "armor", "armour"), side=side,
+        )
+        if arm and hand:
+            entry = {"root_bone": arm, "tip_bone": hand, "side": side}
+            if forearm:
+                entry["pole_bone"] = forearm
+            shoulder = _auto_detect_pick(candidates, ("shoulder", "clavicle"), side=side)
+            if shoulder:
+                entry["parent_override"] = shoulder
+            results[("ARM", side)] = entry
+
+        calf = _auto_detect_pick(candidates, ("calf", "shin", "lowerleg", "knee"), side=side)
+        foot = _auto_detect_pick(candidates, ("foot", "feet"), side=side)
+        thigh = _auto_detect_pick(
+            candidates, ("thigh", "upperleg", "leg"),
+            exclude_keywords=("calf", "shin", "lowerleg"), side=side,
+        )
+        if thigh and foot:
+            entry = {"root_bone": thigh, "tip_bone": foot, "side": side}
+            if calf:
+                entry["pole_bone"] = calf
+            if pelvis_name:
+                # v0.6/_resolve_parent_override: nome ORG puro, sem
+                # sufixo "_CTRL" -- a resolução em tempo de "Create Rig"
+                # já sabe achar o "_CTRL" gerado a partir daqui (ver
+                # comentário grande em _resolve_parent_override).
+                entry["parent_override"] = pelvis_name
+            results[("LEG", side)] = entry
+
+    return results
+
+
+class RIG_OT_hytale_ik_chain_auto_detect(Operator):
+    """Varre os bones ORG do armature ativo e tenta preencher Bone
+    Settings sozinho pros 6 slots mais comuns (Head, Spine, Arm L/R, Leg
+    L/R), usando palavras-chave de nomenclatura comuns (Head/Neck;
+    Pelvis/Spine/Belly/Chest; Shoulder/Arm/Forearm/Hand;
+    Thigh/Calf/Foot) + prefixo/sufixo de lado ("L-"/"R-" é o principal,
+    ver _AUTO_DETECT_SIDE_PREFIXES, com alguns fallbacks pra mods que
+    nomeiam diferente). Puramente heurístico -- não substitui revisão
+    manual, só poupa digitação no caso comum; sempre confira os campos
+    preenchidos antes de "Create Rig". NUNCA sobrescreve uma entrada já
+    existente do mesmo tipo (e do mesmo lado, pra Arm/Leg) -- roda de
+    novo com segurança depois de ajustes manuais, só preenche o que
+    ainda falta."""
+
+    bl_idname = "armature.hytale_ik_chain_auto_detect"
+    bl_label = "Auto-Detect Bone Settings"
+    description = tooltip("rigger.tooltip.ik_chain_auto_detect")
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == "ARMATURE"
+
+    def execute(self, context):
+        armature = context.active_object.data
+        chains = armature.hytale_ik_chains
+        detected = _auto_detect_bone_settings(armature)
+
+        existing_head = any(c.chain_type == "HEAD" for c in chains)
+        existing_spine = any(c.chain_type == "SPINE" for c in chains)
+        existing_sides = {
+            (c.chain_type, c.side) for c in chains if c.chain_type in ("ARM", "LEG")
+        }
+
+        added = []
+        skipped = []
+
+        def _add_entry(chain_type, label_prefix, fields):
+            item = chains.add()
+            item.chain_type = chain_type
+            item.label = _unique_bone_setting_label(chains, label_prefix)
+            # Mesmo fix de RIG_OT_hytale_ik_chain_add -- pole_angle_preset_name
+            # nasce coerente com o chain_type, em vez do default "ARM" cru.
+            item.pole_angle_preset_name = chain_type
+            for key, value in fields.items():
+                setattr(item, key, value)
+            armature.hytale_ik_chains_index = len(chains) - 1
+            added.append(item.label)
+
+        if "HEAD" in detected:
+            if existing_head:
+                skipped.append("Head")
+            else:
+                _add_entry("HEAD", "Head", detected["HEAD"])
+
+        if "SPINE" in detected:
+            if existing_spine:
+                skipped.append("Spine")
+            else:
+                _add_entry("SPINE", "Spine", detected["SPINE"])
+
+        side_suffix = {"LEFT": "L", "RIGHT": "R"}
+        for chain_type, limb_label in (("ARM", "Arm"), ("LEG", "Leg")):
+            for side in ("LEFT", "RIGHT"):
+                key = (chain_type, side)
+                if key not in detected:
+                    continue
+                if (chain_type, side) in existing_sides:
+                    skipped.append(f"{limb_label} {side_suffix[side]}")
+                    continue
+                _add_entry(chain_type, f"{limb_label} {side_suffix[side]}", detected[key])
+
+        _redraw_all_areas(context)
+
+        if not added and not skipped:
+            self.report(
+                {"WARNING"},
+                "Could not recognize any Head/Spine/Arm/Leg bones on this armature -- "
+                "the bone names may not follow a supported naming convention.",
+            )
+            return {"CANCELLED"}
+
+        msg_parts = []
+        if added:
+            msg_parts.append(f"added {', '.join(added)}")
+        if skipped:
+            msg_parts.append(f"already had {', '.join(skipped)} (skipped)")
+        self.report({"INFO"}, "Auto-Detect Bone Settings: " + "; ".join(msg_parts) + ".")
+        return {"FINISHED"}
+
+
+def _ik_chain_load_defaults_props(lang):
+    return {
+        "preset": StringProperty(
+            name="Preset",
+            default="",
+            description=tr("rigger.prop.ik_chain_load_defaults_preset", lang),
+        ),
+    }
+
+
+@localized_props(_ik_chain_load_defaults_props)
 class RIG_OT_hytale_ik_chain_load_defaults(Operator):
     """Preenche a lista com um template de cadeias de IK já calibradas
     (ver templates/rig/*.json, builtin + Documentos/Hyblend/templates/
@@ -3411,19 +4340,21 @@ class RIG_OT_hytale_ik_chain_load_defaults(Operator):
     criatura/personagem, não precisa mexer em código: basta criar um
     .json novo em uma dessas pastas (e rodar "Reload Templates" se o
     Blender já estava aberto) -- a lista de opções abaixo é gerada
-    automaticamente a partir dos templates descobertos."""
+    automaticamente a partir dos templates descobertos.
+
+    Selecionar "(none)" (_TEMPLATE_NONE) no dropdown e clicar Load LIMPA
+    a lista de cadeias de IK e o rig template ativo (mesmo espírito do
+    fix equivalente em RIG_OT_hytale_shape_template_apply) -- útil pra
+    começar do zero sem nenhuma cadeia pré-calibrada, sem precisar
+    remover uma por uma na mão. NÃO mexe no shape template ativo (esse é
+    um picker independente, com o próprio "(none)" na box de Character
+    Templates) nem em hytale_apply_ik_joint_fix (fica como já estava --
+    não é algo que "pertença" a nenhum template, é ajustável direto)."""
 
     bl_idname = "armature.hytale_ik_chain_load_defaults"
     bl_label = "Load Hytale IK Chain Preset"
-    bl_description = "Load a calibrated rig template, replacing the current IK chain list"
+    description = tooltip("rigger.tooltip.ik_chain_load_defaults")
     bl_options = {"REGISTER", "UNDO"}
-
-    preset: StringProperty(
-        name="Preset",
-        default="",
-        description="Rig template name to load -- leave empty to use whatever is currently selected in the "
-        "Character Templates dropdown (wm.hytale_rig_template_selected, see interface.py)",
-    )
 
     @classmethod
     def poll(cls, context):
@@ -3432,9 +4363,26 @@ class RIG_OT_hytale_ik_chain_load_defaults(Operator):
 
     def execute(self, context):
         preset_name = self.preset or context.window_manager.hytale_rig_template_selected
-        if not preset_name or preset_name == _TEMPLATE_NONE:
+        if not preset_name:
             self.report({"WARNING"}, "No rig template selected.")
             return {"CANCELLED"}
+        if preset_name == _TEMPLATE_NONE:
+            # "(none)" de propósito -- limpa a lista de cadeias e o rig
+            # template ativo em vez de só avisar/cancelar (ver docstring
+            # da classe). Só mexe nos dois campos que "pertencem" ao rig
+            # template -- deixa hytale_apply_ik_joint_fix e o shape
+            # template ativo como já estavam (não fazem parte do que
+            # este operador normalmente sobrescreve nesse caminho).
+            armature = context.active_object.data
+            chain_count = len(armature.hytale_ik_chains)
+            armature.hytale_ik_chains.clear()
+            armature.hytale_active_rig_template = ""
+            self.report(
+                {"INFO"},
+                f"Rig template cleared -- removed {chain_count} IK chain(s). "
+                f"Add chains manually or load a template to start again.",
+            )
+            return {"FINISHED"}
 
         template = get_rig_template(preset_name)
         entries = template.get("ik_chains") if template else None
@@ -3482,7 +4430,7 @@ class RIG_OT_hytale_ik_chain_load_defaults(Operator):
                 if "leg" in guess or "perna" in guess or "thigh" in guess:
                     item.chain_type = "LEG"
                 elif "tail" in guess or "cauda" in guess:
-                    item.chain_type = "TAIL"
+                    item.chain_type = "CHAIN"
                 # senão fica em "ARM" (default do Enum) -- mesmo
                 # comportamento de sempre pra cadeias que já eram braço
                 # ou que não dá pra classificar por texto nenhum.
@@ -3526,7 +4474,7 @@ class RIG_OT_hytale_ik_chain_load_defaults(Operator):
 
 
 _CHAIN_TYPE_ICON = {
-    "ARM": "CON_KINEMATIC", "LEG": "CON_KINEMATIC", "TAIL": "PHYSICS",
+    "ARM": "CON_KINEMATIC", "LEG": "CON_KINEMATIC", "CHAIN": "PHYSICS",
     "HEAD": "USER", "SPINE": "BONE_DATA", "ATTACHMENTS": "LINKED",
     "TEXTURE_PICKER": "IMAGE_DATA",
 }
@@ -3560,7 +4508,7 @@ class RIG_OT_hytale_bone_collection_load_defaults(Operator):
 
     bl_idname = "armature.hytale_bone_collection_load_defaults"
     bl_label = "Load Default Collections"
-    bl_description = "Populate the list with the built-in collections (Head/Spine/Body/Arm L/Arm R/Leg L/Leg R/Root)"
+    description = tooltip("rigger.tooltip.bone_collection_load_defaults")
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -3590,21 +4538,17 @@ class RIG_OT_hytale_bone_collection_reset_grid(Operator):
     por nome, que por coincidência pode bater com a ordem antiga do
     Bone Settings.
 
-    Este botão só REESCREVE row/column (e SÓ pras entradas cujo NOME
-    bate com um dos 10 defaults -- COLL_MAIN_HEAD etc., ver
-    _DEFAULT_BONE_COLLECTION_GRID) pro valor de grade esperado -- nunca
-    mexe em parent, nunca cria/apaga entradas, e NUNCA toca em
-    collections com nome custom (criadas pelo usuário) -- só corrige o
-    que já era pra ser "default" e ficou desatualizado."""
+    Este botão REESCREVE row/column das entradas cujo NOME bate com um
+    dos 10 defaults (COLL_MAIN_HEAD etc., ver _DEFAULT_BONE_COLLECTION_GRID)
+    pro valor de grade esperado, e RE-ADICIONA (v0.7.9 -- pedido
+    explícito do usuário) qualquer um desses 10 que tenha sido apagado
+    da lista -- nunca mexe em `parent`, nunca cria/apaga uma entrada
+    CUSTOM (nome que o usuário digitou), e nunca duplica um default que
+    já existe."""
 
     bl_idname = "armature.hytale_bone_collection_reset_grid"
     bl_label = "Reset Row/Column to Defaults"
-    bl_description = (
-        "Fix Row/Column for the built-in collections (Head/Spine/Body/Arm L/Arm R/Leg L/Leg R/Root/Tail/"
-        "Attachments) back to their default grid position -- useful if these entries were created before "
-        "Row/Column existed, leaving them all stuck at Row 0/Column 0 (which makes ordering fall back to "
-        "alphabetical). Custom collections are never touched"
-    )
+    description = tooltip("rigger.tooltip.bone_collection_reset_grid")
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -3622,37 +4566,77 @@ class RIG_OT_hytale_bone_collection_reset_grid(Operator):
                 continue  # nome custom -- não é um dos 10 defaults, não mexe
             item.row, item.column = grid
             fixed += 1
+        # v0.7.9 -- FIX (pedido explícito do usuário): ERA só isso acima
+        # -- se um dos 10 defaults tivesse sido APAGADO da lista (não só
+        # "com row/column desatualizados"), este botão simplesmente não
+        # tinha nada pra corrigir e reportava "0 built-in collection(s)",
+        # parecendo não fazer nada. Agora RE-ADICIONA (via
+        # ensure_default_bone_collection_entries, mesma função que
+        # "Create Rig" já chama sozinho -- ver lá) qualquer default que
+        # esteja faltando, com o Row/Column correto -- "Reset ... to
+        # Defaults" volta a significar "traz de volta o estado default",
+        # não só "conserta o que já existe". entry_type/parent ficam no
+        # default (COLLECTION / cai pra Section "Main" via fallback) --
+        # mesmo comportamento de uma entrada nova criada do zero.
+        added = ensure_default_bone_collection_entries(armature)
+        # v0.7.11 -- Texture Picker é tratado à parte (mesma checagem
+        # condicional que "Create Rig" usa -- só volta se houver de fato
+        # uma cadeia TEXTURE_PICKER configurada, ver ensure_texture_picker_
+        # collection_entry) -- ensure_default_bone_collection_entries
+        # deliberadamente NÃO cobre Texture Picker (ver docstring dela).
+        before = len(armature.hytale_bone_collections)
+        ensure_texture_picker_collection_entry(armature)
+        if len(armature.hytale_bone_collections) > before:
+            added += 1
         sync_bone_collection_order(armature)
         _redraw_all_areas(context)
-        self.report({"INFO"}, f"Reset Row/Column on {fixed} built-in collection(s).")
+        self.report({"INFO"}, f"Reset Row/Column on {fixed} built-in collection(s), re-added {added} missing.")
         return {"FINISHED"}
 
 
+def _bone_collection_add_props(lang):
+    return {
+        "collection_name": StringProperty(name="Name", default="Collection"),
+        "entry_type": EnumProperty(
+            name="Type",
+            items=[
+                (
+                    "COLLECTION",
+                    "Collection",
+                    tr("rigger.prop.bone_collection_add_entry_type_item_collection", lang),
+                ),
+                (
+                    "SECTION",
+                    "Section",
+                    tr("rigger.prop.bone_collection_add_entry_type_item_section", lang),
+                ),
+            ],
+            default="COLLECTION",
+        ),
+        # `default=0` (índice, não string) -- mesma lição aprendida com
+        # collection_override: Blender não aceita string como default pra
+        # EnumProperty com `items` dinâmico (ver changelog).
+        "parent": EnumProperty(
+            name="Parent",
+            items=_collection_parent_enum_items,
+            default=0,
+        ),
+    }
+
+
+@localized_props(_bone_collection_add_props)
 class RIG_OT_hytale_bone_collection_add(Operator):
-    """Abre um dialog (nome + Parent) e adiciona uma entrada nova.
-    Diferente de RIG_OT_hytale_ik_chain_add (que só recebe um
-    chain_type fixo do menu popup, sem digitar nada) -- aqui o NOME é
-    livre, então precisa de um invoke_props_dialog em vez de rodar
-    direto no clique."""
+    """Abre um dialog (nome + Type + Parent) e adiciona uma entrada
+    nova -- Collection ou Section, mesma lista, mesmo diálogo (pedido
+    explícito do usuário). Diferente de RIG_OT_hytale_ik_chain_add (que
+    só recebe um chain_type fixo do menu popup, sem digitar nada) --
+    aqui o NOME é livre, então precisa de um invoke_props_dialog em vez
+    de rodar direto no clique."""
 
     bl_idname = "armature.hytale_bone_collection_add"
-    bl_label = "Add Bone Collection"
-    bl_description = "Add a new named bone collection, nested under Main or another collection"
+    bl_label = "Add Bone Collection / Section"
+    description = tooltip("rigger.tooltip.bone_collection_add")
     bl_options = {"REGISTER", "UNDO"}
-
-    collection_name: StringProperty(name="Name", default="Collection")
-    # v0.9.6 -- ERA um EnumProperty fixo (Main/Face) -- reusa a MESMA
-    # função de items dinâmica que HytaleBoneCollectionItem.parent usa
-    # (ver _parent_collection_enum_items) -- lista qualquer collection
-    # já existente na lista como opção de parent, mais "Main (root)".
-    # `default=0` (índice, não string) -- mesma lição aprendida com
-    # collection_override: Blender não aceita string como default pra
-    # EnumProperty com `items` dinâmico (ver changelog).
-    parent: EnumProperty(
-        name="Parent",
-        items=_parent_collection_enum_items,
-        default=0,
-    )
 
     @classmethod
     def poll(cls, context):
@@ -3665,6 +4649,7 @@ class RIG_OT_hytale_bone_collection_add(Operator):
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "collection_name")
+        layout.prop(self, "entry_type")
         layout.prop(self, "parent")
 
     def execute(self, context):
@@ -3679,16 +4664,17 @@ class RIG_OT_hytale_bone_collection_add(Operator):
         if name.upper() == COLLECTION_OVERRIDE_AUTO:
             self.report({"ERROR"}, f"'{name}' is a reserved name (used internally for 'Auto (default)') -- pick another.")
             return {"CANCELLED"}
-        # v0.9.6 -- mesma ideia, pro sentinel do dropdown de Parent.
-        if name == PARENT_COLLECTION_ROOT:
+        if name == SECTION_ROOT:
             self.report({"ERROR"}, f"'{name}' is a reserved name -- pick another.")
             return {"CANCELLED"}
         if any(c.name == name for c in armature.hytale_bone_collections):
-            self.report({"ERROR"}, f"A collection named '{name}' already exists in this list.")
+            self.report({"ERROR"}, f"An entry named '{name}' already exists in this list.")
             return {"CANCELLED"}
         ensure_default_bone_collections(armature)  # garante que a lista já foi semeada antes de adicionar
+        ensure_default_bone_section_backfill(armature)  # v0.7.8 -- garante a Section "Main" também (ver docstring)
         item = armature.hytale_bone_collections.add()
         item.name = name
+        item.entry_type = self.entry_type
         item.parent = self.parent
         armature.hytale_bone_collections_index = len(armature.hytale_bone_collections) - 1
         sync_bone_collection_order(armature)  # v0.9 (Etapa 2) -- reflete no painel nativo na hora, se já existir
@@ -3703,11 +4689,21 @@ class RIG_OT_hytale_bone_collection_remove(Operator):
     continuam lá; só deixa de ser uma opção no dropdown 'Collection' de
     Bone Settings, e cadeias que já apontavam pra ela caem de volta no
     default (Auto) no próximo 'Create Rig' -- ver
-    _apply_bone_collection_overrides."""
+    _apply_bone_collection_overrides.
+
+    v0.7.9 -- FIX (pedido explícito do usuário): ERA bloqueado apagar a
+    ÚLTIMA Section restante -- removido. Apagar todas as Sections é
+    permitido agora; sem NENHUMA Section na lista, toda Collection
+    (mesmo uma explicitamente atribuída a uma Section que não existe
+    mais) cai num grupo implícito "Root" na aba Animation, sem
+    cabeçalho nenhum -- ver render em interface.py/_draw_animation e o
+    fallback em sync_bone_collection_order (rigger/rig.py), os dois já
+    preparados pra esse caso (nunca dependiam de Section nenhuma
+    existir de fato, só se beneficiavam se existisse)."""
 
     bl_idname = "armature.hytale_bone_collection_remove"
     bl_label = "Remove Bone Collection"
-    bl_description = "Remove the selected entry from the list"
+    description = tooltip("rigger.tooltip.bone_collection_remove")
     bl_options = {"REGISTER", "UNDO"}
 
     index: IntProperty(default=-1)
@@ -3729,6 +4725,20 @@ class RIG_OT_hytale_bone_collection_remove(Operator):
         return {"FINISHED"}
 
 
+
+def _bone_collection_move_props(lang):
+    return {
+        "direction": EnumProperty(
+            items=(
+                ("UP", "Up", tr("rigger.prop.bone_collection_move_direction_item_up", lang)),
+                ("DOWN", "Down", tr("rigger.prop.bone_collection_move_direction_item_down", lang)),
+            ),
+            default="UP",
+        ),
+    }
+
+
+@localized_props(_bone_collection_move_props)
 class RIG_OT_hytale_bone_collection_move(Operator):
     """Mesmo padrão de RIG_OT_hytale_ik_chain_move -- reordena uma
     posição pra cima/baixo na lista inteira (Main e Face juntas, sem
@@ -3740,16 +4750,8 @@ class RIG_OT_hytale_bone_collection_move(Operator):
 
     bl_idname = "armature.hytale_bone_collection_move"
     bl_label = "Move Bone Collection"
-    bl_description = "Move the selected entry up or down in the list"
+    description = tooltip("rigger.tooltip.bone_collection_move")
     bl_options = {"REGISTER", "UNDO"}
-
-    direction: EnumProperty(
-        items=(
-            ("UP", "Up", "Move the entry one position up"),
-            ("DOWN", "Down", "Move the entry one position down"),
-        ),
-        default="UP",
-    )
 
     @classmethod
     def poll(cls, context):
@@ -3772,26 +4774,21 @@ class RIG_OT_hytale_bone_collection_move(Operator):
 
 class RIG_UL_hytale_bone_collections(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        # v0.7.7 -- ícone/rótulo secundário dependem do tipo agora
+        # (lista unificada, ver HytaleBoneCollectionItem.entry_type) --
+        # uma Collection mostra a Section resolvida (onde o botão dela
+        # aparece na aba Animation); uma Section mostra o próprio
+        # Parent (dentro de qual outra Section ela está aninhada, ou
+        # "Root"). `data` aqui é a Armature (mesmo objeto passado em
+        # template_list(), ver interface.py).
         row = layout.row(align=True)
-        row.prop(item, "name", text="", emboss=False, icon="GROUP_BONE")
-        # v0.9.6 -- mostra o parent resolvido (qualquer collection da
-        # lista, ou "Main" pro sentinel/vazio) -- ver
-        # HytaleBoneCollectionItem.parent/PARENT_COLLECTION_ROOT.
-        parent_label = "Main" if item.parent in ("", PARENT_COLLECTION_ROOT) else item.parent
-        row.label(text=parent_label)
-
-
-# ---------------------------------------------------------------------------
-# Tarefa C -- duas funções puras extraídas do meio de
-# RIG_OT_hytale_generate_rig (ver comentário em
-# RIG_OT_hytale_generate_rig._warn_shared_pole_angle_presets e no branch
-# PRESET de _build_pose_constraints, mais abaixo) pra que
-# RIG_OT_hytale_validate_rig, logo depois, possa reaproveitar a MESMA
-# lógica de checagem/lookup em vez de duplicá-la. Pequeno refactor
-# comportamental-neutro feito EM SERVIÇO da Tarefa C (não faz parte da
-# Tarefa A, que foi reorganização pura) -- resultado idêntico ao que
-# estava inline antes, só que agora chamável de dois lugares.
-# ---------------------------------------------------------------------------
+        if item.entry_type == "SECTION":
+            row.prop(item, "name", text="", emboss=False, icon="OUTLINER_COLLECTION")
+            parent_label = "Root" if item.parent in ("", SECTION_ROOT) else item.parent
+            row.label(text=parent_label)
+        else:
+            row.prop(item, "name", text="", emboss=False, icon="GROUP_BONE")
+            row.label(text=_resolve_collection_section_name(data, item))
 
 
 def resolve_pole_angle_preset_degrees(rig_template, preset_name, side):
@@ -3828,6 +4825,17 @@ def find_shared_pole_angle_preset_warnings(chains_data):
     return [(name, sorted(types)) for name, types in preset_chain_types.items() if len(types) > 1]
 
 
+def _validate_rig_props(lang):
+    return {
+        "export_collection_name": StringProperty(
+            name="Export Collection",
+            default="Hytale Export",
+            description=tr("rigger.prop.validate_rig_export_collection_name", lang),
+        ),
+    }
+
+
+@localized_props(_validate_rig_props)
 class RIG_OT_hytale_validate_rig(Operator):
     """Tarefa C -- diagnóstico, não muda NADA no rig/armature. Roda 4
     checagens (ver DEVELOPER_NOTES.md/histórico do chat pra lista
@@ -3865,15 +4873,8 @@ class RIG_OT_hytale_validate_rig(Operator):
 
     bl_idname = "armature.hytale_validate_rig"
     bl_label = "Validate Rig"
-    bl_description = "Check the IK chain list and export bone collection for common mistakes (report-only)"
+    description = tooltip("rigger.tooltip.validate_rig")
     bl_options = {"REGISTER"}
-
-    export_collection_name: StringProperty(
-        name="Export Collection",
-        default="Hytale Export",
-        description="Bone collection name that original (non-generated) bones are expected to be in -- same "
-        "name exporter.py uses by default; change only if you've renamed that collection",
-    )
 
     @classmethod
     def poll(cls, context):
@@ -4034,26 +5035,70 @@ class RIG_OT_hytale_validate_rig(Operator):
 # ---------------------------------------------------------------------------
 
 
+def _clear_generated_props(lang):
+    return {
+        "mode": EnumProperty(
+            items=[
+                (
+                    "ONLY_RIG",
+                    "Only Rig",
+                    tr("rigger.prop.clear_generated_mode_item_only_rig", lang),
+                ),
+                (
+                    "DELETE_ALL",
+                    "Delete All",
+                    tr("rigger.prop.clear_generated_mode_item_delete_all", lang),
+                ),
+            ],
+            default="ONLY_RIG",
+        ),
+    }
+
+
+@localized_props(_clear_generated_props)
 class RIG_OT_hytale_clear_generated(Operator):
     """Apaga todo bone criado por este script (MCH, CTRL, CTRL-IK,
     MCH-IK/bridge, Pole, e os bones utilitários root.*), deixando só os
-    bones ORG originais. Não mexe na lista hytale_ik_chains -- rodar
-    "Create Rig" de novo depois reconstrói tudo igual.
+    bones ORG originais.
 
-    Também purga TODOS os objetos widget deste Armature -- os TEMPLATES
-    por-papel (ver ensure_widget_objects) E as cópias por-bone (v0.17,
-    ver _ensure_bone_widget_copy), já que ambos moram juntos na mesma
-    collection 'WGT - <nome>' e o purge simplesmente esvazia essa
-    collection inteira. Sem isso, depois de editar/atualizar
-    hytale_widgets.blend (ex.: remodelar um shape existente), "Create
-    Rig" continuava usando os TEMPLATES antigos já presentes na cena
-    (ensure_widget_objects só faz append do que ainda NÃO existe em
-    bpy.data.objects -- um objeto com o mesmo nome já presente nunca é
-    atualizado sozinho) -- e as cópias por-bone, que vêm dos templates,
-    herdariam a forma antiga junto. Rodar este botão força um append
-    fresco da biblioteca (novos templates) e novas cópias por-bone na
-    próxima geração. A collection 'WGT - <nome>' em si também é
-    removida se ficar vazia.
+    v0.7.10 -- FIX (pedido explícito do usuário): ganhou um `mode` com
+    dois valores, escolhidos num menu popup (ver RIG_MT_hytale_clear_
+    generated_menu, aberto pelo ícone de lixeira em interface.py) em vez
+    de rodar direto no clique:
+
+    - ONLY_RIG (o de sempre, "quase" o comportamento antigo -- ver
+      abaixo): bones gerados + bone collections reais sob Main +
+      artefatos do Texture Picker/First Person Camera. NÃO mexe em
+      hytale_ik_chains (Bone Settings) nem hytale_bone_collections
+      (Collection Settings) -- rodar "Create Rig" de novo depois
+      reconstrói tudo igual. NÃO purga os widgets (WGT) -- essa é a
+      MUDANÇA real de comportamento (v0.7.10): antes, QUALQUER "Remove
+      Generated Bones" também apagava os WGT, o que incluía qualquer
+      edição manual feita em Shape Edit Mode/Vertex Edit -- forçando o
+      usuário a refazer a edição do zero toda vez que só queria
+      regenerar o esqueleto. Editar shapes agora sobrevive a este modo.
+
+    - DELETE_ALL: tudo que ONLY_RIG faz, MAIS purga os widgets (WGT --
+      comportamento antigo, quando shapes editados à mão precisam
+      mesmo ser descartados) E limpa hytale_ik_chains/hytale_bone_
+      collections por completo, voltando pro estado "nunca configurado"
+      -- só sobra o rig ORG original, exatamente como um armature recém
+      importado.
+
+    Também purga TODOS os objetos widget deste Armature (só em
+    DELETE_ALL) -- os TEMPLATES por-papel (ver ensure_widget_objects) E
+    as cópias por-bone (v0.17, ver _ensure_bone_widget_copy), já que
+    ambos moram juntos na mesma collection 'WGT - <nome>' e o purge
+    simplesmente esvazia essa collection inteira. Sem isso, depois de
+    editar/atualizar hytale_widgets.blend (ex.: remodelar um shape
+    existente), "Create Rig" continuava usando os TEMPLATES antigos já
+    presentes na cena (ensure_widget_objects só faz append do que ainda
+    NÃO existe em bpy.data.objects -- um objeto com o mesmo nome já
+    presente nunca é atualizado sozinho) -- e as cópias por-bone, que
+    vêm dos templates, herdariam a forma antiga junto. Rodar
+    DELETE_ALL força um append fresco da biblioteca (novos templates) e
+    novas cópias por-bone na próxima geração. A collection 'WGT -
+    <nome>' em si também é removida se ficar vazia.
 
     v0.16 -- desde que os widgets viraram por-personagem (nome com
     sufixo ' - <nome_do_armature>', ver _widget_instance_name), este
@@ -4065,7 +5110,7 @@ class RIG_OT_hytale_clear_generated(Operator):
 
     bl_idname = "armature.hytale_clear_generated_rig"
     bl_label = "Remove Generated Hytale Rig Bones"
-    bl_description = "Delete all generated bones, keeping only the original ones"
+    description = tooltip("rigger.tooltip.clear_generated")
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -4117,10 +5162,9 @@ class RIG_OT_hytale_clear_generated(Operator):
         # internas do rig, não organização do usuário).
         #
         # NÃO mexe em armature.hytale_bone_collections (a LISTA de
-        # configuração, em "Collection Settings") -- só nas collections
-        # de VERDADE do Blender. É por isso que a lista continua com o
-        # mesmo plano de organização pro próximo "Create Rig", em vez de
-        # o usuário ter que recriar tudo na mão de novo.
+        # configuração, em "Collection Settings") em nenhum dos dois
+        # modos aqui -- só nas collections de VERDADE do Blender. Isso é
+        # feito à parte, mais abaixo, só em DELETE_ALL.
         removed_collections = 0
 
         def _remove_tree(coll):
@@ -4134,19 +5178,23 @@ class RIG_OT_hytale_clear_generated(Operator):
         if main_coll is not None:
             _remove_tree(main_coll)
 
+        # v0.7.10 -- purge de widgets: SÓ em DELETE_ALL agora (ver
+        # docstring da classe pro motivo -- ERA incondicional, apagava
+        # edição manual de Shape Edit Mode/Vertex Edit à toa).
         purged = 0
-        widgets_collection = _find_widgets_collection(obj)
-        if widgets_collection is not None:
-            for wgt_obj in list(widgets_collection.objects):
-                mesh = wgt_obj.data
-                bpy.data.objects.remove(wgt_obj, do_unlink=True)
-                if mesh is not None and mesh.users == 0:
-                    bpy.data.meshes.remove(mesh, do_unlink=True)
-                purged += 1
-            if not widgets_collection.objects:
-                _unlink_and_remove_collection(widgets_collection)
-                if obj.get("hytale_widgets_collection"):
-                    del obj["hytale_widgets_collection"]
+        if self.mode == "DELETE_ALL":
+            widgets_collection = _find_widgets_collection(obj)
+            if widgets_collection is not None:
+                for wgt_obj in list(widgets_collection.objects):
+                    mesh = wgt_obj.data
+                    bpy.data.objects.remove(wgt_obj, do_unlink=True)
+                    if mesh is not None and mesh.users == 0:
+                        bpy.data.meshes.remove(mesh, do_unlink=True)
+                    purged += 1
+                if not widgets_collection.objects:
+                    _unlink_and_remove_collection(widgets_collection)
+                    if obj.get("hytale_widgets_collection"):
+                        del obj["hytale_widgets_collection"]
 
         # v0.10 -- Texture Picker não é feito de bone PROP_RIG_LAYER só (o
         # plane de referência e os nodes injetados no material real da
@@ -4154,7 +5202,10 @@ class RIG_OT_hytale_clear_generated(Operator):
         # à parte, reaproveitando a mesma função do botão dedicado
         # (RIG_OT_hytale_texture_picker_remove), pra "Remove Generated"
         # também deixar a boca no estado "nunca gerado", consistente com
-        # o resto. Roda pra TODA entrada TEXTURE_PICKER da lista, não só a ativa.
+        # o resto. Roda pra TODA entrada TEXTURE_PICKER da lista, não só
+        # a ativa -- SEMPRE, nos dois modos (ainda lendo de hytale_
+        # ik_chains, que só é limpa mais abaixo, em DELETE_ALL -- por
+        # isso este loop precisa rodar ANTES dessa limpeza).
         texture_picker_cleaned = 0
         for item in obj.data.hytale_ik_chains:
             if item.chain_type == "TEXTURE_PICKER" and item.texture_picker_bone:
@@ -4166,19 +5217,64 @@ class RIG_OT_hytale_clear_generated(Operator):
         # Picker acima (reaproveita a mesma função do botão dedicado,
         # RIG_OT_hytale_camera_remove). Só uma câmera por armature (ver
         # comentário na seção "First Person Camera"), não precisa de
-        # loop por entrada.
+        # loop por entrada. Sempre roda, nos dois modos.
         camera_cleaned = _remove_first_person_camera(obj)
+
+        # v0.7.10 -- só em DELETE_ALL: limpa Bone Settings (hytale_ik_chains)
+        # e Collection Settings (hytale_bone_collections) por completo --
+        # "deixando apenas o rig original", pedido explícito. Reseta os
+        # flags de "já inicializado" também -- sem isso, o próximo
+        # 'Create Rig' encontraria os flags True e não re-semearia nada
+        # sozinho (embora ensure_default_bone_collection_entries/
+        # ensure_default_bone_section_backfill já cubram esse caso de
+        # qualquer forma, resetar aqui deixa o estado 100% equivalente a
+        # "nunca configurado", sem depender só do backfill).
+        chains_cleared = 0
+        collections_cleared = 0
+        if self.mode == "DELETE_ALL":
+            chains_cleared = len(obj.data.hytale_ik_chains)
+            obj.data.hytale_ik_chains.clear()
+            collections_cleared = len(obj.data.hytale_bone_collections)
+            obj.data.hytale_bone_collections.clear()
+            obj.data.hytale_bone_collections_initialized = False
 
         self.report(
             {"INFO"},
-            f"Removed {removed} generated bone(s) and {removed_collections} bone collection(s) under "
-            f"Main; purged {purged} cached widget object(s) "
-            f"(next 'Create Rig' re-loads them from {WIDGETS_LIBRARY_FILENAME})"
+            f"Removed {removed} generated bone(s) and {removed_collections} bone collection(s) under Main"
+            + (f"; purged {purged} cached widget object(s)" if self.mode == "DELETE_ALL" else "")
             + (f"; cleaned {texture_picker_cleaned} Texture Picker setup(s)" if texture_picker_cleaned else "")
             + ("; removed First Person Camera" if camera_cleaned else "")
+            + (
+                f"; cleared {chains_cleared} Bone Settings entrie(s) and {collections_cleared} Collection "
+                f"Settings entrie(s)"
+                if self.mode == "DELETE_ALL"
+                else ""
+            )
             + ".",
         )
         return {"FINISHED"}
+
+
+class RIG_MT_hytale_clear_generated_menu(Menu):
+    """Menu popup mostrado ao clicar o ícone de lixeira ao lado de
+    "Create Rig" (ver interface.py) -- pergunta QUAL modo usar antes de
+    apagar (ver RIG_OT_hytale_clear_generated.mode), em vez de rodar
+    direto no clique como antes (v0.7.10). Mesmo espírito de
+    RIG_MT_hytale_ik_chain_add_menu -- cada opção só chama o operador
+    com um `mode` diferente, nenhuma lógica própria aqui."""
+
+    bl_idname = "RIG_MT_hytale_clear_generated_menu"
+    bl_label = "Remove Generated Bones"
+    description = tooltip("rigger.tooltip.clear_generated_menu")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.operator(
+            RIG_OT_hytale_clear_generated.bl_idname, text="Only Rig", icon="ARMATURE_DATA"
+        ).mode = "ONLY_RIG"
+        layout.operator(
+            RIG_OT_hytale_clear_generated.bl_idname, text="Delete All", icon="TRASH"
+        ).mode = "DELETE_ALL"
 
 
 # ---------------------------------------------------------------------------
@@ -4292,7 +5388,7 @@ def _find_image_texture_node(material):
     return next((n for n in nodes if n.type == "TEX_IMAGE" and n.image is not None), None)
 
 
-def _ensure_texture_picker_material_uv_offset(mesh_obj):
+def _ensure_texture_picker_material_uv_offset(mesh_obj, label):
     """Garante 'UV Map -> Mapping -> Image Texture' no material real da
     boca (hoje o material montado por importer.py NÃO tem Mapping
     nenhum -- Image Texture liga direto no Base Color, ver
@@ -4327,6 +5423,19 @@ def _ensure_texture_picker_material_uv_offset(mesh_obj):
     verdade), não importa quantas das nossas próprias malhas apontem
     pra ela.
 
+    v0.13.8 -- FIX/pedido do usuário: o sufixo fixo "_TexturePickerCopy"
+    virou "_<Label>" (Label da entrada de Bone Settings, ex. "Mouth" --
+    `label`, parâmetro NOVO e obrigatório) -- nome final continua
+    "<material original>_<Label>", só o sufixo mudou (era genérico
+    demais pra identificar de qual Texture Picker a cópia veio, agora é
+    direto). `original_name` (o nome de ANTES da cópia, pra
+    _revert_texture_picker_material_uv_offset saber voltar) continua
+    guardado igual. Como o principal e todo Companion que compartilha o
+    mesmo material original recebem o MESMO `label` (mesmo Label -- ver
+    chamadas em _build_texture_picker/_apply_texture_picker_to_companion),
+    a checagem de "já existe uma cópia nossa com esse nome" (logo
+    abaixo) continua funcionando igual pra evitar duplicar/colidir.
+
     Devolve (mapping_node, image) ou (None, None) se não achar nenhum
     Image Texture nesse material."""
     if not mesh_obj.data.materials or mesh_obj.data.materials[0] is None:
@@ -4343,11 +5452,40 @@ def _ensure_texture_picker_material_uv_offset(mesh_obj):
     # sistema já criou por cópia -- se ela já está lá, o material já
     # está "resolvido" (seja usado por 1 ou várias das NOSSAS malhas),
     # não precisa copiar de novo.
+    #
+    # v0.13.7 -- FIX (bug relatado pelo usuário: "Companion Bone cria um
+    # material pra cada, com .001 no final"): a checagem acima cobre
+    # rodar de novo NA MESMA malha que já tem a cópia -- mas não cobria
+    # uma malha DIFERENTE (o Companion) que ainda NÃO tem cópia nenhuma
+    # e cujo material original, por acaso, RESULTARIA no MESMO nome de
+    # cópia que já existe (ex.: o Target Bone principal já copiou "X"
+    # pra "X_TexturePickerCopy" nesta mesma execução, e o companion cai
+    # no fluxo de cópia PRÓPRIA -- ver _apply_texture_picker_to_companion
+    # -- porque o material dele, na hora da comparação por NOME, não
+    # bateu com o original do principal; ou então é simplesmente uma
+    # cópia ÓRFÃ sobrando de uma execução anterior, nunca limpa porque
+    # o usuário trocou o nome do Companion Bone ou reimportou a malha
+    # sem clicar em "Remove Texture Picker" antes). Nesses casos,
+    # `material.copy()` tentava criar OUTRO datablock com o MESMO nome
+    # de uma cópia que já existe -- o Blender resolve sozinho anexando
+    # ".001", exatamente o sintoma relatado. Antes de copiar, procura
+    # por uma cópia NOSSA já existente com esse nome exato (rastreada
+    # pela mesma property, apontando pro mesmo original) e REAPROVEITA
+    # ela em vez de duplicar -- nunca mais colide.
     if material.users > 1 and PROP_TEXTURE_PICKER_MATERIAL_ORIGINAL not in material.keys():
         original_name = material.name
-        material = material.copy()
-        material.name = original_name + TEXTURE_PICKER_MATERIAL_COPY_SUFFIX
-        material[PROP_TEXTURE_PICKER_MATERIAL_ORIGINAL] = original_name
+        # v0.13.8 -- "<original>_<Label>" (era "<original>_TexturePickerCopy"
+        # antes, e um breve intervalo dessa correção só usava o Label
+        # sozinho -- pedido explícito do usuário: quer os DOIS, com "_"
+        # entre eles).
+        copy_name = f"{original_name}_{label}"
+        existing_copy = bpy.data.materials.get(copy_name)
+        if existing_copy is not None and existing_copy.get(PROP_TEXTURE_PICKER_MATERIAL_ORIGINAL) == original_name:
+            material = existing_copy
+        else:
+            material = material.copy()
+            material.name = copy_name
+            material[PROP_TEXTURE_PICKER_MATERIAL_ORIGINAL] = original_name
         mesh_obj.data.materials[0] = material
 
     tex_node = _find_image_texture_node(material)
@@ -4411,7 +5549,9 @@ def _apply_texture_picker_driver(mapping_node, axis_index, armature_obj, step, p
     target.data_path = f'pose.bones["{cursor_bone_name}"].location[{axis_index}]'
 
 
-def _apply_texture_picker_to_companion(armature_obj, companion_bone_name, grid, step_x, step_y, primary_material, cursor_bone_name):
+def _apply_texture_picker_to_companion(
+    armature_obj, companion_bone_name, grid, step_x, step_y, primary_material, cursor_bone_name, label
+):
     """v0.10.13 -- Companion Bones (HytaleIKChainItem.texture_picker_extra_bone_
     1..N): aplica o MESMO tratamento de material que o Target Bone
     principal recebe (_ensure_texture_picker_material_uv_offset +
@@ -4450,7 +5590,20 @@ def _apply_texture_picker_to_companion(armature_obj, companion_bone_name, grid, 
 
     Devolve (True, None) se aplicado com sucesso, ou (False, mensagem)
     -- mensagem sempre não-fatal, o chamador decide se reporta como
-    aviso (ver _build_texture_picker) sem cancelar o resto."""
+    aviso (ver _build_texture_picker) sem cancelar o resto.
+
+    v0.13.8 -- `label` (Label da entrada de Bone Settings) é NOVO aqui,
+    só usado se este companion cair no fluxo de cópia PRÓPRIA (textura
+    genuinamente diferente do principal -- ver comentário grande acima):
+    nesse caso a cópia NÃO pode se chamar igual à do principal (o
+    principal já usa "<original>_<label>", ver _build_texture_picker/
+    _ensure_texture_picker_material_uv_offset) -- colidiria, e o Blender
+    resolveria sozinho com ".001", voltando ao mesmo bug. Passa
+    "<label>_<companion_bone_name>" (virando "<original>_<label>_
+    <companion_bone_name>" depois de _ensure_texture_picker_material_uv_offset
+    prefixar) -- ainda fácil de reconhecer de qual entrada de Bone
+    Settings veio, mas distinto o bastante pra nunca colidir com a cópia
+    do principal nem com a de outro companion."""
     mesh_obj = _find_texture_picker_mesh_object(armature_obj, companion_bone_name)
     if mesh_obj is None:
         return False, (
@@ -4476,7 +5629,9 @@ def _apply_texture_picker_to_companion(armature_obj, companion_bone_name, grid, 
 
     # Companion tem um material genuinamente DIFERENTE do principal --
     # segue o fluxo normal (própria cópia se precisar, próprio driver).
-    mapping_node, image = _ensure_texture_picker_material_uv_offset(mesh_obj)
+    mapping_node, image = _ensure_texture_picker_material_uv_offset(
+        mesh_obj, f"{label}_{companion_bone_name}"
+    )
     if mapping_node is None or image is None:
         return False, f"companion bone '{companion_bone_name}': '{mesh_obj.name}' has no Image Texture material."
     if tuple(image.size) != (grid["atlas_w"], grid["atlas_h"]):
@@ -4580,21 +5735,30 @@ def _revert_texture_picker_material_uv_offset(mesh_obj):
     return _strip_texture_picker_material_nodes(material)
 
 
-def _apply_texture_picker_visibility_driver(plane_obj, armature_obj):
+def _apply_texture_picker_visibility_driver(plane_obj, armature_obj, collection_name):
     """Driver simples em Object.hide_viewport ('Disable in Viewport', o
     olho no Outliner / caixa em Object Properties > Visibility) do plane
-    de referência do Texture Picker, ligado à visibilidade da bone
-    collection "Texture Picker" (COLL_MAIN_TEXTURE_PICKER) do MESMO armature --
-    pedido explícito do usuário: desativar a collection "Texture Picker"
-    (checkbox da aba Animation ou do painel nativo "Bone Collections")
-    já esconde o plane sozinho, sem precisar escondê-lo à mão toda vez.
+    de referência do Texture Picker, ligado à visibilidade de
+    `collection_name` (a bone collection REAL que os bones root.ui/
+    cursor desta instância usam -- normalmente "Texture Picker", mas
+    pode ser outra via collection_override, ver _build_texture_picker)
+    do MESMO armature -- pedido explícito do usuário: desativar essa
+    collection (checkbox da aba Animation ou do painel nativo "Bone
+    Collections") já esconde o plane sozinho, sem precisar escondê-lo à
+    mão toda vez.
 
-    `collections_all["Texture Picker"].is_visible` é o toggle PRÓPRIO da
-    collection (não a visibilidade efetiva considerando ancestrais --
-    pedido foi "driver simples", e Texture Picker não costuma ter uma
-    collection pai além de Main, que não tem toggle de visibilidade
-    próprio hoje). hide_viewport é o INVERSO de is_visible (True =
-    escondido), por isso a expressão nega a variável."""
+    v0.7.7 -- ERA sempre COLL_MAIN_TEXTURE_PICKER fixo -- vira parâmetro
+    agora: corrige o mesmo bug de collection_override ignorado (ver
+    changelog) -- sem isso, o driver continuaria apontando pra uma
+    collection "Texture Picker" que, com o bug do assign() já corrigido,
+    podia nem existir mais quando um override estivesse configurado.
+
+    `collections_all[name].is_visible` é o toggle PRÓPRIO da collection
+    (não a visibilidade efetiva considerando ancestrais -- pedido foi
+    "driver simples", e a collection normalmente não tem um pai além de
+    Main, que não tem toggle de visibilidade próprio hoje). hide_viewport
+    é o INVERSO de is_visible (True = escondido), por isso a expressão
+    nega a variável."""
     plane_obj.driver_remove("hide_viewport")
     fcurve = plane_obj.driver_add("hide_viewport")
     driver = fcurve.driver
@@ -4608,7 +5772,7 @@ def _apply_texture_picker_visibility_driver(plane_obj, armature_obj):
     target = var.targets[0]
     target.id_type = "ARMATURE"
     target.id = armature_obj.data
-    target.data_path = f'collections_all["{COLL_MAIN_TEXTURE_PICKER}"].is_visible'
+    target.data_path = f'collections_all["{collection_name}"].is_visible'
 
 
 def _get_texture_picker_mesh_rest_uv(mesh_obj):
@@ -4760,7 +5924,12 @@ def _build_texture_picker(context, armature_obj, item):
             f"Armature -- is the attachment/mesh imported and attached?"
         )
 
-    mapping_node, image = _ensure_texture_picker_material_uv_offset(mesh_obj)
+    # v0.13.8 -- nome "amigável" da cópia do material (ver
+    # _ensure_texture_picker_material_uv_offset/_apply_texture_picker_to_companion)
+    # -- o Label desta entrada de Bone Settings (ex. "Mouth"), com
+    # fallback pro Target Bone se o Label por acaso estiver vazio.
+    texture_picker_label = (item.label or "").strip() or texture_picker_bone_name
+    mapping_node, image = _ensure_texture_picker_material_uv_offset(mesh_obj, texture_picker_label)
     if mapping_node is None or image is None:
         return False, f"'{mesh_obj.name}' has no material with an Image Texture -- nothing to drive."
     # v0.10.17 -- guarda o material RESULTANTE do principal (já pode ser
@@ -4836,7 +6005,26 @@ def _build_texture_picker(context, armature_obj, item):
         cursor.tail = cursor.head + (direction / length) * min(0.05, plane_w * 0.15)
         cursor[PROP_RIG_LAYER] = "UI-CTRL"
 
-    coll_texture_picker = ensure_bone_collection(armature_obj.data, COLL_MAIN_TEXTURE_PICKER, parent=ensure_bone_collection(armature_obj.data, COLL_MAIN))
+    # v0.7.7 -- FIX (bug relatado pelo usuário): root.ui/cursor ignoravam
+    # collection_override por completo -- sempre criavam e usavam a
+    # collection default "Texture Picker" (COLL_MAIN_TEXTURE_PICKER),
+    # mesmo com um collection_override configurado pra outra collection
+    # (ex. "Mouth"). Causa: esta função nunca olhava pra item.
+    # collection_override, só _apply_bone_collection_overrides olhava
+    # -- só que aquele redirect cobre o BONE ORIGINAL (texture_picker_bone),
+    # não os bones root.ui/cursor, que são criados e atribuídos AQUI,
+    # direto, sem passar por lá. Agora: com um override configurado
+    # (!= Auto), tenta resolver pra essa collection primeiro -- só cai
+    # pro default "Texture Picker" se o override não existir mais
+    # (apagado/renomeado) ou estiver em Auto.
+    target_name = (item.collection_override or "").strip()
+    coll_texture_picker = None
+    if target_name and target_name != COLLECTION_OVERRIDE_AUTO:
+        coll_texture_picker = resolve_collection_override_target(armature_obj.data, target_name)
+    if coll_texture_picker is None:
+        coll_texture_picker = ensure_bone_collection(
+            armature_obj.data, COLL_MAIN_TEXTURE_PICKER, parent=ensure_bone_collection(armature_obj.data, COLL_MAIN)
+        )
     coll_texture_picker.assign(ui_root)
     coll_texture_picker.assign(cursor)
 
@@ -4979,9 +6167,11 @@ def _build_texture_picker(context, armature_obj, item):
     # addon (4.5, ver blender_manifest.toml), cobre EEVEE Next e Cycles.
     plane_obj.visible_shadow = False
 
-    # v0.10.9 -- visibilidade do plane amarrada à bone collection "Texture Picker"
-    # (pedido explícito): desativar a collection esconde o plane junto.
-    _apply_texture_picker_visibility_driver(plane_obj, armature_obj)
+    # v0.10.9 -- visibilidade do plane amarrada à bone collection real
+    # que os bones root.ui/cursor usam (normalmente "Texture Picker",
+    # mas respeita collection_override -- ver v0.7.7 acima): desativar
+    # essa collection esconde o plane junto.
+    _apply_texture_picker_visibility_driver(plane_obj, armature_obj, coll_texture_picker.name)
 
     # --- Drivers de UV no material REAL do alvo ---------------------------
     # Índice 0 = X (colunas), 1 = Y (linhas) -- ver comentário sobre eixos
@@ -5007,7 +6197,7 @@ def _build_texture_picker(context, armature_obj, item):
     companion_warnings = []
     for companion_name in configured_companions:
         ok_companion, warn_msg = _apply_texture_picker_to_companion(
-            armature_obj, companion_name, grid, step_x, step_y, primary_material, cursor_name
+            armature_obj, companion_name, grid, step_x, step_y, primary_material, cursor_name, texture_picker_label
         )
         if not ok_companion:
             companion_warnings.append(warn_msg)
@@ -5173,7 +6363,7 @@ class RIG_OT_hytale_texture_picker_create(Operator):
 
     bl_idname = "armature.hytale_texture_picker_create"
     bl_label = "Create Texture Picker"
-    bl_description = "Build a texture-atlas UV-picker rig for it (a dedicated root.ui/cursor bone pair + reference plane) from the Manual Grid values"
+    description = tooltip("rigger.tooltip.texture_picker_create")
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -5215,7 +6405,7 @@ class RIG_OT_hytale_texture_picker_remove(Operator):
 
     bl_idname = "armature.hytale_texture_picker_remove"
     bl_label = "Remove Texture Picker"
-    bl_description = "Remove the generated Texture Picker rig (root.ui/cursor bone pair, reference plane, material driver) for this entry"
+    description = tooltip("rigger.tooltip.texture_picker_remove")
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -5342,7 +6532,7 @@ class RIG_OT_hytale_camera_create(Operator):
 
     bl_idname = "armature.hytale_camera_create"
     bl_label = "Create Camera"
-    bl_description = "Create (or update) a First Person Camera object, bone-parented to the chosen bone"
+    description = tooltip("rigger.tooltip.camera_create")
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -5380,7 +6570,7 @@ class RIG_OT_hytale_camera_remove(Operator):
 
     bl_idname = "armature.hytale_camera_remove"
     bl_label = "Remove Camera"
-    bl_description = "Remove the generated First Person Camera object for this armature"
+    description = tooltip("rigger.tooltip.camera_remove")
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -5413,7 +6603,7 @@ class RIG_OT_hytale_generate_rig(Operator):
 
     bl_idname = "armature.hytale_generate_rig"
     bl_label = "Create Rig"
-    bl_description = "Create or update the rig layers, constraints and custom shapes"
+    description = tooltip("rigger.tooltip.generate_rig")
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -5439,6 +6629,8 @@ class RIG_OT_hytale_generate_rig(Operator):
         ensure_default_bone_collections(armature)
         ensure_texture_picker_collection_entry(armature)  # v0.10.5 -- backfill p/ armatures já
         # inicializados antes do Texture Picker existir na grade default, ver docstring da função
+        ensure_default_bone_section_backfill(armature)  # v0.7.8 -- mesmo padrão, backfill da Section "Main"
+        ensure_default_bone_collection_entries(armature)  # v0.7.9 -- idem, pros outros 10 defaults
 
         # "Pra baixo" (usado no fallback do Foot_IK) precisa ser
         # convertido do espaço mundo pro espaço local do Armature -- as
@@ -5457,7 +6649,13 @@ class RIG_OT_hytale_generate_rig(Operator):
 
         self._build_pose_constraints(obj, chains_data)
         tail_constraint_count = self._build_tail_pose_constraints(obj, tail_chains_data)
-        self._build_spine_follow(obj)
+        # v0.13.12 -- respeita o mesmo "Create root.spine_CTRL" (ver
+        # _build_root_controls/HytaleIKChainItem.spine_ctrl_enabled) --
+        # sem root.spine_CTRL não tem pra onde apontar o Spine Follow,
+        # então nem tenta (evita o WARNING de "bone não encontrado" toda
+        # vez que rodar de propósito com a opção desligada).
+        if stats["spine_ctrl_enabled"]:
+            self._build_spine_follow(obj)
         head_follow_built = self._build_head_follow(obj, stats["head_follow_active"], stats["head_follow_source"])
         self._apply_pole_childof_inverses(obj, chains_data, head_follow_built)
         widget_stats = self._build_custom_shapes(obj, chains_data)
@@ -5624,7 +6822,7 @@ class RIG_OT_hytale_generate_rig(Operator):
     def _build_custom_shapes(self, obj, chains_data):
         """Atribui pose_bone.custom_shape pros bones CTRL/CTRL-IK/
         ROOT-CTRL, usando as meshes de hytale_widgets.blend (ver
-        ensure_widget_objects / _widget_name_for_bone). Roda por último --
+        ensure_widget_objects / _widget_candidates_for_bone). Roda por último --
         só depois que TODOS os bones já existem, então dá pra decidir
         "esse bone é a ponta de uma cadeia IK?" com base em chains_data
         sem se preocupar com ordem.
@@ -5664,75 +6862,77 @@ class RIG_OT_hytale_generate_rig(Operator):
             # layer normalmente existe (bones gerados por este script);
             # pode vir None só se um bone entrar em WIDGET_NAME_OVERRIDES
             # (ou no campo "widget" do template de shapes) sem nunca ter
-            # sido gerado por aqui -- _widget_name_for_bone já lida com
-            # isso (override sempre vence, mesmo com layer None). Não é o
-            # caso do Origin_CTRL hoje (ele tem layer= "CTRL" normalmente
-            # -- ver comentário perto do dict).
+            # sido gerado por aqui -- _widget_candidates_for_bone já lida
+            # com isso (override sempre vence, mesmo com layer None). Não
+            # é o caso do Origin_CTRL hoje (ele tem layer= "CTRL"
+            # normalmente -- ver comentário perto do dict).
             layer = pb.bone.get(PROP_RIG_LAYER)
-            widget_name = _widget_name_for_bone(pb.name, layer, ik_tip_names, self._shape_template_bones)
-            if widget_name:
-                wanted[pb.name] = widget_name
+            candidates = _widget_candidates_for_bone(pb.name, layer, ik_tip_names, self._shape_template_bones)
+            if candidates:
+                wanted[pb.name] = candidates
 
-        # Passada 1: TEMPLATE preferido (por papel) -- ainda um por
-        # papel, compartilhado só como FONTE de cópia (ver docstring).
-        preferred_names = set(wanted.values())
-        still_missing = ensure_widget_objects(preferred_names, obj)
-
-        # Passada 2: template fallback só pros bones cujo preferido não existe.
-        needs_fallback = {b for b, w in wanted.items() if w in still_missing}
-        fallback_available = False
-        if needs_fallback:
-            fallback_missing = ensure_widget_objects({WGT_DEFAULT_FALLBACK}, obj)
-            fallback_available = WGT_DEFAULT_FALLBACK not in fallback_missing
-
-        if still_missing and not fallback_available:
-            # v0.16 -- diagnóstico melhorado: a mensagem antiga só listava
-            # os nomes, sem dizer SE o problema é 'arquivo .blend não
-            # encontrado no caminho calculado' (_widgets_library_path())
-            # ou 'arquivo encontrado, mas os nomes não existem dentro
-            # dele' -- duas causas bem diferentes que pediam a mesma
-            # frase genérica antes. v0.16.1 -- no segundo caso, lista
-            # também os nomes que a biblioteca REALMENTE tem
-            # (list_widget_library_names) -- se algum nome esperado
-            # aparecer aí escrito ligeiramente diferente (maiúscula,
-            # espaço, etc.), fica óbvio na hora.
-            lib_path = _widgets_library_path()
-            if os.path.isfile(lib_path):
-                available = list_widget_library_names()
-                available_hint = ", ".join(sorted(available)) if available else "(none readable)"
-                path_hint = f"names not present inside '{lib_path}' -- library actually contains: {available_hint}"
-            else:
-                path_hint = f"library file not found at '{lib_path}'"
-            self.report(
-                {"WARNING"},
-                f"Widget shape(s) not found ({path_hint}): {', '.join(sorted(still_missing))} "
-                f"(and no '{WGT_DEFAULT_FALLBACK}' fallback available either) -- affected bone(s) left with the "
-                f"default shape.",
-            )
-        elif still_missing:
-            self.report(
-                {"INFO"},
-                f"Widget shape(s) not found yet: {', '.join(sorted(still_missing))} -- using "
-                f"'{WGT_DEFAULT_FALLBACK}' as fallback for those roles.",
-            )
+        # Materializa/apenda de hytale_widgets.blend TODO nome candidato
+        # que apareça em QUALQUER cadeia (união de todos os bones) -- uma
+        # passada só, batendo tudo de uma vez, igual antes. Nomes já
+        # POR-BONE/POR-PERSONAGEM (vindos de um override de shape_template
+        # -- ver _bone_widget_name) nunca vão bater com nada aqui dentro
+        # (a biblioteca só entende nome de PAPEL, ex. "WGT_FK_RING") --
+        # ficam em `still_missing`, mas isso é ESPERADO e inofensivo: a
+        # resolução de verdade pra esses é o check por-bone dentro de
+        # _ensure_bone_widget_copy (loop abaixo), que procura o objeto
+        # JÁ existente com aquele nome exato antes de sequer olhar pra
+        # biblioteca -- `still_missing` só entra no relatório final.
+        all_candidate_names = {name for candidates in wanted.values() for name in candidates}
+        still_missing = ensure_widget_objects(all_candidate_names, obj)
 
         widgets_collection = get_or_create_widgets_collection(obj)
         assigned = 0
         used_fallback = 0
-        for bone_name, widget_name in wanted.items():
-            if widget_name in still_missing:
-                if not fallback_available:
-                    continue
-                widget_name = WGT_DEFAULT_FALLBACK
-                used_fallback += 1
+        left_default = []
+        for bone_name, candidates in wanted.items():
             pb = pose_bones[bone_name]
+            # v0.18 -- tenta CADA candidato em ordem (mais específico
+            # primeiro), não só o primeiro -- corrige o bug relatado pelo
+            # usuário: um override de shape_template (ex. cópia por-
+            # personagem apagada por "Remove Generated Bones" > "Delete
+            # All") ANTES pulava direto pro cubo genérico (WGT_DEFAULT_
+            # FALLBACK) quando esse nome específico não existia mais,
+            # mesmo o shape GENÉRICO do papel do bone (WGT_FK_RING/
+            # WGT_IK_BOX) continuando disponível na biblioteca sem
+            # problema nenhum. `still_missing` acima não é usado como
+            # filtro aqui -- só descreve nomes de PAPEL de verdade; cada
+            # candidato é tentado de verdade via _ensure_bone_widget_copy,
+            # que decide sozinho (idempotente) se já existe ou precisa
+            # duplicar do template.
+            # Embutir malha nos Shape Templates: o candidato de índice 0
+            # só existe na lista quando veio de shape_overrides (ver
+            # _widget_candidates_for_bone, tier 1) -- então a chave
+            # "mesh" desse MESMO bone, se existir, só pode se referir a
+            # ESSE candidato específico (nunca ao genérico/fallback, que
+            # sempre resolve via biblioteca de verdade). Passar só no
+            # primeiro índice evita que uma malha embutida seja tentada
+            # como fallback pro papel genérico por engano.
+            bone_mesh_override = self._shape_template_bones.get(bone_name, {}).get("mesh")
+            new_shape_obj = None
+            resolved_name = None
+            for index, candidate in enumerate(candidates):
+                embedded_mesh = bone_mesh_override if index == 0 else None
+                new_shape_obj = _ensure_bone_widget_copy(
+                    candidate, obj, bone_name, widgets_collection, embedded_mesh=embedded_mesh,
+                )
+                if new_shape_obj is not None:
+                    resolved_name = candidate
+                    break
+            if new_shape_obj is None:
+                left_default.append(bone_name)
+                continue
+            if resolved_name == WGT_DEFAULT_FALLBACK:
+                used_fallback += 1
             # v0.17 -- cópia ÚNICA deste bone, duplicada do template
-            # `widget_name` na primeira vez (ver _ensure_bone_widget_copy)
+            # `resolved_name` na primeira vez (ver _ensure_bone_widget_copy)
             # -- nunca mais o mesmo Object entre dois bones, nem do
             # mesmo papel.
-            new_shape_obj = _ensure_bone_widget_copy(widget_name, obj, bone_name, widgets_collection)
-            if new_shape_obj is None:
-                continue
+            #
             # Só reseta Translation/Rotation/Scale pro default na PRIMEIRA
             # vez que ESTE shape é atribuído a ESTE bone -- reruns não
             # apagam ajustes já feitos (template de shapes ativo, ver
@@ -5751,10 +6951,59 @@ class RIG_OT_hytale_generate_rig(Operator):
             self._apply_widget_transform_override(pb, bone_name)
             assigned += 1
 
+        if left_default:
+            # v0.16/v0.16.1 -- diagnóstico melhorado: diz SE o problema é
+            # 'arquivo .blend não encontrado no caminho calculado'
+            # (_widgets_library_path()) ou 'arquivo encontrado, mas nem
+            # o WGT_DEFAULT_FALLBACK existe dentro dele' -- só chega aqui
+            # quando NENHUM candidato (nem o cubo genérico) resolveu pro
+            # bone, então já é o pior caso dos dois.
+            lib_path = _widgets_library_path()
+            if os.path.isfile(lib_path):
+                available = list_widget_library_names()
+                available_hint = ", ".join(sorted(available)) if available else "(none readable)"
+                path_hint = (
+                    f"library found at '{lib_path}', but not even '{WGT_DEFAULT_FALLBACK}' exists inside it "
+                    f"-- library actually contains: {available_hint}"
+                )
+            else:
+                path_hint = f"library file not found at '{lib_path}'"
+            self.report(
+                {"WARNING"},
+                f"No widget shape could be resolved at all ({path_hint}) for {len(left_default)} bone(s): "
+                f"{', '.join(sorted(left_default))} -- affected bone(s) left with Blender's default shape.",
+            )
+        elif used_fallback:
+            self.report(
+                {"INFO"},
+                f"{used_fallback} bone(s) fell back to '{WGT_DEFAULT_FALLBACK}' -- their preferred shape "
+                f"(character-specific override and/or the generic shape for their role) wasn't found. Check "
+                f"the active Shape Template (Character Templates) and hytale_widgets.blend.",
+            )
+
+        # v0.13.12 -- pedido do usuário: o custom shape de root.spine_CTRL
+        # usa Override Transform (custom_shape_transform) apontando pro
+        # _CTRL do último bone configurado na entrada SPINE de Bone
+        # Settings (ver _spine_ctrl_override_transform_bone_name) -- o
+        # widget continua desenhado na posição/tamanho do próprio
+        # root.spine_CTRL (use_custom_shape_bone_size continua True, sem
+        # mudança), só a ORIENTAÇÃO que o shape usa pra se desenhar passa
+        # a seguir a do último bone do Spine. Roda DEPOIS do loop acima
+        # (precisa que root.spine_CTRL já tenha custom_shape atribuído).
+        # None (sem entrada SPINE, sem bone preenchido, ou o bone não
+        # existir de verdade neste armature) limpa o Override Transform
+        # -- volta pro comportamento default do Blender, sem erro.
+        spine_ctrl_pose = pose_bones.get(BONE_ROOT_SPINE)
+        if spine_ctrl_pose is not None:
+            override_bone_name = _spine_ctrl_override_transform_bone_name(armature)
+            spine_ctrl_pose.custom_shape_transform = (
+                pose_bones.get(override_bone_name) if override_bone_name else None
+            )
+
         return {
             "assigned": assigned,
             "fallback": used_fallback,
-            "missing": 0 if fallback_available else len(still_missing),
+            "missing": len(left_default),
         }
 
     def _apply_widget_transform_override(self, pose_bone, bone_name):
@@ -5956,7 +7205,43 @@ class RIG_OT_hytale_generate_rig(Operator):
         CONSTRAINT_HEAD_FOLLOW_LOC (Copy Location) NÃO entra aqui --
         Set Inverse só existe pro tipo Child Of; Copy Location não
         "pula" (é uma cópia contínua, sempre recalculada, sem estado
-        próprio pra ficar desalinhado)."""
+        próprio pra ficar desalinhado).
+
+        v0.13.9 -- FIX (bug relatado pelo usuário): "Set Inverse" captura
+        a diferença entre a matriz MUNDIAL atual do bone e a do target
+        NO MOMENTO em que o operator roda -- se o armature já tinha uma
+        Action carregada (fora da pose de descanso -- ex.: rodou "Remove
+        Generated Bones" + "Create Rig" de novo com uma animação
+        aplicada, current frame no meio dela), essa "diferença" fica
+        calculada em cima da pose ANIMADA, não da pose de descanso. O
+        Child Of guarda esse inverse errado pra sempre -- dali em diante
+        os poles saem "tortos" em QUALQUER frame, incluindo o bind pose,
+        até alguém repetir manualmente o fluxo "voltar pra pose padrão +
+        clicar em Set Inverse nos poles" (exatamente o que o usuário
+        relatou fazer).
+
+        v0.13.10 -- CORRIGIDO DE VERDADE: a v0.13.9 só trocava
+        `armature.pose_position` pra 'REST' antes do loop -- não
+        resolveu (confirmado pelo usuário). Causa: qualquer avaliação de
+        depsgraph entre trocar 'REST' e o operator ler as matrizes
+        (inclusive a que o PRÓPRIO operator dispara internamente antes
+        de agir) reavalia a Action/NLA por cima de qualquer coisa que
+        'REST' tentasse esconder -- 'REST' controla como o Blender
+        DESENHA a pose (e como o modifier Armature deforma a malha), não
+        se a Action continua rodando por baixo -- então a pose "vista"
+        podia voltar a ficar animada bem na hora que o operator
+        calculava a diferença. A técnica que funciona de verdade é a que
+        o usuário já fazia na mão: DESLIGAR a Action (e mutar NLA
+        tracks, se houver) de verdade, e zerar o transform local
+        (`matrix_basis`) de CADA pose bone -- assim não sobra NADA
+        (Action, NLA, ou pose manual antiga) que uma reavaliação de
+        depsgraph possa reaplicar por cima; o bind pose fica garantido
+        não importa quantas vezes o Blender reavaliar no meio do
+        caminho. Guarda a Action, o mute de cada NLA track, e a
+        matrix_basis de CADA bone ANTES de mexer -- restaura os três
+        exatamente como estavam no final (bloco finally), mesmo se algum
+        Set Inverse individual falhar no meio do loop -- a animação
+        volta inteira, sem precisar o usuário reaplicar nada."""
         prev_mode = obj.mode
         if obj.mode != "POSE":
             bpy.ops.object.mode_set(mode="POSE")
@@ -5965,30 +7250,70 @@ class RIG_OT_hytale_generate_rig(Operator):
         prev_active = view_layer.objects.active
         view_layer.objects.active = obj
 
-        targets_by_bone = []
-        for data in chains_data:
-            targets_by_bone.append((data["pole"], (CONSTRAINT_CHILD_OF_LOCAL, CONSTRAINT_CHILD_OF_GLOBAL)))
-            targets_by_bone.append((data["ik_tip"], (CONSTRAINT_CHILD_OF_GLOBAL,)))
-        if head_follow_built:
-            targets_by_bone.append((HEAD_COLLECTION_ROOT, (CONSTRAINT_HEAD_FOLLOW_ROT,)))
+        # v0.13.10 -- desliga TUDO que possa reaplicar uma pose animada
+        # por cima do bind pose durante o loop: a Action ativa, e cada
+        # NLA track (mute individual, sem apagar/desvincular nada).
+        anim_data = obj.animation_data
+        prev_action = anim_data.action if anim_data is not None else None
+        if anim_data is not None and prev_action is not None:
+            anim_data.action = None
+        prev_track_mutes = []
+        if anim_data is not None:
+            for track in anim_data.nla_tracks:
+                prev_track_mutes.append((track, track.mute))
+                track.mute = True
 
-        for bone_name, constraint_names in targets_by_bone:
-            pose_bone = obj.pose.bones.get(bone_name)
-            if pose_bone is None:
-                continue
-            obj.data.bones.active = pose_bone.bone
-            for cname in constraint_names:
-                if cname not in pose_bone.constraints:
+        # Zera o transform local de CADA pose bone -- captura o valor
+        # atual primeiro (pra restaurar depois) -- matrix_basis cobre
+        # loc/rot/scale numa única propriedade, não importa o
+        # rotation_mode de cada bone (o Blender decompõe sozinho na
+        # hora de ler/escrever).
+        saved_pose = {pb.name: pb.matrix_basis.copy() for pb in obj.pose.bones}
+        for pb in obj.pose.bones:
+            pb.matrix_basis = Matrix.Identity(4)
+        view_layer.update()
+
+        try:
+            targets_by_bone = []
+            for data in chains_data:
+                targets_by_bone.append((data["pole"], (CONSTRAINT_CHILD_OF_LOCAL, CONSTRAINT_CHILD_OF_GLOBAL)))
+                targets_by_bone.append((data["ik_tip"], (CONSTRAINT_CHILD_OF_GLOBAL,)))
+            if head_follow_built:
+                targets_by_bone.append((HEAD_COLLECTION_ROOT, (CONSTRAINT_HEAD_FOLLOW_ROT,)))
+
+            for bone_name, constraint_names in targets_by_bone:
+                pose_bone = obj.pose.bones.get(bone_name)
+                if pose_bone is None:
                     continue
-                try:
-                    with bpy.context.temp_override(object=obj, active_object=obj, active_pose_bone=pose_bone):
-                        bpy.ops.constraint.childof_set_inverse(constraint=cname, owner="BONE")
-                except Exception as exc:
-                    self.report(
-                        {"WARNING"},
-                        f"Could not auto Set Inverse for '{cname}' on '{bone_name}': {exc}. "
-                        f"Set it manually in the constraint panel.",
-                    )
+                obj.data.bones.active = pose_bone.bone
+                for cname in constraint_names:
+                    if cname not in pose_bone.constraints:
+                        continue
+                    try:
+                        with bpy.context.temp_override(object=obj, active_object=obj, active_pose_bone=pose_bone):
+                            bpy.ops.constraint.childof_set_inverse(constraint=cname, owner="BONE")
+                    except Exception as exc:
+                        self.report(
+                            {"WARNING"},
+                            f"Could not auto Set Inverse for '{cname}' on '{bone_name}': {exc}. "
+                            f"Set it manually in the constraint panel.",
+                        )
+        finally:
+            # Restaura a pose manual/gerada por matrix_basis PRIMEIRO --
+            # antes de religar a Action, senão o valor restaurado aqui
+            # seria imediatamente sobrescrito por ela mesmo (idempotente
+            # de qualquer forma, já que a Action manda de novo assim que
+            # volta, mas evita um frame intermediário com dado errado se
+            # algo redesenhar no meio).
+            for pb in obj.pose.bones:
+                mb = saved_pose.get(pb.name)
+                if mb is not None:
+                    pb.matrix_basis = mb
+            for track, was_muted in prev_track_mutes:
+                track.mute = was_muted
+            if anim_data is not None and prev_action is not None:
+                anim_data.action = prev_action
+            view_layer.update()
 
         view_layer.objects.active = prev_active
         if obj.mode != prev_mode:
@@ -6062,6 +7387,7 @@ class RIG_OT_hytale_generate_rig(Operator):
         stats = {
             "mch": 0, "ctrl": 0, "ik": 0, "ik_mch": 0, "root": 0, "mch_transfer": 0, "continuous_chain": 0,
             "head_follow_active": False, "head_follow_source": None,
+            "spine_ctrl_enabled": True,
         }
 
         for org in ordered:
@@ -6109,7 +7435,21 @@ class RIG_OT_hytale_generate_rig(Operator):
         # Bones utilitários de controle geral -- precisam existir ANTES da
         # camada de IK (overrides de parent podem apontar pra eles) e dos
         # overrides de parent dos CTRL normais.
-        stats["root"] += self._build_root_controls(edit_bones, coll_ctrl)
+        #
+        # v0.13.12 -- root.spine_CTRL agora é OPCIONAL (checkbox "Create
+        # root.spine_CTRL" na entrada SPINE de Bone Settings, ver
+        # HytaleIKChainItem.spine_ctrl_enabled) -- lê a entrada SPINE
+        # (só a primeira, se existir mais de uma -- root.spine_CTRL é
+        # um bone SINGLETON, não faz sentido por instância) ANTES de
+        # criar; default True (sem entrada SPINE nenhuma, ou entrada sem
+        # esse campo ainda tocado) preserva o comportamento de sempre
+        # (criava incondicionalmente). Guardado em stats pra
+        # _build_spine_follow (Pose Mode, mais tarde) saber se deve
+        # pular os constraints de Spine Follow também, sem precisar
+        # reler hytale_ik_chains de novo.
+        spine_item = next((it for it in armature.hytale_ik_chains if it.chain_type == "SPINE"), None)
+        stats["spine_ctrl_enabled"] = spine_item.spine_ctrl_enabled if spine_item is not None else True
+        stats["root"] += self._build_root_controls(edit_bones, coll_ctrl, stats["spine_ctrl_enabled"])
         self._apply_ctrl_parent_overrides(edit_bones)
 
         resolved_chains = self._resolve_chains(edit_bones, armature)
@@ -6147,7 +7487,7 @@ class RIG_OT_hytale_generate_rig(Operator):
         )
 
         self._build_main_collections(armature, edit_bones)
-        self._move_main_child_before(armature, COLL_MAIN_TAIL, COLL_MAIN_ROOT)
+        self._move_main_child_before(armature, COLL_MAIN_CHAIN, COLL_MAIN_ROOT)
         self._propagate_pole_and_tip_to_main_collections(edit_bones, chains_data)
         self._apply_bone_collection_overrides(armature, edit_bones, chains_data, tail_chains_data)
         # v0.9 (Etapa 2) -- reordena o painel nativo "Bone Collections"
@@ -6173,7 +7513,7 @@ class RIG_OT_hytale_generate_rig(Operator):
         eles)."""
         resolved = []
         for item in armature.hytale_ik_chains:
-            if item.chain_type in ("TAIL", "HEAD", "SPINE", "ATTACHMENTS", "TEXTURE_PICKER"):
+            if item.chain_type in ("CHAIN", "HEAD", "SPINE", "ATTACHMENTS", "TEXTURE_PICKER"):
                 continue
             label = item.label or item.root_bone or "(sem nome)"
             if not item.root_bone or not item.tip_bone:
@@ -6213,45 +7553,58 @@ class RIG_OT_hytale_generate_rig(Operator):
         direto no tip) é válido."""
         resolved = []
         for item in armature.hytale_ik_chains:
-            if item.chain_type != "TAIL":
+            if item.chain_type != "CHAIN":
                 continue
             label = item.label or item.root_bone or "(sem nome)"
             if not item.root_bone or not item.tip_bone:
-                self.report({"WARNING"}, f"Tail '{label}': root/tip bone name is empty -- skipped.")
+                self.report({"WARNING"}, f"Chain '{label}': root/tip bone name is empty -- skipped.")
                 continue
             root = edit_bones.get(item.root_bone)
             if root is None:
-                self.report({"WARNING"}, f"Tail '{label}': root bone '{item.root_bone}' not found -- skipped.")
+                self.report({"WARNING"}, f"Chain '{label}': root bone '{item.root_bone}' not found -- skipped.")
                 continue
             if edit_bones.get(item.tip_bone) is None:
-                self.report({"WARNING"}, f"Tail '{label}': tip bone '{item.tip_bone}' not found -- skipped.")
+                self.report({"WARNING"}, f"Chain '{label}': tip bone '{item.tip_bone}' not found -- skipped.")
                 continue
             path = find_org_path(root, item.tip_bone)
             if path is None:
                 self.report(
                     {"WARNING"},
-                    f"Tail '{label}': no path from '{item.root_bone}' to '{item.tip_bone}' -- skipped.",
+                    f"Chain '{label}': no path from '{item.root_bone}' to '{item.tip_bone}' -- skipped.",
                 )
                 continue
             resolved.append({"item": item, "path": path})
         return resolved
 
     def _build_tail_layer(self, armature, edit_bones, resolved_tail_chains):
-        """Pra cada cadeia TAIL resolvida (v0.7, revisado): quem forma a
-        cadeia fisicamente contínua (posicionalmente -- não "connected"
-        no sentido do Blender, ver abaixo) são os próprios bones `_CTRL`
+        """Pra cada cadeia CHAIN resolvida ("Chain" na UI e também no
+        identificador interno desde v0.7.14 -- ERA "TAIL" nos dois até
+        v0.7.13 (só o rótulo mudou primeiro, ver COLL_MAIN_CHAIN em
+        constants.py) -- pedido explícito do usuário pra também trocar o
+        identificador interno. SEM MIGRAÇÃO (mesma decisão de sempre):
+        uma entrada salva com chain_type == "TAIL" de antes desta versão
+        fica com o Type em branco/inválido no Bone Settings -- o usuário
+        reseleciona "Chain" manualmente): quem forma a cadeia fisicamente
+        contínua (posicionalmente -- não necessariamente "connected" no
+        sentido do Blender, ver abaixo) são os próprios bones `_CTRL`
         (já criados pelo loop genérico em _build_edit_bones, ANTES desta
         etapa rodar) -- aqui só REDIRECIONA o tail de cada `_CTRL` da
         cauda pro head do próximo segmento (mesmo truque de
         _build_ik_layer: os ORG do Hytale vêm com o eixo Y apontando pra
-        cima, não pro filho). use_connect fica DESLIGADO de propósito --
-        a posição já bate (tail de um == head do próximo) sem precisar
-        da conexão "travada" do Blender, que prenderia o bone e
-        impediria reparent/offset (ex.: parent_override). É essa
-        continuidade posicional, no bone que o usuário efetivamente
-        anima (_CTRL), que deixa a cauda pronta pra um addon de física
-        (spring bone, rigid body constraint etc.) hookar de um segmento
-        pro próximo sem gap.
+        cima, não pro filho).
+
+        v0.7.13 -- use_connect (Bone Properties > Relations > Connected)
+        virou OPCIONAL (HytaleIKChainItem.tail_use_connect, desligado
+        por padrão -- pedido explícito do usuário) nos segmentos
+        INTERNOS da cadeia (i > 0, ver bloco abaixo) -- a posição já
+        bate (tail de um == head do próximo) sem precisar da conexão
+        "travada" do Blender, então por padrão continua desligada (o
+        comportamento de sempre, permite reparent/offset livre, ex.
+        parent_override). Ligar é útil quando o efeito visual de
+        "grudado de verdade" importa (ex. uma orelha comprida). A RAIZ
+        da cadeia (i == 0) nunca liga Connected, mesmo com o toggle
+        ativo -- seu parent é EXTERNO à cadeia (o _CTRL do ORG pai real,
+        ou um parent_override), sem garantia de que a posição bate.
 
         v0.13: o bridge dedicado `_Tail` (SUFFIX_TAIL) foi RETIRADO --
         Tail agora reaproveita o bridge GENÉRICO `_MCH_Transfer`
@@ -6283,7 +7636,14 @@ class RIG_OT_hytale_generate_rig(Operator):
         "Specials" nesta versão), oculta por padrão -- é só mecanismo
         interno, nunca precisa ser selecionado."""
         coll_main = ensure_bone_collection(armature, COLL_MAIN)
-        coll_tail = ensure_bone_collection(armature, COLL_MAIN_TAIL, parent=coll_main)
+        # v0.7.7 -- FIX (mesma classe de bug do Texture Picker, achado
+        # numa varredura pedida pelo usuário): ERA criada incondicional,
+        # mesmo em personagens SEM nenhuma cadeia Tail configurada --
+        # sobrava uma "Main/Tail" vazia, sem bone nenhum, à toa. Só cria
+        # se `resolved_tail_chains` tiver pelo menos uma cadeia de
+        # verdade (única leitora de `coll_tail` é o loop abaixo, que já
+        # não roda nada se a lista estiver vazia).
+        coll_tail = ensure_bone_collection(armature, COLL_MAIN_CHAIN, parent=coll_main) if resolved_tail_chains else None
 
         tail_chains_data = []
         for resolved in resolved_tail_chains:
@@ -6302,7 +7662,7 @@ class RIG_OT_hytale_generate_rig(Operator):
                 if ctrl is None:
                     self.report(
                         {"WARNING"},
-                        f"Tail: CTRL bone '{org.name + SUFFIX_CTRL}' not found -- skipped.",
+                        f"Chain: CTRL bone '{org.name + SUFFIX_CTRL}' not found -- skipped.",
                     )
                     ctrl_bones = []
                     break
@@ -6337,6 +7697,20 @@ class RIG_OT_hytale_generate_rig(Operator):
                     rotate_edit_bone_local_axis(
                         ctrl, item.tail_tip_rotation_axis, item.tail_tip_rotation_deg
                     )
+                # v0.7.13 -- "Connected" (pedido explícito do usuário,
+                # ver HytaleIKChainItem.tail_use_connect) -- só aplica
+                # nos segmentos INTERNOS da cadeia (i > 0, cujo parent
+                # real é o _CTRL anterior desta MESMA cadeia, já
+                # posicionado head-a-tail pelo bloco acima). O primeiro
+                # (i == 0, raiz da cadeia) fica de fora de propósito --
+                # o parent dele é EXTERNO (o _CTRL do ORG pai de
+                # verdade, ou um parent_override -- ver abaixo), sem
+                # garantia nenhuma de que a posição bate exatamente;
+                # ligar "Connected" ali "puxaria" a cadeia inteira pra
+                # colar no tail do parent externo, o que não é o efeito
+                # pedido.
+                if i > 0:
+                    ctrl.use_connect = item.tail_use_connect
                 coll_tail.assign(ctrl)
 
             # Parent override (campo "Attach To") -- aplica no _CTRL
@@ -6371,7 +7745,7 @@ class RIG_OT_hytale_generate_rig(Operator):
                 if bridge is None:
                     self.report(
                         {"WARNING"},
-                        f"Tail: bridge bone '{org.name + SUFFIX_MCH_TRANSFER}' not found -- skipped.",
+                        f"Chain: bridge bone '{org.name + SUFFIX_MCH_TRANSFER}' not found -- skipped.",
                     )
                     missing_bridge = True
                     break
@@ -6527,11 +7901,19 @@ class RIG_OT_hytale_generate_rig(Operator):
                 count += 1
         return count
 
-    def _build_root_controls(self, edit_bones, coll_ctrl):
+    def _build_root_controls(self, edit_bones, coll_ctrl, spine_ctrl_enabled=True):
         """Cria (se ainda não existirem) root.master_CTRL, root.spine_CTRL
         e root.pelvis_CTRL. Não derivam de nenhum ORG por sufixo -- usam
         bones de referência já existentes só pra posição/orientação
-        inicial."""
+        inicial.
+
+        v0.13.12 -- `spine_ctrl_enabled` (NOVO parâmetro, pedido do
+        usuário): quando False, PULA root.spine_CTRL inteiro (não cria
+        -- e, se rodar de novo depois de ter sido criado com a opção
+        ligada, NÃO apaga o que já existe -- mesmo espírito não-
+        destrutivo do resto do pipeline; ver RIG_OT_hytale_camera_remove
+        pro mesmo padrão em Head). root.pelvis_CTRL continua sendo
+        criado normalmente -- é independente de root.spine_CTRL."""
         created = 0
         master_source = edit_bones.get(ROOT_MASTER_SOURCE)
         belly_ctrl = edit_bones.get("Belly" + SUFFIX_CTRL)
@@ -6554,7 +7936,7 @@ class RIG_OT_hytale_generate_rig(Operator):
         if master is not None:
             coll_ctrl.assign(master)
 
-        if master_source is not None:
+        if master_source is not None and spine_ctrl_enabled:
             spine, is_new = create_bone_like(edit_bones, master_source, BONE_ROOT_SPINE)
             if is_new:
                 spine.parent = master
@@ -7133,8 +8515,9 @@ class RIG_OT_hytale_generate_rig(Operator):
     def _move_main_child_before(self, armature, child_name, before_name):
         """Reposiciona a bone collection `child_name` (filha de Main) pra
         ficar logo ANTES de `before_name` (outra filha de Main, MESMO
-        parent) na lista -- usado pra colocar "Tail" depois de "Leg R" e
-        antes de "Root" (v0.7).
+        parent) na lista -- usado pra colocar "Chain" (COLL_MAIN_CHAIN,
+        renomeada de "Tail" na v0.7.13) depois de "Leg R" e antes de
+        "Root" (v0.7).
 
         v0.8 -- bug real corrigido aqui (não só o WARNING): a versão
         anterior calculava os índices em `list(armature.collections)`,
@@ -7208,22 +8591,17 @@ class RIG_OT_hytale_generate_rig(Operator):
         abaixo)."""
 
         def _resolve_target(target_name, context_label):
-            settings_item = next(
-                (c for c in armature.hytale_bone_collections if c.name == target_name), None
-            )
-            if settings_item is None:
+            # v0.7.7 -- lógica movida pra resolve_collection_override_target
+            # (nível de módulo), pra também ser reaproveitada por
+            # _build_texture_picker -- ver docstring lá.
+            target_coll = resolve_collection_override_target(armature, target_name)
+            if target_coll is None:
                 self.report(
                     {"WARNING"},
                     f"Bone Settings: collection '{target_name}' not found in Collection Settings (may "
                     f"have been deleted/renamed) -- '{context_label}' kept in the default collection instead.",
                 )
-                return None
-            # v0.9.6 -- ERA "Face ou Main" fixo -- agora anda a cadeia de
-            # parents de verdade (aninhamento livre, ver
-            # _resolve_collection_parent), criando qualquer ancestral que
-            # ainda não exista no caminho.
-            parent = _resolve_collection_parent(armature, settings_item)
-            return ensure_bone_collection(armature, target_name, parent=parent)
+            return target_coll
 
         def _redirect(bone, target_coll):
             # Tira só das sub-collections default de Main (Head/Spine/
@@ -7333,6 +8711,31 @@ class RIG_OT_hytale_generate_rig(Operator):
                     )
                     continue
                 _redirect(bone, target_coll)
+
+            # v0.7.11 -- FIX (bug relatado pelo usuário): root.ui/cursor
+            # (bones auxiliares do Texture Picker, criados por "Create
+            # Texture Picker" -- ver _build_texture_picker) NÃO passavam
+            # por este redirect -- só eram atribuídos uma vez, dentro de
+            # _build_texture_picker, que só roda no clique de "Create
+            # Texture Picker" (botão separado), nunca em "Create Rig".
+            # Se o usuário trocasse Collection DEPOIS de já ter clicado
+            # "Create Texture Picker" uma vez (ex.: Auto -> "Mouth"), os
+            # dois bones ficavam presos na collection antiga (a default
+            # "Texture Picker") pra sempre -- "Create Rig" sozinho nunca
+            # corrigia isso, só clicar "Create Texture Picker" de novo.
+            # Agora redireciona os dois aqui também, se já existirem (SE
+            # -- não cria nada novo, isso continua sendo trabalho
+            # exclusivo de "Create Texture Picker"; aqui só corrige a
+            # COLLECTION de quem já existe, mesmo espírito do resto
+            # deste loop).
+            if item.chain_type == "TEXTURE_PICKER" and item.texture_picker_bone:
+                for aux_name in (
+                    _texture_picker_ui_root_name(item.texture_picker_bone),
+                    _texture_picker_cursor_name(item.texture_picker_bone),
+                ):
+                    aux_bone = edit_bones.get(aux_name)
+                    if aux_bone is not None:
+                        _redirect(aux_bone, target_coll)
 
     def _apply_collection_visibility(self, armature):
         """Esconde tudo (Internal e todo o resto), deixando visível só
@@ -7703,8 +9106,9 @@ class RIG_OT_hytale_generate_rig(Operator):
         ensure_switch_property(
             pose_bones[BONE_PROPERTIES],
             PROP_HEAD_FOLLOW_SWITCH,
-            description=f"1 = Follow {source} (default), 0 = Free rotation (Head_CTRL keeps its own "
-            f"rotation/scale, still follows {source}'s position)",
+            description=tr("rigger.runtime.head_follow_switch_description", get_language(bpy.context)).format(
+                source=source
+            ),
             default_value=1,
         )
 
@@ -7735,6 +9139,17 @@ class RIG_OT_hytale_generate_rig(Operator):
         return True
 
 
+def _shape_template_apply_props(lang):
+    return {
+        "template": StringProperty(
+            name="Shape Template",
+            default="",
+            description=tr("rigger.prop.shape_template_apply_template", lang),
+        ),
+    }
+
+
+@localized_props(_shape_template_apply_props)
 class RIG_OT_hytale_shape_template_apply(Operator):
     """Troca só o template de custom shapes ativo
     (armature.hytale_active_shape_template), sem mexer na lista de
@@ -7742,19 +9157,19 @@ class RIG_OT_hytale_shape_template_apply(Operator):
     rig, ou quando o rig template carregado não tem um shape_template
     correspondente. Não reaplica shapes num rig já gerado sozinho -- rode
     "Create Rig" de novo depois (idempotente, seguro de repetir) pra
-    aplicar."""
+    aplicar.
+
+    Selecionar "(none)" (_TEMPLATE_NONE) no dropdown e clicar Apply LIMPA
+    o template ativo (grava "") em vez de avisar/cancelar -- útil pra
+    voltar os shapes pro genérico da biblioteca, descartando qualquer
+    override por-personagem, sem precisar apagar o template do disco. Só
+    "sem nada selecionado de verdade" (template vazio, nem "(none)")
+    continua sendo tratado como erro."""
 
     bl_idname = "armature.hytale_shape_template_apply"
     bl_label = "Set Hytale Shape Template"
-    bl_description = "Set the active custom shape template (run 'Create Rig' again to apply)"
+    description = tooltip("rigger.tooltip.shape_template_apply")
     bl_options = {"REGISTER", "UNDO"}
-
-    template: StringProperty(
-        name="Shape Template",
-        default="",
-        description="Shape template name to activate -- leave empty to use whatever is currently selected in "
-        "the Character Templates dropdown (wm.hytale_shape_template_selected, see interface.py)",
-    )
 
     @classmethod
     def poll(cls, context):
@@ -7763,9 +9178,31 @@ class RIG_OT_hytale_shape_template_apply(Operator):
 
     def execute(self, context):
         template_name = self.template or context.window_manager.hytale_shape_template_selected
-        if not template_name or template_name == _TEMPLATE_NONE:
+        if not template_name:
             self.report({"WARNING"}, "No shape template selected.")
             return {"CANCELLED"}
+        if template_name == _TEMPLATE_NONE:
+            # "(none)" selecionado de propósito -- limpa o template ativo em
+            # vez de tratar como erro (ANTES caía no mesmo branch de
+            # template_name vazio/inválido, então escolher "(none)" e
+            # clicar em Apply simplesmente não fazia nada além do warning
+            # "No shape template selected.", sem nunca limpar de fato o
+            # armature.data.hytale_active_shape_template já setado antes).
+            # Só grava a property vazia -- não mexe em nenhum bone/widget já
+            # gerado (mesmo espírito 100%-preguiçoso do resto deste
+            # operador: só troca o PONTEIRO, quem aplica de verdade nos
+            # shapes é "Create Rig" rodado de novo depois, ver
+            # _build_custom_shapes/_widget_candidates_for_bone, que sem
+            # nenhum override no template ativo cai direto pro papel
+            # genérico -- exatamente "criar os shape do zero sem as
+            # alterações").
+            context.active_object.data.hytale_active_shape_template = ""
+            self.report(
+                {"INFO"},
+                "Active shape template cleared -- run 'Create Rig' again to build shapes from scratch, "
+                "without any per-character override.",
+            )
+            return {"FINISHED"}
         if get_shape_template(template_name) is None:
             self.report({"WARNING"}, f"Unknown shape template '{template_name}'.")
             return {"CANCELLED"}
@@ -7851,7 +9288,7 @@ _IK_CHAIN_JSON_FIELDS = (
     "pole_angle_manual", "pole_angle_fine_tune", "extra_ik_location", "tail_tip_rotation_axis", "tail_tip_rotation_deg",
     "neck_count", "neck_bone_1", "neck_bone_2", "neck_bone_3", "neck_bone_4", "neck_bone_5",
     "head_bone", "head_end_bone",
-    "spine_count", "pelvis_bone", "spine_bone_1", "spine_bone_2", "spine_bone_3", "spine_bone_4",
+    "spine_count", "spine_ctrl_enabled", "pelvis_bone", "spine_bone_1", "spine_bone_2", "spine_bone_3", "spine_bone_4",
     # v0.13 -- "Continuous Chain", compartilhado por HEAD/SPINE (v0.13.4:
     # sem UI, mas ainda salvo/carregado -- ver comentário em
     # HytaleIKChainItem.continuous_chain).
@@ -7871,6 +9308,25 @@ _IK_CHAIN_JSON_FIELDS = (
     "texture_picker_grid_cols", "texture_picker_grid_rows",
     "texture_picker_grid_cell_width", "texture_picker_grid_cell_height",
     "texture_picker_extra_bone_count", *(f"texture_picker_extra_bone_{i}" for i in range(1, TEXTURE_PICKER_EXTRA_BONES_MAX_COUNT + 1)),
+    # v0.13.5 -- FIX (bug relatado pelo usuário): "collection_override"
+    # nunca esteve nesta tupla -- Save/Load Rig Template sempre ignorou
+    # silenciosamente o dropdown "Collection" de Head/Spine/Arm/Leg/etc.
+    # (mesmo bug de "campo novo esquecido" dos comentários acima, só que
+    # esse nem era novo, já existia desde v0.9). Guarda
+    # "collection_override_name" (o campo INTERNO que
+    # _collection_override_get/_collection_override_set usam por baixo
+    # -- ver comentário grande lá em cima) em vez de "collection_override"
+    # em si de propósito: esse último é o Enum dinâmico (índice na lista
+    # ATUAL de Collection Settings), e setattr(item, "collection_override",
+    # valor) com um nome que ainda não existe no personagem de DESTINO
+    # (ex. aplicando este template num personagem novo, sem "Head Left"
+    # configurado ainda) lançaria erro (identificador de Enum
+    # desconhecido). "collection_override_name" é uma StringProperty
+    # comum -- aceita qualquer texto sem validar, mesmo fallback gracioso
+    # de sempre (cai em "Auto (default)" com aviso, ver
+    # resolve_collection_override_target) se o nome não bater com nada
+    # quando "Create Rig" rodar de verdade.
+    "collection_override_name",
 )
 
 # Bones utilitários (não derivam de nenhuma cadeia IK) que também
@@ -7890,7 +9346,7 @@ class RIG_OT_hytale_rig_template_save(Operator):
 
     bl_idname = "armature.hytale_rig_template_save"
     bl_label = "Save Rig Template"
-    bl_description = "Save the current IK chain list as a new template in your Documents/Hyblend folder"
+    description = tooltip("rigger.tooltip.rig_template_save")
     bl_options = {"REGISTER"}
 
     template_name: StringProperty(name="Template Name", default="")
@@ -7942,7 +9398,7 @@ class RIG_OT_hytale_rig_template_delete(Operator):
 
     bl_idname = "armature.hytale_rig_template_delete"
     bl_label = "Delete Rig Template"
-    bl_description = "Delete the selected rig template from your Documents/Hyblend folder (user templates only)"
+    description = tooltip("rigger.tooltip.rig_template_delete")
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -7968,11 +9424,25 @@ class RIG_OT_hytale_shape_template_save(Operator):
     template novo em Documentos/Hyblend/templates/shapes/<nome>.json --
     útil depois de ajustar os shapes na mão no viewport e querer guardar
     esse resultado como ponto de partida reutilizável, sem mexer em
-    nenhum arquivo builtin do addon."""
+    nenhum arquivo builtin do addon.
+
+    Embutir malha nos Shape Templates: além de translation/rotation/
+    scale/widget, cada bone GENUINAMENTE customizado (ver
+    _widget_mesh_differs_from_template) também ganha uma chave "mesh"
+    com a geometria em si (vértices/edges/faces, ver _mesh_object_to_
+    dict) -- assim a edição sobrevive a um "Remove Generated Bones" >
+    "Delete All", a reimportar em outro .blend, e dá pra compartilhar o
+    template com a edição junto, não só o nome de um objeto que pode não
+    existir em lugar nenhum na hora de carregar de novo (ver
+    _ensure_bone_widget_copy/embedded_mesh). Bones que nunca foram
+    customizados (ainda idênticos ao template do papel na biblioteca)
+    NÃO ganham "mesh" -- continuam recebendo remodelagens futuras de
+    hytale_widgets.blend automaticamente, comportamento documentado em
+    RIG_OT_hytale_clear_generated."""
 
     bl_idname = "armature.hytale_shape_template_save"
     bl_label = "Save Shape Template"
-    bl_description = "Save the current custom shapes as a new template in your Documents/Hyblend folder"
+    description = tooltip("rigger.tooltip.shape_template_save")
     bl_options = {"REGISTER"}
 
     template_name: StringProperty(name="Template Name", default="")
@@ -8013,6 +9483,29 @@ class RIG_OT_hytale_shape_template_save(Operator):
             }
             if pb.custom_shape.name not in (WGT_DEFAULT_FALLBACK,):
                 entry["widget"] = pb.custom_shape.name
+
+            # Embutir malha nos Shape Templates: só embute a GEOMETRIA
+            # quando este bone estiver genuinamente customizado -- ver
+            # _widget_mesh_differs_from_template. PROP_WIDGET_SOURCE_ROLE
+            # ausente (objeto atribuído por fora do pipeline normal, ex.
+            # "Use Selected Object as Widget", ou .blend salvo antes desta
+            # property existir) conta como "sem proveniência conhecida" e
+            # SEMPRE embute -- não tem template confiável pra comparar
+            # contra, e é exatamente o caso de "widget totalmente próprio"
+            # que esta feature também cobre. Com proveniência, só embute
+            # se a malha realmente divergir do template do papel -- um
+            # bone nunca customizado continua recebendo remodelagens
+            # futuras da biblioteca automaticamente (não trava no shape
+            # congelado do momento do save).
+            if pb.custom_shape.type == "MESH":
+                source_role = pb.custom_shape.get(PROP_WIDGET_SOURCE_ROLE)
+                if source_role:
+                    embed_mesh = _widget_mesh_differs_from_template(pb.custom_shape, source_role, obj.name)
+                else:
+                    embed_mesh = True
+                if embed_mesh:
+                    entry["mesh"] = _mesh_object_to_dict(pb.custom_shape.data)
+
             bones[pb.name] = entry
 
         if not bones:
@@ -8035,7 +9528,7 @@ class RIG_OT_hytale_shape_template_delete(Operator):
 
     bl_idname = "armature.hytale_shape_template_delete"
     bl_label = "Delete Shape Template"
-    bl_description = "Delete the selected shape template from your Documents/Hyblend folder (user templates only)"
+    description = tooltip("rigger.tooltip.shape_template_delete")
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -8128,6 +9621,118 @@ def _apply_collection_template_entries(armature, edit_bones, entries, report):
     return assigned, missing_bones
 
 
+def _ensure_collection_settings_entry(armature, name, entry_type, report):
+    """Acha (por nome, na lista INTEIRA -- nomes são únicos entre
+    Collection e Section, mesma regra que RIG_OT_hytale_bone_collection_add
+    já impõe na hora de adicionar pela UI) ou cria uma entrada nova em
+    armature.hytale_bone_collections (Collection Settings, a lista de
+    HytaleBoneCollectionItem -- NÃO a bone collection real do Blender,
+    ver _apply_collection_template_entries pra essa parte) do tipo
+    `entry_type` pedido.
+
+    Se já existir uma entrada com esse nome mas do OUTRO tipo (conflito
+    de verdade -- ex. o template pede uma Section "Tail" mas o
+    armature-alvo já tem uma COLLECTION chamada "Tail" configurada),
+    NÃO sobrescreve o tipo dela (mudar Collection<->Section por baixo
+    confundiria tudo que já depende dela -- bones já atribuídos,
+    dropdowns de Bone Settings apontando pra ela, etc.) -- avisa e
+    devolve None; o chamador pula essa entrada do template, sem derrubar
+    o resto do Apply."""
+    for item in armature.hytale_bone_collections:
+        if item.name == name:
+            if item.entry_type != entry_type:
+                report(
+                    {"WARNING"},
+                    f"Collection template: '{name}' already exists as a {item.entry_type.title()} in "
+                    f"Collection Settings on this armature -- skipped its {entry_type.title()} settings "
+                    f"from the template.",
+                )
+                return None
+            return item
+    item = armature.hytale_bone_collections.add()
+    item.name = name
+    item.entry_type = entry_type
+    return item
+
+
+def _apply_collection_settings_entries(armature, collection_entries, section_entries, report):
+    """Aplica a parte de "Collection Settings" (armature.hytale_bone_
+    collections -- entry_type/parent VISUAL/show_in_animation_tab/row/
+    column) de um Collection Template -- a metade que
+    _apply_collection_template_entries NUNCA tocou (essa função só cuida
+    das bone collections REAIS do Blender + membership de bone, ver sua
+    docstring). Duas partes:
+
+    1. Recria/atualiza cada Section de `section_entries` (schema:
+       {"name", "parent", "row"} -- ver templates/__init__.py). SEM
+       dependência de ordem de criação (ao contrário das bone collections
+       REAIS, que _apply_collection_template_entries resolve em múltiplas
+       passadas porque a API do Blender exige o pai já existir na hora de
+       criar) -- uma Section aqui é só uma entrada solta de PropertyGroup
+       referenciando outra pelo NOME (string), então dá pra criar/
+       atualizar todas de uma vez, em qualquer ordem, sem se preocupar
+       com qual "existe primeiro".
+    2. Pra cada `collection_entries` (a MESMA lista que já virou bone
+       collection real) que tiver pelo menos um dos campos opcionais
+       "section"/"show_in_animation_tab"/"row"/"column" (ver
+       RIG_OT_hytale_collection_template_save -- só embutidos quando a
+       collection também estava cadastrada em Collection Settings na hora
+       do save), cria (se a collection real já existe mas nunca foi
+       cadastrada em Collection Settings no armature-alvo) ou atualiza a
+       entrada correspondente com esses valores. Uma entry SEM nenhum
+       desses campos (template salvo antes desta feature existir, ou uma
+       collection que nunca esteve em Collection Settings na hora do
+       save) não mexe em nada aqui -- comportamento de sempre, só a bone
+       collection real é criada.
+
+    Idempotente/aditivo, mesmo espírito de _apply_collection_template_
+    entries: nunca remove uma entrada existente, só cria as que faltam e
+    atualiza (sobrescreve os campos presentes n`o template, deixa o resto
+    como já estava) as que já existem com o mesmo nome. Devolve quantas
+    entradas (Section + Collection) foram criadas/atualizadas, só pro
+    report() final do chamador."""
+    ensure_default_bone_collections(armature)
+    ensure_default_bone_section_backfill(armature)
+
+    touched = 0
+    for entry in section_entries:
+        name = entry.get("name")
+        if not name:
+            continue
+        item = _ensure_collection_settings_entry(armature, name, "SECTION", report)
+        if item is None:
+            continue
+        try:
+            item.parent = entry.get("parent") or SECTION_ROOT
+            item.row = int(entry.get("row", 0))
+        except (TypeError, ValueError):
+            pass  # campo corrompido num .json editado à mão -- mantém o resto, não derruba o Apply
+        touched += 1
+
+    settings_fields = ("section", "show_in_animation_tab", "row", "column")
+    for entry in collection_entries:
+        name = entry.get("name")
+        if not name or not any(field in entry for field in settings_fields):
+            continue
+        item = _ensure_collection_settings_entry(armature, name, "COLLECTION", report)
+        if item is None:
+            continue
+        try:
+            if "section" in entry:
+                item.parent = entry.get("section") or SECTION_ROOT
+            if "show_in_animation_tab" in entry:
+                item.show_in_animation_tab = bool(entry.get("show_in_animation_tab", True))
+            if "row" in entry:
+                item.row = int(entry.get("row", 0))
+            if "column" in entry:
+                item.column = int(entry.get("column", 0))
+        except (TypeError, ValueError):
+            pass
+        touched += 1
+
+    return touched
+
+
 class RIG_OT_hytale_collection_template_save(Operator):
     """Salva TODAS as bone collections do Armature ativo que NÃO
     pertencem ao conjunto que "Create Rig" já gerencia sozinho (ver
@@ -8135,14 +9740,22 @@ class RIG_OT_hytale_collection_template_save(Operator):
     Hyblend/templates/collections/<nome>.json. Lê a membership direto de
     armature.bones[...].collections -- funciona em Object/Pose Mode, não
     precisa entrar em Edit Mode só pra salvar (ao contrário do Apply, que
-    precisa pra poder chamar coll.assign())."""
+    precisa pra poder chamar coll.assign()).
+
+    Também salva a metade "Collection Settings" (armature.hytale_bone_
+    collections -- entry_type/parent VISUAL/show_in_animation_tab/row/
+    column, ver HytaleBoneCollectionItem): cada Section vira uma entrada
+    na chave nova "sections"; pra cada bone collection real que TAMBÉM
+    estiver cadastrada em Collection Settings (pode não estar, se foi
+    criada direto no painel nativo do Blender, por fora do addon), os
+    campos "section"/"show_in_animation_tab"/"row"/"column" são
+    embutidos na entrada dela em "collections" -- ausentes, se essa
+    collection nunca foi cadastrada lá (comportamento de sempre: só
+    nome/parent-real/bones nesse caso)."""
 
     bl_idname = "armature.hytale_collection_template_save"
     bl_label = "Save Collection Template"
-    bl_description = (
-        "Save the armature's custom bone collections (created via Blender's native Bone Collections panel) "
-        "as a new template in your Documents/Hyblend folder"
-    )
+    description = tooltip("rigger.tooltip.collection_template_save")
     bl_options = {"REGISTER"}
 
     template_name: StringProperty(name="Template Name", default="")
@@ -8166,11 +9779,15 @@ class RIG_OT_hytale_collection_template_save(Operator):
 
         armature = context.active_object.data
         custom_colls = [c for c in _iter_all_collections(armature) if c.name not in RESERVED_MAIN_COLLECTION_NAMES]
-        if not custom_colls:
+        section_settings = [
+            item for item in armature.hytale_bone_collections if item.entry_type == "SECTION" and item.name
+        ]
+        if not custom_colls and not section_settings:
             self.report(
                 {"WARNING"},
-                "No custom bone collection found (only the auto-generated ones exist) -- nothing to save. "
-                "Create one first in the Armature Data Properties > Bone Collections panel.",
+                "No custom bone collection or section found (only the auto-generated ones exist) -- nothing "
+                "to save. Create one first in the Armature Data Properties > Bone Collections panel, or add a "
+                "Section in Collection Settings.",
             )
             return {"CANCELLED"}
 
@@ -8181,28 +9798,64 @@ class RIG_OT_hytale_collection_template_save(Operator):
                 if coll.name in custom_names:
                     bones_by_coll[coll.name].append(bone.name)
 
-        entries = [
-            {
+        # Collection Settings pode não ter uma entrada pra toda bone
+        # collection real -- ver docstring da classe. Índice por nome só
+        # entre as entry_type == "COLLECTION" (nunca confunde com uma
+        # Section que por acaso tenha o mesmo nome -- não deveria
+        # acontecer, nomes são únicos na lista inteira, mas o filtro é
+        # defensivo e barato).
+        settings_by_name = {
+            item.name: item for item in armature.hytale_bone_collections if item.entry_type == "COLLECTION"
+        }
+
+        entries = []
+        for coll in custom_colls:
+            entry = {
                 "name": coll.name,
                 "parent": coll.parent.name if coll.parent is not None else None,
                 "bones": bones_by_coll[coll.name],
             }
-            for coll in custom_colls
+            settings_item = settings_by_name.get(coll.name)
+            if settings_item is not None:
+                entry["section"] = settings_item.parent
+                entry["show_in_animation_tab"] = settings_item.show_in_animation_tab
+                entry["row"] = settings_item.row
+                entry["column"] = settings_item.column
+            entries.append(entry)
+
+        section_entries = [
+            {"name": item.name, "parent": item.parent, "row": item.row} for item in section_settings
         ]
 
         data = {
-            "description": f"User-saved collection template ({len(entries)} collection(s)).",
+            "description": (
+                f"User-saved collection template ({len(entries)} collection(s), "
+                f"{len(section_entries)} section(s))."
+            ),
             "collections": entries,
+            "sections": section_entries,
         }
         path = save_collection_template(self.template_name, data)
         armature.hytale_active_collection_template = self.template_name
         self.report(
             {"INFO"},
-            f"Saved collection template '{self.template_name}' ({len(entries)} collection(s)) to '{path}'.",
+            f"Saved collection template '{self.template_name}' ({len(entries)} collection(s), "
+            f"{len(section_entries)} section(s)) to '{path}'.",
         )
         return {"FINISHED"}
 
 
+def _collection_template_apply_props(lang):
+    return {
+        "template_name": StringProperty(
+            name="Template",
+            default="",
+            description=tr("rigger.prop.collection_template_apply_template_name", lang),
+        ),
+    }
+
+
+@localized_props(_collection_template_apply_props)
 class RIG_OT_hytale_collection_template_apply(Operator):
     """Aplica o template de collections selecionado na lista da box
     "Character Templates": cria (ou reaproveita) cada bone collection
@@ -8210,19 +9863,32 @@ class RIG_OT_hytale_collection_template_apply(Operator):
     uma collection nem desassocia um bone que já estava lá por outro
     motivo (mesmo espírito idempotente do resto do pipeline, ver
     _build_main_collections). Entra e sai do Edit Mode sozinho (precisa
-    dele pra chamar coll.assign()), restaura o modo anterior no final."""
+    dele pra chamar coll.assign()), restaura o modo anterior no final.
+
+    Também aplica a metade "Collection Settings" do template (Sections +
+    section/show_in_animation_tab/row/column por collection, ver
+    _apply_collection_settings_entries) -- roda DEPOIS de sair do Edit
+    Mode (escrita normal de PropertyGroup, sem exigência de modo
+    específico) e força um redraw/sync pra refletir na hora tanto na box
+    "Bone Collections" quanto no painel nativo do Blender.
+
+    Selecionar "(none)" (_TEMPLATE_NONE) no dropdown e clicar Apply
+    LIMPA só o PONTEIRO (armature.hytale_active_collection_template = "")
+    -- mesmo espírito do fix equivalente em
+    RIG_OT_hytale_shape_template_apply/RIG_OT_hytale_ik_chain_load_
+    defaults, mas sem o efeito de "reverter" nada: como aplicar um
+    template de collections é ADITIVO por natureza (ver acima), não
+    existe uma operação inversa segura pra desfazer as collections/
+    Sections/atribuições já criadas por um Apply anterior -- "(none)"
+    aqui só esquece QUAL template estava marcado como ativo, não desfaz
+    o que ele já fez na cena. Pra remover collections/Sections de
+    verdade, use a lista "Bone Collections" (Remove) mais acima nesta
+    mesma aba."""
 
     bl_idname = "armature.hytale_collection_template_apply"
     bl_label = "Apply Collection Template"
-    bl_description = "Apply the selected collection template to the active armature"
+    description = tooltip("rigger.tooltip.collection_template_apply")
     bl_options = {"REGISTER", "UNDO"}
-
-    template_name: StringProperty(
-        name="Template",
-        default="",
-        description="Collection template name to apply -- leave empty to use whatever is currently selected "
-        "in the Character Templates dropdown (wm.hytale_collection_template_selected, see interface.py)",
-    )
 
     @classmethod
     def poll(cls, context):
@@ -8231,15 +9897,27 @@ class RIG_OT_hytale_collection_template_apply(Operator):
 
     def execute(self, context):
         name = self.template_name or context.window_manager.hytale_collection_template_selected
-        if not name or name == _TEMPLATE_NONE:
+        if not name:
             self.report({"WARNING"}, "No collection template selected.")
             return {"CANCELLED"}
+        if name == _TEMPLATE_NONE:
+            # "(none)" de propósito -- só esquece qual template estava
+            # marcado como ativo (ver docstring da classe pro porquê de
+            # NÃO desfazer nenhuma collection/atribuição já criada).
+            context.active_object.data.hytale_active_collection_template = ""
+            self.report(
+                {"INFO"},
+                "Active collection template cleared -- existing bone collections/assignments were not "
+                "removed (use the Bone Collections list above to remove them manually).",
+            )
+            return {"FINISHED"}
 
         data = get_collection_template(name)
         entries = data.get("collections") if data else None
         if not entries:
             self.report({"WARNING"}, f"Unknown or empty collection template '{name}'.")
             return {"CANCELLED"}
+        section_entries = data.get("sections", [])
 
         obj = context.active_object
         armature = obj.data
@@ -8254,8 +9932,17 @@ class RIG_OT_hytale_collection_template_apply(Operator):
             if prev_mode != "OBJECT":
                 bpy.ops.object.mode_set(mode=prev_mode)
 
+        settings_touched = _apply_collection_settings_entries(armature, entries, section_entries, self.report)
+        sync_bone_collection_order(armature)  # reflete a ordem/seção no painel nativo na hora
+        _redraw_all_areas(context)
+
         armature.hytale_active_collection_template = name
         msg = f"Applied collection template '{name}': {assigned} bone assignment(s) across {len(entries)} collection(s)."
+        if settings_touched:
+            msg += (
+                f" Collection Settings updated for {settings_touched} entr"
+                f"{'y' if settings_touched == 1 else 'ies'} ({len(section_entries)} section(s))."
+            )
         if missing_bones:
             msg += f" {len(missing_bones)} bone(s) not found on this armature (skipped)."
         self.report({"INFO"}, msg)
@@ -8268,9 +9955,7 @@ class RIG_OT_hytale_collection_template_delete(Operator):
 
     bl_idname = "armature.hytale_collection_template_delete"
     bl_label = "Delete Collection Template"
-    bl_description = (
-        "Delete the selected collection template from your Documents/Hyblend folder (user templates only)"
-    )
+    description = tooltip("rigger.tooltip.collection_template_delete")
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod

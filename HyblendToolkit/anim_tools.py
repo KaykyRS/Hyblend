@@ -8,11 +8,7 @@ Mesmo espírito de rigger.py: interface.py é quem desenha os botões, este
 arquivo só fornece o que os botões chamam.
 
 Cobre, até agora:
-  1. Toggle de visibilidade das Bone Collections de alto nível que
-     rigger.py já cria (Head/Spine/Body/Arm L/Arm R/Leg L/Leg R/Root/
-     Tail/Face/Attachments) -- não cria nenhuma collection nova, só
-     mostra/esconde as que o Auto-Rigger já gera.
-  2. FK/IK -- dois jeitos de trocar, propositalmente separados:
+  1. FK/IK -- dois jeitos de trocar, propositalmente separados:
      - ANIM_OT_hytale_set_fk_ik (botões FK/IK da lista, por índice de
        cadeia): troca CRUA, só a influência -- não mexe na pose. Pode
        dar um "pulo" visual se FK e IK estiverem posados diferente.
@@ -20,7 +16,7 @@ Cobre, até agora:
        bone ATIVO selecionado): iguala a pose do lado oposto ao
        selecionado E troca pra esse lado oposto, tudo de uma vez --
        ver identify_chain_from_bone/snap_chain_pose logo abaixo.
-  3. v0.13.5 -- "Head Free/Lock" (ANIM_OT_hytale_set_head_follow +
+  2. v0.13.5 -- "Head Free/Lock" (ANIM_OT_hytale_set_head_follow +
      get_head_follow_state): mesmo espírito "cru" do botão FK/IK da
      lista (só troca a influência, não iguala pose) -- não tem
      equivalente ao "Snap FK/IK" (não pedido, e não haveria "lado
@@ -28,6 +24,33 @@ Cobre, até agora:
      poses paralelas guardadas em bones diferentes, só uma rotação
      própria vs. a do predecessor). Switch ÚNICO, sem índice de cadeia
      -- só existe UM Head_CTRL no rig inteiro.
+  3. v0.7.5 -- ANIM_OT_hytale_keyframe_switch: insere keyframe (frame
+     atual) na custom property crua por trás do FK/IK e do Head Free/
+     Lock. Motivo de existir: os botões acima (1 e 2) são operadores
+     (`layout.operator`), e um operador NUNCA é "keyframeable" pelo
+     Blender (colocar o mouse em cima e apertar "I", ou botão direito
+     -> Insert Keyframe, só funciona sobre um `layout.prop()` de
+     verdade) -- por isso não era possível animar FK/IK nem Head Free/
+     Lock antes, mesmo os dois já sendo baseados numa custom property
+     (que POR SI SÓ é animável). Este operador cobre os dois casos
+     (`switch` = "FK_IK"/"HEAD_FOLLOW") reaproveitando a mesma
+     resolução de property que os botões de troca já usam
+     (_resolve_switch_prop) -- ver interface.py pra onde o botão de
+     keyframe (ícone) fica desenhado, ao lado de cada FK/IK e do Free/
+     Lock.
+
+     v0.7.5 -- a visibilidade das Bone Collections (abaixo) deixou de
+     usar operador (ANIM_OT_hytale_toggle_collection_visibility,
+     removido) e passou a ser um `layout.prop(coll, "is_visible", ...)`
+     direto em interface.py -- MESMO motivo do keyframe acima
+     (`is_visible` já é uma property nativa de bpy.types.BoneCollection,
+     não precisava de operador nenhum pra trocar) e também resolve o
+     outro problema relatado (arrastar o mouse sobre vários botões de
+     visibilidade ao mesmo tempo só funciona quando são `prop()` de
+     verdade lado a lado -- é um comportamento nativo do Blender pra
+     botões toggle numa mesma row(align=True), operadores não têm
+     isso). Este arquivo não precisou de nenhuma função nova pra essa
+     parte -- só perdeu a classe do operador antigo.
 
 CAVEAT -- Pole Local/Global: o pole target já tem dois Child Of no rig
 (um mirando na ponta da cadeia -- "Local", ativo por padrão -- outro no
@@ -62,13 +85,26 @@ inclusive as aninhadas dentro de "Main"), então este arquivo NÃO precisa
 importar os nomes de collection de rigger/constants.py: recebe o nome
 (string) já pronto de quem desenha (interface.py), que é quem decide
 QUAIS collections mostrar na lista.
+
+v0.14 -- primeiro arquivo migrado pro sistema de tooltip dinâmico (ver
+"Tooltips dinâmicos" em translations/__init__.py): os 4 bl_description
+viraram `description = tooltip("anim_tools.tooltip.<nome>")`, e os 2
+IntProperty com description= viraram @localized_props (chain_index em
+ANIM_OT_hytale_set_fk_ik e em ANIM_OT_hytale_keyframe_switch) --
+register()/unregister() usam register_localized_class/
+unregister_localized_class no lugar de bpy.utils.*_class direto. Keys
+novas em translations/en.py: anim_tools.tooltip.set_fk_ik,
+anim_tools.tooltip.set_head_follow, anim_tools.tooltip.snap_selected,
+anim_tools.tooltip.keyframe_switch, anim_tools.prop.set_fk_ik_chain_index,
+anim_tools.prop.keyframe_switch_chain_index.
 """
 
 import bpy
-from bpy.props import EnumProperty, IntProperty, StringProperty
+from bpy.props import EnumProperty, IntProperty
 from bpy.types import Operator
 from mathutils import Vector
 
+from .translations import localized_props, register_localized_class, tooltip, tr, unregister_localized_class
 from .rigger import (
     BONE_PROPERTIES,
     CONSTRAINT_CHILD_OF_GLOBAL,
@@ -101,59 +137,17 @@ def _redraw_all_areas(context):
 
 
 # ---------------------------------------------------------------------------
-# Bone Collections -- toggle de visibilidade
-# ---------------------------------------------------------------------------
-
-
-class ANIM_OT_hytale_toggle_collection_visibility(Operator):
-    """Mostra/esconde uma bone collection do rig no viewport. Não muda
-    nada de seleção/pose -- só o que fica desenhado. Funciona em
-    qualquer nível de aninhamento (usa armature.collections_all, não
-    armature.collections -- que só enxerga as de nível raiz)."""
-
-    bl_idname = "armature.hytale_toggle_collection_visibility"
-    bl_label = "Toggle Bone Collection Visibility"
-    bl_description = "Show/hide this bone collection in the viewport"
-    bl_options = {"REGISTER", "UNDO"}
-
-    collection_name: StringProperty(
-        description="Nome exato da bone collection (ex.: 'Arm L', 'Face') -- quem escolhe o valor é o "
-        "interface.py, na hora de desenhar a lista"
-    )
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return obj is not None and obj.type == "ARMATURE"
-
-    def execute(self, context):
-        armature = context.active_object.data
-        coll = armature.collections_all.get(self.collection_name)
-        if coll is None:
-            # Rig ainda não gerado, ou essa collection específica não
-            # existe nesse personagem (ex.: nenhuma cadeia Tail
-            # configurada -- "Tail" nunca chegou a ser criada).
-            self.report(
-                {"WARNING"},
-                f"Bone collection '{self.collection_name}' not found -- generate the rig first.",
-            )
-            return {"CANCELLED"}
-        coll.is_visible = not coll.is_visible
-        return {"FINISHED"}
-
-
-# ---------------------------------------------------------------------------
 # FK/IK Switch + Snap -- por cadeia (armature.hytale_ik_chains)
 # ---------------------------------------------------------------------------
 
 
 def get_fk_ik_state(obj, item):
     """Leitura pura, sem efeito colateral: retorna 0 (FK), 1 (IK), ou
-    None se esse switch ainda não existe (chain_type == TAIL -- não tem
+    None se esse switch ainda não existe (chain_type == CHAIN -- não tem
     IK --, rig nunca gerado, ou entrada nova na lista que ainda não
     passou por "Create Rig"). Usada pelo interface.py só pra saber qual
     dos dois botões (FK/IK) desenhar destacado -- nunca escreve nada."""
-    if item.chain_type == "TAIL":
+    if item.chain_type == "CHAIN":
         return None
     pose = obj.pose
     if pose is None:
@@ -435,6 +429,19 @@ def _write_fk_ik_switch(context, obj, props_bone, prop_name, mode):
     _redraw_all_areas(context)
 
 
+# v0.14 -- todas as properties de ANIM_OT_hytale_set_fk_ik (mesmo a que
+# não tem tooltip nenhum, "mode") vêm desta função em vez de anotação
+# solta no corpo da classe -- @localized_props precisa do dict COMPLETO
+# pra reconstruir a classe quando o idioma muda (ver translations/
+# __init__.py, seção "Tooltip de campo").
+def _set_fk_ik_props(lang):
+    return {
+        "chain_index": IntProperty(description=tr("anim_tools.prop.set_fk_ik_chain_index", lang)),
+        "mode": EnumProperty(items=[("FK", "FK", ""), ("IK", "IK", "")]),
+    }
+
+
+@localized_props(_set_fk_ik_props)
 class ANIM_OT_hytale_set_fk_ik(Operator):
     """Troca a cadeia (item de armature.hytale_ik_chains, por índice)
     pra FK (mode='FK') ou IK (mode='IK') -- SÓ a influência (custom
@@ -446,11 +453,11 @@ class ANIM_OT_hytale_set_fk_ik(Operator):
 
     bl_idname = "pose.hytale_set_fk_ik"
     bl_label = "Set FK/IK"
-    bl_description = "Switch this chain to FK or IK -- doesn't match the pose (use 'Snap FK/IK' for that)"
+    # v0.14 -- description() dinâmico (ver tooltip() em translations/
+    # __init__.py) no lugar de bl_description fixo -- texto mora só em
+    # translations/en.py (key "anim_tools.tooltip.set_fk_ik").
+    description = tooltip("anim_tools.tooltip.set_fk_ik")
     bl_options = {"REGISTER", "UNDO"}
-
-    chain_index: IntProperty(description="Índice em armature.hytale_ik_chains")
-    mode: EnumProperty(items=[("FK", "FK", ""), ("IK", "IK", "")])
 
     @classmethod
     def poll(cls, context):
@@ -466,8 +473,8 @@ class ANIM_OT_hytale_set_fk_ik(Operator):
             return {"CANCELLED"}
 
         item = chains[self.chain_index]
-        if item.chain_type == "TAIL":
-            self.report({"WARNING"}, "Tail chains don't have an FK/IK switch.")
+        if item.chain_type == "CHAIN":
+            self.report({"WARNING"}, "Chain entries don't have an FK/IK switch.")
             return {"CANCELLED"}
 
         props_bone, prop_name, reason = _resolve_switch_prop(obj, item)
@@ -492,7 +499,11 @@ class ANIM_OT_hytale_set_head_follow(Operator):
 
     bl_idname = "pose.hytale_set_head_follow"
     bl_label = "Set Head Free/Lock"
-    bl_description = "Lock (follow the predecessor bone's rotation) or Free (keep Head_CTRL's own rotation)"
+    # v0.14 -- description() dinâmico, ver ANIM_OT_hytale_set_fk_ik acima.
+    # "mode" (abaixo) não tem @localized_props: EnumProperty sem
+    # description= própria, nada aqui pra traduzir -- fica como
+    # anotação normal mesmo, sem overhead de re-registro à toa.
+    description = tooltip("anim_tools.tooltip.set_head_follow")
     bl_options = {"REGISTER", "UNDO"}
 
     mode: EnumProperty(items=[("FREE", "Free", ""), ("LOCK", "Lock", "")])
@@ -525,6 +536,77 @@ class ANIM_OT_hytale_set_head_follow(Operator):
         return {"FINISHED"}
 
 
+def _keyframe_switch_props(lang):
+    return {
+        "switch": EnumProperty(items=[("FK_IK", "FK/IK", ""), ("HEAD_FOLLOW", "Head Follow", "")]),
+        "chain_index": IntProperty(
+            default=-1, description=tr("anim_tools.prop.keyframe_switch_chain_index", lang)
+        ),
+    }
+
+
+@localized_props(_keyframe_switch_props)
+class ANIM_OT_hytale_keyframe_switch(Operator):
+    """Insere um keyframe, no frame atual, no valor CRU (0/1) por trás
+    de um switch FK/IK (por índice de cadeia) ou do Head Free/Lock
+    (switch único) -- ver docstring do módulo pra por que isso não
+    "acontecia sozinho" antes (os botões de troca são operadores, não
+    properties, e só properties são keyframeable). Reaproveita
+    _resolve_switch_prop pra achar a mesma custom property que
+    ANIM_OT_hytale_set_fk_ik já escreve -- então o keyframe inserido
+    aqui é sempre da MESMA property que os botões FK/IK/Free/Lock leem
+    (get_fk_ik_state/get_head_follow_state), nunca uma cópia
+    paralela."""
+
+    bl_idname = "pose.hytale_keyframe_switch"
+    bl_label = "Insert Switch Keyframe"
+    description = tooltip("anim_tools.tooltip.keyframe_switch")
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == "ARMATURE" and obj.pose is not None
+
+    def execute(self, context):
+        obj = context.active_object
+
+        if self.switch == "FK_IK":
+            chains = obj.data.hytale_ik_chains
+            if not (0 <= self.chain_index < len(chains)):
+                self.report({"WARNING"}, "Invalid chain index.")
+                return {"CANCELLED"}
+            props_bone, prop_name, reason = _resolve_switch_prop(obj, chains[self.chain_index])
+            if props_bone is None:
+                self.report({"WARNING"}, reason)
+                return {"CANCELLED"}
+        else:
+            props_bone = obj.pose.bones.get(BONE_PROPERTIES)
+            prop_name = PROP_HEAD_FOLLOW_SWITCH
+            if props_bone is None or prop_name not in props_bone.keys():
+                self.report(
+                    {"WARNING"},
+                    f"'{prop_name}' not found on the {BONE_PROPERTIES} bone -- enable 'Head Free/Lock' "
+                    "on the HEAD entry (Bone Settings) and run 'Create Rig' first.",
+                )
+                return {"CANCELLED"}
+
+        # data_path entre colchetes/aspas -- sintaxe padrão do Blender
+        # pra apontar uma custom (ID) property, não uma bpy.props
+        # registrada de verdade (mesma sintaxe que aparece se você
+        # clicar com o botão direito numa custom property no painel
+        # "Item" da N-Panel e escolher "Copy Data Path").
+        try:
+            props_bone.keyframe_insert(data_path=f'["{prop_name}"]', frame=context.scene.frame_current)
+        except TypeError as exc:
+            self.report({"ERROR"}, f"Couldn't insert keyframe for '{prop_name}': {exc}")
+            return {"CANCELLED"}
+
+        _redraw_all_areas(context)
+        self.report({"INFO"}, f"Keyframed '{prop_name}' at frame {context.scene.frame_current}.")
+        return {"FINISHED"}
+
+
 def identify_chain_from_bone(obj, bone_name):
     """Dado o nome de um bone (tipicamente context.active_pose_bone.name),
     acha em qual cadeia ARM/LEG de armature.hytale_ik_chains ele
@@ -542,7 +624,7 @@ def identify_chain_from_bone(obj, bone_name):
     armature = obj.data
     bones = armature.bones
     for index, item in enumerate(armature.hytale_ik_chains):
-        if item.chain_type == "TAIL" or not item.root_bone or not item.tip_bone:
+        if item.chain_type == "CHAIN" or not item.root_bone or not item.tip_bone:
             continue
         root_bone = bones.get(item.root_bone)
         if root_bone is None:
@@ -577,10 +659,7 @@ class ANIM_OT_hytale_snap_selected(Operator):
 
     bl_idname = "pose.hytale_snap_fk_ik_selected"
     bl_label = "Snap FK/IK"
-    bl_description = (
-        "Match the pose of the opposite side (FK or IK) to the selected bone's chain, then switch to it -- "
-        "does both the snap and the switch in one click, for whichever chain the active bone belongs to"
-    )
+    description = tooltip("anim_tools.tooltip.snap_selected")
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -621,18 +700,22 @@ class ANIM_OT_hytale_snap_selected(Operator):
 
 
 _CLASSES = (
-    ANIM_OT_hytale_toggle_collection_visibility,
     ANIM_OT_hytale_set_fk_ik,
     ANIM_OT_hytale_set_head_follow,
     ANIM_OT_hytale_snap_selected,
+    ANIM_OT_hytale_keyframe_switch,
 )
 
 
 def register():
+    # register_localized_class() cuida das classes com @localized_props
+    # (ANIM_OT_hytale_set_fk_ik, ANIM_OT_hytale_keyframe_switch) e
+    # funciona igual a bpy.utils.register_class() pras outras duas --
+    # ver translations/__init__.py, seção "Tooltip de campo".
     for cls in _CLASSES:
-        bpy.utils.register_class(cls)
+        register_localized_class(cls)
 
 
 def unregister():
     for cls in reversed(_CLASSES):
-        bpy.utils.unregister_class(cls)
+        unregister_localized_class(cls)

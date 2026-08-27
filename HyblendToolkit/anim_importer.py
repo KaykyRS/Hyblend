@@ -98,6 +98,7 @@ from .rigger import (
     SUFFIX_MCH_TRANSFER,
     SUFFIX_POLE,
 )
+from .translations import localized_props, register_localized_class, tooltip, tr, unregister_localized_class
 
 # ---------------------------------------------------------------------------
 # Matemática de import -- espelho EXATO (invertido) de compute_deltas() /
@@ -1397,7 +1398,7 @@ def _resolve_ik_chains(armature_obj, hierarchy):
     uma vez só por _apply_ctrl_mode) -- restaurada aqui."""
     chains = []
     for item in armature_obj.data.hytale_ik_chains:
-        if item.chain_type == "TAIL":
+        if item.chain_type == "CHAIN":
             continue
         if not item.root_bone or not item.tip_bone:
             continue
@@ -1627,221 +1628,181 @@ _FPS_PRESET_VALUES = {
 }
 
 
+# v0.14 -- todas as properties de IMPORT_OT_hytale_blockyanim (mesmo
+# filter_glob, sem tooltip nenhum) vêm desta função -- @localized_props
+# precisa do dict COMPLETO pra reconstruir a classe quando o idioma
+# muda (ver translations/__init__.py, seção "Tooltip de campo").
+def _blockyanim_import_props(lang):
+    return {
+        "filter_glob": StringProperty(default="*.blockyanim", options={"HIDDEN"}),
+        "target_mode": EnumProperty(
+            name="Target",
+            description=tr("anim_importer.prop.target_mode", lang),
+            items=[
+                (
+                    "ORG",
+                    "Original Bones",
+                    tr("anim_importer.prop.target_mode_item_org", lang),
+                ),
+                (
+                    "CTRL",
+                    "Controllers",
+                    tr("anim_importer.prop.target_mode_item_ctrl", lang),
+                ),
+            ],
+            default="ORG",
+        ),
+        "action_name": StringProperty(
+            name="Action Name",
+            description=tr("anim_importer.prop.action_name", lang),
+            default="",
+        ),
+        "start_frame": IntProperty(
+            name="Start Frame",
+            description=tr("anim_importer.prop.start_frame", lang),
+            default=1,
+        ),
+        "import_fps_preset": EnumProperty(
+            name="Frame Rate",
+            description=tr("anim_importer.prop.import_fps_preset", lang),
+            items=[
+                ("6", "6", tr("anim_importer.prop.import_fps_preset_item_6", lang)),
+                ("8", "8", tr("anim_importer.prop.import_fps_preset_item_8", lang)),
+                ("12", "12", tr("anim_importer.prop.import_fps_preset_item_12", lang)),
+                ("23.98", "23.98", tr("anim_importer.prop.import_fps_preset_item_23_98", lang)),
+                ("24", "24", tr("anim_importer.prop.import_fps_preset_item_24", lang)),
+                ("25", "25", tr("anim_importer.prop.import_fps_preset_item_25", lang)),
+                ("29.97", "29.97", tr("anim_importer.prop.import_fps_preset_item_29_97", lang)),
+                ("30", "30", tr("anim_importer.prop.import_fps_preset_item_30", lang)),
+                ("50", "50", tr("anim_importer.prop.import_fps_preset_item_50", lang)),
+                ("59.94", "59.94", tr("anim_importer.prop.import_fps_preset_item_59_94", lang)),
+                ("60", "60", tr("anim_importer.prop.import_fps_preset_item_60", lang)),
+                ("120", "120", tr("anim_importer.prop.import_fps_preset_item_120", lang)),
+                ("240", "240", tr("anim_importer.prop.import_fps_preset_item_240", lang)),
+                ("CUSTOM", "Custom", tr("anim_importer.prop.import_fps_preset_item_custom", lang)),
+            ],
+            default="60",
+        ),
+        "import_fps_custom_fps": IntProperty(
+            name="FPS",
+            description=tr("anim_importer.prop.import_fps_custom_fps", lang),
+            default=FPS_HYTALE,  # já importado no topo do arquivo, de common.py
+            min=1,
+            soft_max=240,
+        ),
+        "import_fps_custom_base": FloatProperty(
+            name="Base",
+            description=tr("anim_importer.prop.import_fps_custom_base", lang),
+            default=1.0,
+            min=0.001,
+            soft_max=120.0,
+        ),
+        "loop_mode": EnumProperty(
+            name="Looping",
+            description=tr("anim_importer.prop.loop_mode", lang),
+            items=[
+                (
+                    "AUTO",
+                    "Auto (from file)",
+                    tr("anim_importer.prop.loop_mode_item_auto", lang),
+                ),
+                (
+                    "CYCLE",
+                    "Cycle (loop)",
+                    tr("anim_importer.prop.loop_mode_item_cycle", lang),
+                ),
+                (
+                    "ONE_SHOT",
+                    "Start & End (no loop)",
+                    tr("anim_importer.prop.loop_mode_item_one_shot", lang),
+                ),
+            ],
+            default="AUTO",
+        ),
+        "bake_mode": BoolProperty(
+            name="Bake to Every Frame",
+            description=tr("anim_importer.prop.bake_mode", lang),
+            default=False,
+        ),
+        "keep_spine_follow": BoolProperty(
+            name="Keep Spine-Follow Active",
+            description=tr("anim_importer.prop.keep_spine_follow", lang),
+            default=True,
+        ),
+        "spine_mode": EnumProperty(
+            name="Spine",
+            description=tr("anim_importer.prop.spine_mode", lang),
+            items=[
+                (
+                    "DEFAULT",
+                    "Default (Root CTRL)",
+                    tr("anim_importer.prop.spine_mode_item_default", lang),
+                ),
+                (
+                    "MANUAL",
+                    "Spine CTRL",
+                    tr("anim_importer.prop.spine_mode_item_manual", lang),
+                ),
+            ],
+            default="DEFAULT",
+        ),
+        "arms_mode": EnumProperty(
+            name="Arms",
+            description=tr("anim_importer.prop.arms_mode", lang),
+            items=[
+                (
+                    "BOTH",
+                    "Default (FK + IK)",
+                    tr("anim_importer.prop.arms_mode_item_both", lang),
+                ),
+                (
+                    "CTRL_FK",
+                    "Control FK",
+                    tr("anim_importer.prop.arms_mode_item_ctrl_fk", lang),
+                ),
+                (
+                    "IK",
+                    "Control IK",
+                    tr("anim_importer.prop.arms_mode_item_ik", lang),
+                ),
+            ],
+            default="BOTH",
+        ),
+        "legs_mode": EnumProperty(
+            name="Legs",
+            description=tr("anim_importer.prop.legs_mode", lang),
+            items=[
+                (
+                    "BOTH",
+                    "Default (FK + IK)",
+                    tr("anim_importer.prop.legs_mode_item_both", lang),
+                ),
+                (
+                    "CTRL_FK",
+                    "Control FK",
+                    tr("anim_importer.prop.legs_mode_item_ctrl_fk", lang),
+                ),
+                (
+                    "IK",
+                    "Control IK",
+                    tr("anim_importer.prop.legs_mode_item_ik", lang),
+                ),
+            ],
+            default="BOTH",
+        ),
+    }
+
+
+@localized_props(_blockyanim_import_props)
 class IMPORT_OT_hytale_blockyanim(Operator, ImportHelper):
     """Import a .blockyanim file onto the active armature"""
 
     bl_idname = "import_scene.hytale_blockyanim"
     bl_label = "Import Hytale Animation"
+    description = tooltip("anim_importer.tooltip.blockyanim")
     bl_options = {"REGISTER", "UNDO"}
 
     filename_ext = ".blockyanim"
-    filter_glob: StringProperty(default="*.blockyanim", options={"HIDDEN"})
-
-    target_mode: EnumProperty(
-        name="Target",
-        description="Which bone layer to write the imported animation onto",
-        items=[
-            (
-                "ORG",
-                "Original Bones",
-                "Keyframe the original game bones directly. Works on ANY armature -- rigged or "
-                "not -- but on a rig with an FK/IK control layer on top, these keyframes won't "
-                "move anything (the original bones are constrained to follow the control layer)",
-            ),
-            (
-                "CTRL",
-                "Controllers",
-                "Writes onto the '_CTRL'/'_IK'/pole bones generated by the auto-rig tool "
-                "(rigger.py), so the imported animation stays editable through the control rig -- "
-                "configure Spine/Arms/Legs below",
-            ),
-        ],
-        default="ORG",
-    )
-    action_name: StringProperty(
-        name="Action Name",
-        description="Leave empty to use the file name",
-        default="",
-    )
-    start_frame: IntProperty(
-        name="Start Frame",
-        description="Blender frame where time=0 of the animation file lands",
-        default=1,
-    )
-    import_fps_preset: EnumProperty(
-        name="Frame Rate",
-        description="Target scene FPS for this import. If the scene isn't already at this FPS, "
-        "it gets changed automatically before importing -- .blockyanim files are authored at "
-        "60 FPS (FPS_HYTALE), so keeping this at 60 avoids the 'timing looks compressed' issue "
-        "from importing into a lower-FPS scene. Same list as Blender's own Output Properties > "
-        "Frame Rate -- pick 'Custom' to set FPS/Base separately, same as there",
-        items=[
-            ("6", "6", "6 fps"),
-            ("8", "8", "8 fps"),
-            ("12", "12", "12 fps"),
-            ("23.98", "23.98", "23.976 fps (24000 / 1001, NTSC film)"),
-            ("24", "24", "24 fps"),
-            ("25", "25", "25 fps"),
-            ("29.97", "29.97", "29.97 fps (30000 / 1001, NTSC)"),
-            ("30", "30", "30 fps"),
-            ("50", "50", "50 fps"),
-            ("59.94", "59.94", "59.94 fps (60000 / 1001, NTSC)"),
-            ("60", "60", "60 fps"),
-            ("120", "120", "120 fps"),
-            ("240", "240", "240 fps"),
-            ("CUSTOM", "Custom", "Set FPS and Base separately below"),
-        ],
-        default="60",
-    )
-    import_fps_custom_fps: IntProperty(
-        name="FPS",
-        description="Custom Frame Rate 'Frame Rate' is set to 'Custom' -- same field as Output "
-        "Properties > Frame Rate > FPS in Blender's own UI. Effective rate is FPS / Base",
-        default=FPS_HYTALE,  # já importado no topo do arquivo, de common.py
-        min=1,
-        soft_max=240,
-    )
-    import_fps_custom_base: FloatProperty(
-        name="Base",
-        description="Custom Frame Rate 'Frame Rate' is set to 'Custom' -- same field as Output "
-        "Properties > Frame Rate > Base in Blender's own UI. Effective rate is FPS / Base",
-        default=1.0,
-        min=0.001,
-        soft_max=120.0,
-    )
-    loop_mode: EnumProperty(
-        name="Looping",
-        description="Whether this clip should close into a seamless loop",
-        items=[
-            (
-                "AUTO",
-                "Auto (from file)",
-                "Use the file's own 'holdLastKeyframe' flag: false = cycle (loop), true = "
-                "start & end (hold last pose)",
-            ),
-            (
-                "CYCLE",
-                "Cycle (loop)",
-                "Force this clip to close into a loop: adds a closing pose at 'duration' that "
-                "matches each channel's first keyframe, so it flows back into itself -- use for "
-                "walk/run/idle cycles",
-            ),
-            (
-                "ONE_SHOT",
-                "Start & End (no loop)",
-                "Force this clip to just hold its last pose at the end -- use for non-looping "
-                "actions (attacks, deaths, one-off gestures)",
-            ),
-        ],
-        default="AUTO",
-    )
-    bake_mode: BoolProperty(
-        name="Bake to Every Frame",
-        description=(
-            "Compute the exact pose at every frame directly from the file's raw keyframes "
-            "(proper spherical interpolation for rotation), instead of relying on Blender's own "
-            "per-component Bezier F-Curves. Produces far more keyframes, but avoids rotation "
-            "interpolation artifacts -- especially noticeable with few, far-apart orientation "
-            "keyframes (common in this format). Recommended for Cycle imports. Affects "
-            "position/rotation on 'Original Bones' and shape stretch on both targets -- "
-            "'Control Bones (FK)' position/rotation always bakes every frame regardless"
-        ),
-        default=False,
-    )
-    keep_spine_follow: BoolProperty(
-        name="Keep Spine-Follow Active",
-        description=(
-            "Control FK, Control IK and Default (FK + IK) only: by default, this stays ACTIVE -- "
-            "any extra constraint on a control bone (ex: Belly_CTRL/Chest_CTRL partially following "
-            "root.spine_CTRL) keeps blending in during import, and in modes that write IK, each "
-            "pole target's Child Of constraints also stay active. Disable this to mute those "
-            "constraints instead, making the imported pose match the source file exactly on the "
-            "affected bones -- at the cost of root.spine_CTRL (and the poles' Child Of) no longer "
-            "being usable as fine-tuning tools on top of the imported animation"
-        ),
-        default=True,
-    )
-    spine_mode: EnumProperty(
-        name="Spine",
-        description="Controllers only: how the rig's utility root bones (root.master_CTRL/"
-        "root.pelvis_CTRL, rigger.py) behave. The source animation only ever moves Pelvis/Belly/"
-        "Chest -- these root bones never move on their own, so they need this to travel with the "
-        "animation (ex: walk/run cycles) instead of staying frozen near the origin",
-        items=[
-            (
-                "DEFAULT",
-                "Default (Root CTRL)",
-                "root.master_CTRL follows the Pelvis's animated position and rotation every frame "
-                "-- root.pelvis_CTRL and Belly_CTRL (real children of root.master_CTRL) travel "
-                "along automatically. Recommended -- matches the source animation's root motion",
-            ),
-            (
-                "MANUAL",
-                "Spine CTRL",
-                "root.master_CTRL/root.pelvis_CTRL stay frozen at rest -- Pelvis/Belly/Chest are "
-                "still keyframed normally, but the character won't travel with root motion (ex: "
-                "walking will look like walking in place). Leaves root.spine_CTRL free as a manual "
-                "fine-tuning handle on top of the imported animation instead",
-            ),
-        ],
-        default="DEFAULT",
-    )
-    arms_mode: EnumProperty(
-        name="Arms",
-        description="Controllers only: how 'Arm'-type chains (armature.hytale_ik_chains, "
-        "rigger.py) are keyframed",
-        items=[
-            (
-                "BOTH",
-                "Default (FK + IK)",
-                "Writes both at once -- every arm segment gets its FK '_CTRL' AND the chain's IK "
-                "tip (hand) + pole also get keyframed. fk_ik_switch defaults to FK (0); toggle it "
-                "any time afterward, per chain, to preview or use the IK version instead -- no "
-                "need to reimport",
-            ),
-            (
-                "CTRL_FK",
-                "Control FK",
-                "Only the per-segment '_CTRL' bones -- fk_ik_switch is left untouched (the chain "
-                "doesn't receive any '_IK'/pole keyframes at all)",
-            ),
-            (
-                "IK",
-                "Control IK",
-                "Only the '_IK' tip (hand) + pole target -- per-segment '_CTRL' bones are skipped, "
-                "and fk_ik_switch is set to IK (1)",
-            ),
-        ],
-        default="BOTH",
-    )
-    legs_mode: EnumProperty(
-        name="Legs",
-        description="Controllers only: how 'Leg'-type chains (armature.hytale_ik_chains, "
-        "rigger.py) are keyframed -- same 3 options as Arms, applied independently",
-        items=[
-            (
-                "BOTH",
-                "Default (FK + IK)",
-                "Writes both at once -- every leg segment gets its FK '_CTRL' AND the chain's IK "
-                "tip (foot) + pole also get keyframed. fk_ik_switch defaults to FK (0); toggle it "
-                "any time afterward, per chain, to preview or use the IK version instead -- no "
-                "need to reimport",
-            ),
-            (
-                "CTRL_FK",
-                "Control FK",
-                "Only the per-segment '_CTRL' bones -- fk_ik_switch is left untouched (the chain "
-                "doesn't receive any '_IK'/pole keyframes at all)",
-            ),
-            (
-                "IK",
-                "Control IK",
-                "Only the '_IK' tip (foot) + pole target -- per-segment '_CTRL' bones are skipped, "
-                "and fk_ik_switch is set to IK (1)",
-            ),
-        ],
-        default="BOTH",
-    )
 
     @classmethod
     def poll(cls, context):
@@ -1934,15 +1895,18 @@ _CLASSES = (IMPORT_OT_hytale_blockyanim,)
 
 
 def register():
+    # v0.14 -- register_localized_class() cuida da @localized_props
+    # (ver topo do arquivo) -- ver translations/__init__.py, seção
+    # "Tooltip de campo".
     for cls in _CLASSES:
-        bpy.utils.register_class(cls)
+        register_localized_class(cls)
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
 
 
 def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     for cls in reversed(_CLASSES):
-        bpy.utils.unregister_class(cls)
+        unregister_localized_class(cls)
 
 
 if __name__ == "__main__":

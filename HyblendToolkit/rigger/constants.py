@@ -62,7 +62,13 @@ COLL_MAIN_ARM_R = "Arm R"
 COLL_MAIN_LEG_L = "Leg L"
 COLL_MAIN_LEG_R = "Leg R"
 COLL_MAIN_ROOT = "Root"
-COLL_MAIN_TAIL = "Tail"  # v0.7 -- bones _CTRL de uma cadeia Tail (ver HytaleIKChainItem.chain_type == "TAIL"), sempre visível (mesmo espírito de Arm/Leg/etc.)
+COLL_MAIN_CHAIN = "Chain"  # v0.7.14 -- ERA COLL_MAIN_TAIL = "Tail" -- renomeado (NOME do símbolo Python E
+# valor) junto com o rótulo E o identificador interno do chain_type "TAIL" -> "CHAIN" na UI/dados (pedido
+# explícito do usuário: essa cadeia serve pra qualquer coisa que precise de bones "conectados" em sequência
+# -- orelha comprida, cauda, o que for -- não só cauda). SEM MIGRAÇÃO (mesma decisão já tomada outras vezes
+# neste arquivo): uma collection "Tail" de antes desta versão fica órfã, o usuário reorganiza manualmente
+# se quiser; uma entrada salva com chain_type == "TAIL" fica com o Type em branco no Bone Settings, o
+# usuário reseleciona "Chain" manualmente.
 COLL_MAIN_TEXTURE_PICKER = "Texture Picker"  # v0.10 -- chain_type MOUTH, renomeado TEXTURE_PICKER na v0.11 (Texture Picker), mesmo espírito organizacional de COLL_MAIN_HEAD/SPINE
 
 # Todo nome de bone collection que o PRÓPRIO "Create Rig" já cria/
@@ -76,7 +82,7 @@ RESERVED_MAIN_COLLECTION_NAMES = {
     COLL_HYTALE_EXPORT, COLL_INTERNAL, COLL_ORG, COLL_MCH, COLL_MCH_IK, COLL_CTRL, COLL_CTRL_IK,
     COLL_ATTACHMENTS_IMPORTED, COLL_FACE, COLL_MAIN, COLL_ATTACHMENTS, COLL_MAIN_HEAD, COLL_MAIN_SPINE,
     COLL_MAIN_BODY, COLL_MAIN_ARM_L, COLL_MAIN_ARM_R, COLL_MAIN_LEG_L, COLL_MAIN_LEG_R, COLL_MAIN_ROOT,
-    COLL_MAIN_TAIL, COLL_MAIN_TEXTURE_PICKER,
+    COLL_MAIN_CHAIN, COLL_MAIN_TEXTURE_PICKER,
 }
 
 # v0.9 (Tarefa B, split de rigger.py): SUFFIX_MCH/SUFFIX_CTRL/SUFFIX_IK
@@ -175,6 +181,19 @@ PROP_FK_IK_SWITCH = "fk_ik_switch"
 # Chest_CTRL -- a posição continua acompanhando, ver
 # CONSTRAINT_HEAD_FOLLOW_LOC, que nunca tem toggle).
 PROP_HEAD_FOLLOW_SWITCH = "head_follow_switch"
+
+# Custom property no OBJECT do widget por-bone (ver _ensure_bone_widget_copy
+# em rig.py), gravada só quando a cópia é duplicada de um TEMPLATE de papel
+# de verdade (ex.: "WGT_hytale_fk_ring") -- guarda o base_name de origem,
+# pra RIG_OT_hytale_shape_template_save saber contra qual template comparar
+# na hora de decidir se embute a malha editada no .json (ver "mesh" no
+# schema de shapes/<nome>.json, em templates/__init__.py -- feature de
+# embutir malha nos Shape Templates). Ausente = sem proveniência conhecida
+# -- objeto atribuído por fora do pipeline normal (ex.: "Use Selected
+# Object as Widget") ou vindo de um .blend salvo antes desta property
+# existir -- nesses casos o save SEMPRE embute a malha (não tem contra o
+# que comparar, mesmo espírito "sem migração" do resto do addon).
+PROP_WIDGET_SOURCE_ROLE = "hytale_widget_source_role"
 
 # Nomes de constraint iguais aos dos scripts de referência (facilita
 # comparar/depurar um rig gerado por este script com um feito à mão).

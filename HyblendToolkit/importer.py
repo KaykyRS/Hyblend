@@ -29,7 +29,16 @@ from .common import (
     quat_xyzw,
     vec3,
 )
-from .translations import get_language, get_language_items, tr
+from .translations import (
+    get_language,
+    get_language_items,
+    localized_props,
+    refresh_localized_properties,
+    register_localized_class,
+    tooltip,
+    tr,
+    unregister_localized_class,
+)
 
 # ---------------------------------------------------------------------------
 # i18n
@@ -43,30 +52,67 @@ from .translations import get_language, get_language_items, tr
 # "importer." nas keys mudou, pra não colidir com as keys de
 # interface.py (prefixo "panel.") dentro do mesmo dicionário compartilhado.
 #
-# Continua valendo a limitação de antes: o tooltip (hover) de um
-# bpy.props.*Property (parâmetro description=) fica fixo em Inglês,
-# porque o Blender resolve esse texto no registro da classe, não a cada
-# redraw -- ver a nota grande sobre isso em translations/__init__.py.
+# v0.14 -- a limitação antiga (tooltip de property fixo em Inglês) foi
+# resolvida -- ver "Tooltips dinâmicos" em translations/__init__.py.
+# HytaleImporterPreferences.language (logo abaixo) é o primeiro caso
+# real usando @localized_props: description= agora vem de tr(), e o
+# update= dispara refresh_localized_properties() em TODO o addon assim
+# que o usuário troca o idioma nas Preferences (não só neste arquivo --
+# qualquer outro arquivo migrado pra @localized_props é atualizado
+# junto, automaticamente, sem este arquivo precisar saber quais).
 
 
+def _on_language_update(self, context):
+    """update= de HytaleImporterPreferences.language -- dispara o
+    re-registro de toda classe @localized_props (de QUALQUER arquivo do
+    addon, não só deste) no idioma novo. Ver refresh_localized_properties
+    em translations/__init__.py pro porquê disso ser necessário (tooltip
+    de property não é dinâmico por redraw como o de botão).
+
+    IMPORTANTE -- agendado via bpy.app.timers em vez de chamado direto:
+    estamos rodando DENTRO do update() da property "language", que
+    pertence à própria HytaleImporterPreferences -- e essa classe
+    TAMBÉM está em @localized_props, então refresh_localized_properties
+    vai desregistrar/re-registrar ela mesma. Fazer isso síncrono, ainda
+    dentro do callback de update disparado pela escrita dessa mesma
+    property, é reentrância arriscada (o Blender pode não ter terminado
+    de processar a escrita na struct RNA antiga quando ela é trocada por
+    baixo) -- por isso adiamos pro próximo tick do loop de eventos, o
+    mesmo padrão usado por addons que precisam re-registrar sua própria
+    classe de Preferences a partir de um update= dela mesma."""
+
+    def _do_refresh():
+        refresh_localized_properties(bpy.context)
+        return None  # não repete (timer de disparo único)
+
+    bpy.app.timers.register(_do_refresh, first_interval=0.0)
+
+
+def _importer_preferences_props(lang):
+    return {
+        # items=get_language_items é uma FUNÇÃO (callback), não uma lista
+        # fixa -- é o que permite qualquer arquivo novo dentro de
+        # translations/ aparecer aqui sem precisar editar este arquivo.
+        # Efeito colateral: EnumProperty com items dinâmico não aceita
+        # default= (o Blender não tem como saber o valor default antes
+        # de rodar o callback) -- por isso não tem default= aqui;
+        # get_language() (translations/__init__.py) já cai pro Inglês
+        # sozinho caso o valor salvo seja inválido/vazio.
+        "language": EnumProperty(
+            name="Language / Idioma",
+            description=tr("importer.prefs_language_tooltip", lang),
+            items=get_language_items,
+            update=_on_language_update,
+        ),
+    }
+
+
+@localized_props(_importer_preferences_props)
 class HytaleImporterPreferences(AddonPreferences):
     # Tem que ser o nome do PACOTE raiz (ver common.ADDON_PACKAGE), não
     # __name__ deste submódulo -- senão o Blender não acha essas
     # preferences em context.preferences.addons[...].
     bl_idname = ADDON_PACKAGE
-
-    # items=get_language_items é uma FUNÇÃO (callback), não uma lista fixa
-    # -- é o que permite qualquer arquivo novo dentro de translations/
-    # aparecer aqui sem precisar editar este arquivo. Efeito colateral:
-    # EnumProperty com items dinâmico não aceita default= (o Blender não
-    # tem como saber o valor default antes de rodar o callback) -- por
-    # isso não tem default= aqui; get_language() (translations/__init__.py)
-    # já cai pro Inglês sozinho caso o valor salvo seja inválido/vazio.
-    language: EnumProperty(
-        name="Language / Idioma",
-        description="Language used for labels in the panel and import dialogs (tooltips stay in English)",
-        items=get_language_items,
-    )
 
     def draw(self, context):
         lang = get_language(context)
@@ -1989,236 +2035,142 @@ def derive_default_name(filepath):
 # ---------------------------------------------------------------------------
 
 
+# v0.14 -- todas as properties de IMPORT_OT_hytale_blockymodel (mesmo
+# filter_glob, sem tooltip nenhum) vêm desta função -- @localized_props
+# precisa do dict COMPLETO pra reconstruir a classe quando o idioma
+# muda (ver translations/__init__.py, seção "Tooltip de campo").
+def _blockymodel_import_props(lang):
+    return {
+        "filter_glob": StringProperty(default="*.blockymodel", options={"HIDDEN"}),
+        "import_mode": EnumProperty(
+            name="Import Mode",
+            description=tr("importer.prop.blockymodel_import_mode", lang),
+            items=[
+                (
+                    "NEW_ARMATURE",
+                    "Create New Armature",
+                    tr("importer.prop.blockymodel_import_mode_item_new", lang),
+                ),
+                (
+                    "ATTACH_EXISTING",
+                    "Attach to Existing Armature",
+                    tr("importer.prop.blockymodel_import_mode_item_attach", lang),
+                ),
+            ],
+            default="NEW_ARMATURE",
+        ),
+        "target_armature_name": StringProperty(
+            name="Target Armature",
+            description=tr("importer.prop.blockymodel_target_armature_name", lang),
+            default="",
+        ),
+        "armature_name": StringProperty(
+            name="Armature Name",
+            description=tr("importer.prop.blockymodel_armature_name", lang),
+            default="",
+        ),
+        "generate_reference_boxes": BoolProperty(
+            name="Generate Reference Meshes",
+            description=tr("importer.prop.blockymodel_generate_reference_boxes", lang),
+            default=True,
+        ),
+        "flat_mesh_collections": BoolProperty(
+            name="Flat Mesh Collections",
+            description=tr("importer.prop.blockymodel_flat_mesh_collections", lang),
+            default=False,
+        ),
+        "generate_uvs": BoolProperty(
+            name="Generate UVs",
+            description=tr("importer.prop.blockymodel_generate_uvs", lang),
+            default=True,
+        ),
+        "missing_face_mode": EnumProperty(
+            name="Faces Missing Texture Data",
+            description=tr("importer.prop.blockymodel_missing_face_mode", lang),
+            items=[
+                (
+                    "SKIP",
+                    "Skip (leave empty) -- matches Blockbench",
+                    tr("importer.prop.blockymodel_missing_face_mode_item_skip", lang),
+                ),
+                (
+                    "OPPOSITE_FALLBACK",
+                    "Reuse Opposite Face's Texture (cosmetic)",
+                    tr("importer.prop.blockymodel_missing_face_mode_item_opposite", lang),
+                ),
+            ],
+            default="SKIP",
+        ),
+        "override_atlas_size": BoolProperty(
+            name="Set Atlas Size Manually",
+            description=tr("importer.prop.blockymodel_override_atlas_size", lang),
+            default=False,
+        ),
+        "atlas_width": FloatProperty(
+            name="Atlas Width (px)",
+            description=tr("importer.prop.blockymodel_atlas_width", lang),
+            default=256.0,
+            min=1.0,
+        ),
+        "atlas_height": FloatProperty(
+            name="Atlas Height (px)",
+            description=tr("importer.prop.blockymodel_atlas_height", lang),
+            default=128.0,
+            min=1.0,
+        ),
+        "create_material": BoolProperty(
+            name="Create Material",
+            description=tr("importer.prop.blockymodel_create_material", lang),
+            default=True,
+        ),
+        "texture_mode": EnumProperty(
+            name="Texture Mode",
+            description=tr("importer.prop.blockymodel_texture_mode", lang),
+            items=[
+                (
+                    "AUTO",
+                    "Automatic",
+                    tr("importer.prop.blockymodel_texture_mode_item_auto", lang),
+                ),
+                (
+                    "MANUAL",
+                    "Manual",
+                    tr("importer.prop.blockymodel_texture_mode_item_manual", lang),
+                ),
+            ],
+            default="AUTO",
+        ),
+        "texture_filepath": StringProperty(
+            name="Texture Image",
+            description=tr("importer.prop.blockymodel_texture_filepath", lang),
+            default="",
+            subtype="FILE_PATH",
+        ),
+        "orient_z_up": BoolProperty(
+            name="Orient to Z-up (visual only)",
+            description=tr("importer.prop.blockymodel_orient_z_up", lang),
+            default=True,
+        ),
+        "unit_scale": FloatProperty(
+            name="Scale (Blender units per game unit)",
+            description=tr("importer.prop.blockymodel_unit_scale", lang),
+            default=UNIT_SCALE_DEFAULT,
+            min=0.0001,
+            max=10.0,
+        ),
+    }
+
+
+@localized_props(_blockymodel_import_props)
 class IMPORT_OT_hytale_blockymodel(Operator, ImportHelper):
     """Import a Hytale .blockymodel as an Armature (correct rest pose)"""
 
     bl_idname = "import_scene.hytale_blockymodel"
     bl_label = "Import .blockymodel"
+    description = tooltip("importer.tooltip.blockymodel")
     bl_options = {"REGISTER", "UNDO"}
 
     filename_ext = ".blockymodel"
-    filter_glob: StringProperty(default="*.blockymodel", options={"HIDDEN"})
-
-    import_mode: EnumProperty(
-        name="Import Mode",
-        description=(
-            "NEW: creates a brand new Armature + reference-mesh collection. "
-            "ATTACH: merges this file's bones into an Armature that's already "
-            "in the scene (e.g. an attachment/prop file like eyes, meant to "
-            "plug into an existing character's attachment-point bones)"
-        ),
-        items=[
-            ("NEW_ARMATURE", "Create New Armature", "Creates a new Armature and reference-mesh collection"),
-            (
-                "ATTACH_EXISTING",
-                "Attach to Existing Armature",
-                "Merges into an Armature already in the scene, reusing any bone/mesh that already has a matching name",
-            ),
-        ],
-        default="NEW_ARMATURE",
-    )
-
-    target_armature_name: StringProperty(
-        name="Target Armature",
-        description=(
-            "Name of the existing Armature (in this .blend file) to attach "
-            "this file's bones to. If a bone with a given name already exists "
-            "there, it's reused as-is (NOT recreated/renamed with .001) -- "
-            "e.g. an eye-attachment file plugs its bones under the "
-            "character's existing 'R-Eye-Attachment' bone instead of "
-            "duplicating it. Same for the reference-mesh collection: reused "
-            "instead of creating a new one"
-        ),
-        default="",
-    )
-
-    armature_name: StringProperty(
-        name="Armature Name",
-        description=(
-            "Name for the new Armature and its reference-mesh collection. "
-            "Leave empty to fall back to the .blockymodel filename -- note "
-            "the file itself doesn't store a character/creature name (only "
-            "bone/piece names), so for files like 'Model.blockymodel' that "
-            "don't match the character's real name (e.g. a boss), type the "
-            "name you actually want here"
-        ),
-        default="",
-    )
-
-    generate_reference_boxes: BoolProperty(
-        name="Generate Reference Meshes",
-        description=(
-            "Creates a simple mesh (box or quad) for each visual shape in the "
-            "model, parented to the Armature and skinned (100% weight) to its "
-            "bone via a Vertex Group + Armature modifier. Useful as a visual "
-            "reference while animating, and already deformable/paintable"
-        ),
-        default=True,
-    )
-
-    flat_mesh_collections: BoolProperty(
-        name="Flat Mesh Collections",
-        description=(
-            "Keep every bone's mesh collection at a single flat level, "
-            "instead of the default nested layout (a bone's mesh collection "
-            "sits inside its nearest ancestor bone's mesh collection, "
-            "mirroring the model's own hierarchy -- same idea as folders in "
-            "Blockbench). Enable this to flatten everything to one level "
-            "instead"
-        ),
-        default=False,
-    )
-
-    generate_uvs: BoolProperty(
-        name="Generate UVs",
-        description=(
-            "Generates UV coordinates for the reference meshes from the "
-            "model's texture layout data (per-face pixel offsets). The "
-            "original texture image size isn't stored in the file, so unless "
-            "'Set Atlas Size Manually' is enabled below, the canvas size is "
-            "INFERRED from the layout data itself -- this is only a lower "
-            "bound (it can come out a few pixels short on width/height if "
-            "the real texture has unused padding), so if you know the actual "
-            "texture's pixel dimensions, set them manually for an exact match"
-        ),
-        default=True,
-    )
-
-    missing_face_mode: EnumProperty(
-        name="Faces Missing Texture Data",
-        description=(
-            "What to do with a box face that has no entry in the model's "
-            "texture layout. CONFIRMED against the official Hytale "
-            "Blockbench plugin's own source (blockymodel.ts): a missing "
-            "entry ALWAYS means that face had no texture assigned in "
-            "Blockbench -- there's no 'implicitly hidden by another piece' "
-            "case. So 'Skip' below is the behavior that faithfully matches "
-            "Blockbench itself (reloading the file there shows the same "
-            "empty face). 'Reuse Opposite Face' is a cosmetic-only override "
-            "for when you'd rather see some texture than a hole, even "
-            "knowing it doesn't match the source file"
-        ),
-        items=[
-            (
-                "SKIP",
-                "Skip (leave empty) -- matches Blockbench",
-                "Don't create geometry for that face. Faithful to what "
-                "Blockbench itself would show -- a missing texture layout "
-                "entry always means the face was genuinely untextured",
-            ),
-            (
-                "OPPOSITE_FALLBACK",
-                "Reuse Opposite Face's Texture (cosmetic)",
-                "Create the face and reuse the texture from the opposite "
-                "side of the same box. Does NOT match what Blockbench "
-                "itself would show -- purely a visual patch to avoid holes, "
-                "can paste the wrong-looking texture onto a visible face",
-            ),
-        ],
-        default="SKIP",
-    )
-
-    override_atlas_size: BoolProperty(
-        name="Set Atlas Size Manually",
-        description=(
-            "Use the exact pixel dimensions of your texture file instead of "
-            "guessing them from the layout data. Recommended: open your "
-            "texture (e.g. in Blockbench or an image viewer) and enter its "
-            "width/height here"
-        ),
-        default=False,
-    )
-
-    atlas_width: FloatProperty(
-        name="Atlas Width (px)",
-        description="Exact width, in pixels, of the texture atlas image",
-        default=256.0,
-        min=1.0,
-    )
-
-    atlas_height: FloatProperty(
-        name="Atlas Height (px)",
-        description="Exact height, in pixels, of the texture atlas image",
-        default=128.0,
-        min=1.0,
-    )
-
-    create_material: BoolProperty(
-        name="Create Material",
-        description=(
-            "Creates one shared material wired into Base Color through the "
-            "generated UVs, applied to every reference mesh. Hytale/Blockbench "
-            "models only use a single flat texture (no PBR maps), so this "
-            "mirrors that. If 'Texture Image' below is set, loads that image "
-            "and uses its real pixel dimensions for the UV layout (overriding "
-            "'Set Atlas Size Manually' above, if also enabled); otherwise "
-            "creates a blank placeholder sized from the atlas size in use"
-        ),
-        default=True,
-    )
-
-    texture_mode: EnumProperty(
-        name="Texture Mode",
-        description=(
-            "'Automatic' finds the texture PNG on disk using the same "
-            "convention as the official Hytale Blockbench plugin (same "
-            "folder as the model, or a '<ModelName>_Textures' subfolder). "
-            "'Manual' lets you point to a specific file instead, ignoring "
-            "auto-detection entirely"
-        ),
-        items=[
-            (
-                "AUTO",
-                "Automatic",
-                "Auto-detect the texture PNG next to the model (same "
-                "convention as the official Hytale plugin)",
-            ),
-            (
-                "MANUAL",
-                "Manual",
-                "Pick the texture PNG yourself -- auto-detection is skipped entirely",
-            ),
-        ],
-        default="AUTO",
-    )
-
-    texture_filepath: StringProperty(
-        name="Texture Image",
-        description=(
-            "The model's texture PNG. The .blockymodel file only stores "
-            "per-face pixel offsets, not the texture itself or its canvas "
-            "size -- pointing this at the real file gives exact UVs using "
-            "its actual dimensions (takes priority over 'Set Atlas Size "
-            "Manually' above). Only used when 'Texture Mode' above is set "
-            "to 'Manual'"
-        ),
-        default="",
-        subtype="FILE_PATH",
-    )
-
-    orient_z_up: BoolProperty(
-        name="Orient to Z-up (visual only)",
-        description=(
-            "Hytale uses Y as the 'up' axis; Blender uses Z. This rotates "
-            "ONLY the Armature object as a whole (not individual bones) so "
-            "the character stands upright in Blender's default view. Doesn't "
-            "affect pose/animation values, which stay in each bone's local space"
-        ),
-        default=True,
-    )
-
-    unit_scale: FloatProperty(
-        name="Scale (Blender units per game unit)",
-        description=(
-            "The animation exporter (Export_blockyanim.py) multiplies "
-            "position by 64 when saving. This only matches up if the rig "
-            "here was built at 1/64 scale. Don't change this unless you're "
-            "sure of a different value"
-        ),
-        default=UNIT_SCALE_DEFAULT,
-        min=0.0001,
-        max=10.0,
-    )
 
     def draw(self, context):
         lang = get_language(context)
@@ -2432,86 +2384,60 @@ def menu_func_import(self, context):
 # importação como o modo "Attach to Existing" do .blockymodel faz).
 
 
+# v0.14 -- mesmo padrão de _blockymodel_import_props acima -- ver
+# translations/__init__.py, seção "Tooltip de campo".
+def _bbmodel_import_props(lang):
+    return {
+        "filter_glob": StringProperty(default="*.bbmodel", options={"HIDDEN"}),
+        "armature_name": StringProperty(
+            name="Armature Name",
+            description=tr("importer.prop.bbmodel_armature_name", lang),
+            default="",
+        ),
+        "orient_z_up": BoolProperty(
+            name="Orient to Z-up (visual only)",
+            description=tr("importer.prop.bbmodel_orient_z_up", lang),
+            default=True,
+        ),
+        "unit_scale": FloatProperty(
+            name="Scale (Blender units per game unit)",
+            description=tr("importer.prop.bbmodel_unit_scale", lang),
+            default=UNIT_SCALE_DEFAULT,
+            min=0.0001,
+        ),
+        "generate_reference_boxes": BoolProperty(
+            name="Generate Reference Meshes",
+            description=tr("importer.prop.bbmodel_generate_reference_boxes", lang),
+            default=True,
+        ),
+        "flat_mesh_collections": BoolProperty(
+            name="Flat Mesh Collections",
+            description=tr("importer.prop.bbmodel_flat_mesh_collections", lang),
+            default=False,
+        ),
+        "generate_uvs": BoolProperty(
+            name="Generate UVs",
+            description=tr("importer.prop.bbmodel_generate_uvs", lang),
+            default=True,
+        ),
+        "create_material": BoolProperty(
+            name="Create Materials",
+            description=tr("importer.prop.bbmodel_create_material", lang),
+            default=True,
+        ),
+    }
+
+
+@localized_props(_bbmodel_import_props)
 class IMPORT_OT_hytale_bbmodel(Operator, ImportHelper):
     """Import a Hytale character/creature from a Blockbench project (.bbmodel)"""
 
     bl_idname = "import_scene.hytale_bbmodel"
     bl_label = "Import Hytale Model (.bbmodel)"
+    description = tooltip("importer.tooltip.bbmodel")
     bl_options = {"REGISTER", "UNDO"}
 
     filename_ext = ".bbmodel"
-    filter_glob: StringProperty(default="*.bbmodel", options={"HIDDEN"})
-
-    armature_name: StringProperty(
-        name="Armature Name",
-        description=(
-            "Name for the new Armature and its collection. Leave empty to "
-            "fall back to the project's own name (stored inside the "
-            ".bbmodel), or to the filename if that's also empty"
-        ),
-        default="",
-    )
-
-    orient_z_up: BoolProperty(
-        name="Orient to Z-up (visual only)",
-        description=(
-            "Rotate the Armature object 90 degrees so it displays upright "
-            "in Blender's Z-up viewport. Purely a display rotation on the "
-            "Armature object itself -- bone data underneath is untouched"
-        ),
-        default=True,
-    )
-
-    unit_scale: FloatProperty(
-        name="Scale (Blender units per game unit)",
-        description="Same meaning as in the .blockymodel importer -- see UNIT_SCALE_DEFAULT in common.py",
-        default=UNIT_SCALE_DEFAULT,
-        min=0.0001,
-    )
-
-    generate_reference_boxes: BoolProperty(
-        name="Generate Reference Meshes",
-        description=(
-            "Creates a mesh for each cube element in the project, parented "
-            "to the Armature and skinned (100% weight) to its owning bone "
-            "via a Vertex Group + Armature modifier"
-        ),
-        default=True,
-    )
-
-    flat_mesh_collections: BoolProperty(
-        name="Flat Mesh Collections",
-        description=(
-            "Keep every bone's mesh collection at a single flat level, "
-            "instead of the default nested layout (a bone's mesh collection "
-            "sits inside its nearest ancestor bone's mesh collection, "
-            "mirroring the .bbmodel's own outliner/folder hierarchy). "
-            "Enable this to flatten everything to one level instead"
-        ),
-        default=False,
-    )
-
-    generate_uvs: BoolProperty(
-        name="Generate UVs",
-        description=(
-            "Generates UV coordinates for the reference meshes from each "
-            "face's pixel rectangle, already stored directly in the "
-            ".bbmodel (no inference needed, unlike the .blockymodel path)"
-        ),
-        default=True,
-    )
-
-    create_material: BoolProperty(
-        name="Create Materials",
-        description=(
-            "Decodes the texture(s) embedded in the .bbmodel itself "
-            "(base64 PNG data) and creates one material per texture used, "
-            "wired into Base Color/Alpha through the generated UVs -- no "
-            "external texture file needed, everything is self-contained "
-            "in the .bbmodel"
-        ),
-        default=True,
-    )
 
     def draw(self, context):
         layout = self.layout
@@ -2661,17 +2587,20 @@ class IMPORT_OT_hytale_bbmodel(Operator, ImportHelper):
 
 
 def register():
-    bpy.utils.register_class(HytaleImporterPreferences)
-    bpy.utils.register_class(IMPORT_OT_hytale_blockymodel)
-    bpy.utils.register_class(IMPORT_OT_hytale_bbmodel)
+    # v0.14 -- as 3 classes usam @localized_props agora (ver topo do
+    # arquivo) -- register_localized_class() aplica a description=
+    # traduzida no idioma atual antes de registrar cada uma.
+    register_localized_class(HytaleImporterPreferences)
+    register_localized_class(IMPORT_OT_hytale_blockymodel)
+    register_localized_class(IMPORT_OT_hytale_bbmodel)
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
 
 
 def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
-    bpy.utils.unregister_class(IMPORT_OT_hytale_bbmodel)
-    bpy.utils.unregister_class(IMPORT_OT_hytale_blockymodel)
-    bpy.utils.unregister_class(HytaleImporterPreferences)
+    unregister_localized_class(IMPORT_OT_hytale_bbmodel)
+    unregister_localized_class(IMPORT_OT_hytale_blockymodel)
+    unregister_localized_class(HytaleImporterPreferences)
 
 
 if __name__ == "__main__":

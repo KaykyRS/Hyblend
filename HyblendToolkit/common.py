@@ -121,6 +121,24 @@ def quat_to_dict(q):
 # DEVELOPER_NOTES.md, seção "Preferences e __name__" para o motivo.
 ADDON_PACKAGE = __package__
 
+# v0.14 -- import posicionado AQUI (depois de ADDON_PACKAGE definido),
+# não no topo do arquivo -- translations/__init__.py importa
+# ADDON_PACKAGE deste módulo (`from ..common import ADDON_PACKAGE`),
+# então um import de .translations no topo de common.py, ANTES de
+# ADDON_PACKAGE existir, criaria um import circular (common ->
+# translations -> common, no meio da execução do primeiro import).
+from .translations import localized_props, register_localized_class, tooltip, tr, unregister_localized_class
+
+def _pick_bone_into_field_props(lang):
+    return {
+        "data_path": StringProperty(
+            description=tr("common.prop.pick_bone_data_path", lang),
+        ),
+        "field": StringProperty(description=tr("common.prop.pick_bone_field", lang)),
+    }
+
+
+@localized_props(_pick_bone_into_field_props)
 class HYTALE_OT_pick_bone_into_field(Operator):
     """Copia o nome do bone atualmente ativo (Edit Mode, Pose Mode, ou o
     último selecionado no Object Mode) pra uma StringProperty qualquer,
@@ -133,13 +151,8 @@ class HYTALE_OT_pick_bone_into_field(Operator):
 
     bl_idname = "hytale.pick_bone_into_field"
     bl_label = "Pick Bone From Selection"
+    description = tooltip("common.tooltip.pick_bone_into_field")
     bl_options = {"REGISTER", "UNDO"}
-
-    data_path: StringProperty(
-        description="Caminho, relativo ao objeto ativo, até o datablock "
-        "dono do campo (ex: 'data.hytale_export_settings')"
-    )
-    field: StringProperty(description="Nome da StringProperty a preencher")
 
     @classmethod
     def poll(cls, context):
@@ -180,9 +193,9 @@ _CLASSES = (HYTALE_OT_pick_bone_into_field,)
 
 def register():
     for cls in _CLASSES:
-        bpy.utils.register_class(cls)
+        register_localized_class(cls)
 
 
 def unregister():
     for cls in reversed(_CLASSES):
-        bpy.utils.unregister_class(cls)
+        unregister_localized_class(cls)

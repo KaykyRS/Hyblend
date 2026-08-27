@@ -57,7 +57,7 @@ plugável, orientado a arquivo, no mesmo espírito do pacote translations/
     "ARM": {"LEFT": -91.25, "RIGHT": -88.76}   // preset (nome livre) -> por side. Só usado por
   },                                            // cadeias com pole_angle_mode = "PRESET".
   // ATENÇÃO: indexado só por NOME DO PRESET + side -- NÃO por chain_type
-  // (ARM/LEG/TAIL). É intencional (deixa reaproveitar o mesmo preset
+  // (ARM/LEG/CHAIN). É intencional (deixa reaproveitar o mesmo preset
   // entre tipos diferentes, se a geometria for parecida o bastante) --
   // mas também significa que NADA impede uma cadeia de braço e uma de
   // perna de acabarem com o MESMO pole_angle_preset_name por acidente
@@ -66,7 +66,7 @@ plugável, orientado a arquivo, no mesmo espírito do pacote translations/
   // compartilhar o MESMO ângulo calibrado, silenciosamente, o que quase
   // sempre é errado (cotovelo e joelho raramente têm a mesma geometria).
   // Convenção recomendada: um preset por chain_type (ex.: "ARM"/"LEG"/
-  // "TAIL"), nunca o mesmo nome pros dois, a menos que você tenha
+  // "CHAIN"), nunca o mesmo nome pros dois, a menos que você tenha
   // verificado que o ângulo realmente bate pros dois. rigger.py (v0.8,
   // ver _warn_shared_pole_angle_presets) avisa com um WARNING, na hora
   // de gerar o rig, se detectar mais de um chain_type usando o mesmo
@@ -92,11 +92,35 @@ plugável, orientado a arquivo, no mesmo espírito do pacote translations/
   "bones": {
     "R-Hand_IK": {
       "widget": "WGT_hytale_ik_box",          // opcional -- nome do objeto na biblioteca
-                                                // (assets/hytale_widgets.blend). Ausente = usa a
-                                                // regra genérica por papel (FK/IK/pole/etc.).
+                                                // (assets/hytale_widgets.blend), OU já um nome
+                                                // por-personagem gravado por um save anterior
+                                                // (ver "widget" em RIG_OT_hytale_shape_template_save,
+                                                // rig.py). Ausente = usa a regra genérica por papel
+                                                // (FK/IK/pole/etc.).
       "translation": [0.0, 0.078, 0.0],       // opcional -- qualquer campo ausente NÃO é
       "rotation_deg": [0.0, 0.0, 0.0],        // tocado (fica como já estava no bone)
-      "scale": [0.89, 1.01, 1.19]
+      "scale": [0.89, 1.01, 1.19],
+      "mesh": {                               // opcional -- geometria EMBUTIDA do widget deste
+                                                // bone (feature "embutir malha nos Shape
+                                                // Templates", rig.py). Só aparece pra bones
+                                                // GENUINAMENTE customizados (ver
+                                                // _widget_mesh_differs_from_template em rig.py) --
+                                                // um bone ainda usando o shape genérico intocado
+                                                // da biblioteca NÃO ganha esta chave, pra continuar
+                                                // recebendo remodelagens futuras de
+                                                // hytale_widgets.blend automaticamente. Ausente =
+                                                // comportamento de sempre (só o nome acima, sem
+                                                // geometria própria) -- templates antigos (salvos
+                                                // antes desta chave existir) continuam carregando
+                                                // normalmente, sem migração nenhuma.
+        "vertices": [[0.1, 0.0, -0.1], [0.1, 0.0, 0.1]],  // [x, y, z] por vértice, arredondado
+        "edges": [[0, 1]],                    // pares de índice -- SEMPRE gravado explícito (não
+                                                // derivado de "faces"), necessário pra widgets
+                                                // wireframe-só (ex. WGT_hytale_pole_line), que não
+                                                // têm face nenhuma
+        "faces": []                           // listas de índice, uma por face (pode ficar vazia
+                                                // pra um widget wireframe-só)
+      }
     }
   }
 }
@@ -123,6 +147,8 @@ import json
 import os
 
 import bpy
+
+from ..translations import tooltip
 
 # ---------------------------------------------------------------------------
 # Localização das pastas (builtin + usuário)
@@ -333,18 +359,50 @@ def save_shape_template(name, data):
 # {
 #   "template_name": "MyCustomCharacter",
 #   "description": "...",
-#   "collections": [                      // um item por bone collection CUSTOM
+#   "collections": [                      // um item por bone collection CUSTOM (real, do Blender)
 #     {
 #       "name": "Tail",
 #       "parent": "Main",                 // nome de outra collection deste mesmo
 #                                          // template, de uma já existente no
-#                                          // armature-alvo, ou null (nível raiz)
-#       "bones": ["Tail_CTRL", "Tail_CTRL.001"]
+#                                          // armature-alvo, ou null (nível raiz) --
+#                                          // PARENT REAL da bone collection do Blender,
+#                                          // nada a ver com "section" abaixo
+#       "bones": ["Tail_CTRL", "Tail_CTRL.001"],
+#       "section": "Body",                 // opcional -- em qual Section (ver "sections"
+#                                          // abaixo) esta collection aparece na aba
+#                                          // Animation (armature.hytale_bone_collections,
+#                                          // "Collection Settings" -- PURAMENTE visual,
+#                                          // nunca afeta a hierarquia real acima). Ausente/
+#                                          // null = cai no fallback de sempre (Section
+#                                          // "Main", ver _resolve_collection_section_name)
+#       "show_in_animation_tab": true,     // opcional, default true se ausente
+#       "row": 0, "column": 0              // opcional, default 0/0 se ausentes -- posição
+#                                          // no grid da Section (ver _collection_sort_key)
+#     }
+#   ],
+#   "sections": [                          // opcional -- um item por Section (entry_type ==
+#                                          // "SECTION" em Collection Settings; NÃO tem bone
+#                                          // collection real do Blender por trás, só existe
+#                                          // como cabeçalho visual na aba Animation)
+#     {
+#       "name": "Body",
+#       "parent": "__SECTION_ROOT__",     // nome de outra Section deste mesmo template/já
+#                                          // existente no armature-alvo (aninhamento visual),
+#                                          // ou o sentinel SECTION_ROOT (nível raiz)
+#       "row": 0                          // ordem entre Sections irmãs -- ver _section_sort_key
 #     }
 #   ]
 # }
 #
-# Ver RIG_OT_hytale_collection_template_save/_apply (rigger.py) pra quem
+# "collections" sem nenhum dos 4 campos opcionais (section/show_in_animation_tab/
+# row/column) = template salvo ANTES desta parte existir, ou uma collection que
+# nunca esteve cadastrada em Collection Settings na hora do save -- carrega
+# normalmente, só a bone collection real é criada/reassociada (comportamento de
+# sempre); "sections" ausente = mesma ideia, nenhuma Section aplicada. Sem
+# migração nenhuma -- leitura por chave com .get(), ignora o que não existir.
+#
+# Ver RIG_OT_hytale_collection_template_save/_apply e _apply_collection_
+# template_entries/_apply_collection_settings_entries (rigger/rig.py) pra quem
 # lê/escreve isso de fato -- este módulo só faz I/O de arquivo, igual
 # rig/shapes.
 # ---------------------------------------------------------------------------
@@ -434,7 +492,7 @@ class TEMPLATES_OT_reload(bpy.types.Operator):
 
     bl_idname = "hytale.reload_templates"
     bl_label = "Reload Templates"
-    bl_description = "Rescan the templates folders for new or edited .json files"
+    description = tooltip("templates.tooltip.reload")
     bl_options = {"REGISTER"}
 
     def execute(self, context):
@@ -459,7 +517,7 @@ class TEMPLATES_OT_open_user_folder(bpy.types.Operator):
 
     bl_idname = "hytale.open_templates_folder"
     bl_label = "Open Templates Folder"
-    bl_description = "Open your Documents/Hyblend/templates folder in the file explorer"
+    description = tooltip("templates.tooltip.open_user_folder")
     bl_options = {"REGISTER"}
 
     def execute(self, context):
