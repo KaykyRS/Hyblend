@@ -58,16 +58,6 @@
 # que `keep_spine_follow=False` -- ver nota grande em _apply_ctrl_mode.
 # ---------------------------------------------------------------------------
 
-bl_info = {
-    "name": "Hytale Blocky Anim Importer",
-    "author": "Kaayky",
-    "version": (0, 1, 0),
-    "blender": (4, 2, 0),
-    "location": "View3D > Sidebar > Hytale Anim (test)",
-    "description": "Import a .blockyanim file onto an existing armature (original bones, "
-    "control bones, or IK limbs)",
-    "category": "Animation",
-}
 
 import json
 import os
@@ -98,7 +88,7 @@ from .rigger import (
     SUFFIX_MCH_TRANSFER,
     SUFFIX_POLE,
 )
-from .translations import localized_props, register_localized_class, tooltip, tr, unregister_localized_class
+from .translations import localized_props, register_localized_class, tr, unregister_localized_class
 
 # ---------------------------------------------------------------------------
 # Matemática de import -- espelho EXATO (invertido) de compute_deltas() /
@@ -1799,7 +1789,6 @@ class IMPORT_OT_hytale_blockyanim(Operator, ImportHelper):
 
     bl_idname = "import_scene.hytale_blockyanim"
     bl_label = "Import Hytale Animation"
-    description = tooltip("anim_importer.tooltip.blockyanim")
     bl_options = {"REGISTER", "UNDO"}
 
     filename_ext = ".blockyanim"

@@ -2,9 +2,11 @@ schema_version = "1.0.0"
 
 id = "hyblend_toolkit"
 name = "Hyblend Toolkit"
-version = "0.8.0"
-tagline = "Import Hytale .blockymodel rigs and export .blockyanim animations"
+version = "0.8.1"
+tagline = "Import Hytale .blockymodel rigs, export .blockyanim"
 maintainer = "Kaayky"
+website = "https://github.com/KaykyRS/Hyblend"
+copyright = ["2026 Kaayky"]
 type = "add-on"
 
 blender_version_min = "4.5.0"
@@ -16,4 +18,4 @@ license = [
 tags = ["Import-Export", "Animation", "Rigging"]
 
 [permissions]
-files = "Import .blockymodel files and export .blockyanim files chosen by the user"
+files = "Import .blockymodel and export .blockyanim files chosen"

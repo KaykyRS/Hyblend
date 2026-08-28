@@ -5,25 +5,8 @@ funcionando exatamente igual de fora do pacote (interface.py,
 anim_importer.py) depois do split de rigger.py num pacote (Tarefa A --
 ver DEVELOPER_NOTES.md). Nenhuma lógica própria aqui além de registro --
 toda lógica real mora em rig.py (e as constantes puras, em constants.py).
-
-bl_info abaixo é só documentação/versão -- este pacote não roda como
-addon avulso do jeito que rigger.py rodava sozinho antes (ver
-DEVELOPER_NOTES.md, "Preferences e __name__" e "Testando localmente");
-mantido só pra continuar rastreável o "version" que os outros bl_info do
-pacote (anim_importer.py) também têm.
 """
 
-bl_info = {
-    "name": "Hytale Blocky Rigger",
-    "author": "Kaayky",
-    "version": (0, 9, 0),
-    "blender": (4, 2, 0),
-    "location": "View3D > Sidebar > Hytale Rigger",
-    "description": "Auto-generate the ORG/MCH/CTRL/CTRL-IK/MCH-IK bone layers, constraints, "
-    "IK/FK switch drivers, root control bones and Main/Face/Attachments collections "
-    "for a Hytale character armature",
-    "category": "Rigging",
-}
 
 import bpy
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, IntProperty, StringProperty
