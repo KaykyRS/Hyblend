@@ -7,7 +7,7 @@
       "id": "hyblend_toolkit",
       "name": "Hyblend Toolkit",
       "tagline": "Import Hytale .blockymodel rigs, export .blockyanim",
-      "version": "0.8.1",
+      "version": "0.8.2",
       "type": "add-on",
       "maintainer": "Kaayky",
       "license": [
@@ -26,9 +26,9 @@
         "Animation",
         "Rigging"
       ],
-      "archive_url": "./hyblend_toolkit-0.8.1.zip",
-      "archive_size": 1764077,
-      "archive_hash": "sha256:1bb6b88f71b3700ac022d28b0ad0c8a689cc28a6d92b0f489c11a253a8a55bb4"
+      "archive_url": "./hyblend_toolkit-0.8.2.zip",
+      "archive_size": 1783070,
+      "archive_hash": "sha256:f216407b869434d960b94fe6478078b45a9216d35762fb8877ca58b97208bbd6"
     }
   ]
 }
