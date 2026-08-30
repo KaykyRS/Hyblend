@@ -1,0 +1,34 @@
+{
+  "version": "v1",
+  "blocklist": [],
+  "data": [
+    {
+      "schema_version": "1.0.0",
+      "id": "hyblend_toolkit",
+      "name": "Hyblend Toolkit",
+      "tagline": "Import Hytale .blockymodel rigs, export .blockyanim",
+      "version": "0.8.4",
+      "type": "add-on",
+      "maintainer": "Kaayky",
+      "license": [
+        "SPDX:GPL-3.0-or-later"
+      ],
+      "blender_version_min": "4.5.0",
+      "website": "https://github.com/KaykyRS/Hyblend",
+      "copyright": [
+        "2026 Kaayky"
+      ],
+      "permissions": {
+        "files": "Import .blockymodel and export .blockyanim files chosen"
+      },
+      "tags": [
+        "Import-Export",
+        "Animation",
+        "Rigging"
+      ],
+      "archive_url": "./hyblend_toolkit-0.8.4.zip",
+      "archive_size": 683914,
+      "archive_hash": "sha256:a3921b3df4a7f394f194203d3a5ec5bc6bf147e3616c6a91c633e7067273593d"
+    }
+  ]
+}
