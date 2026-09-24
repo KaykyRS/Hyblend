@@ -1,0 +1,2516 @@
+# ---------------------------------------------------------------------------
+# Este arquivo é o submódulo EXPORTER do pacote HyblendToolkit.
+# Metadados do addon (nome, versão, versão mínima do Blender, descrição)
+# NÃO vivem mais aqui como `bl_info` -- vivem em blender_manifest.toml, na
+# raiz do pacote (formato de Extension do Blender 4.5+, ver
+# blender_manifest.toml pra fonte da verdade). Se você só recebeu ESTE
+# arquivo pra atualizar, não precisa se preocupar com o manifest a menos
+# que a mudança exija subir a versão -- ver DEVELOPER_NOTES.md.
+# ---------------------------------------------------------------------------
+
+import contextlib
+import json
+import os
+import re
+
+import bpy
+from bpy.props import (
+    BoolProperty,
+    CollectionProperty,
+    EnumProperty,
+    FloatProperty,
+    IntProperty,
+    PointerProperty,
+    StringProperty,
+)
+from bpy.types import Armature, Operator, PropertyGroup
+from mathutils import Quaternion, Vector
+
+from ..common import (
+    ACTION_SOURCE_DURATION_PROP,
+    ACTION_SOURCE_HOLD_LAST_KEYFRAME_PROP,
+    BONE_RENAMED_FROM_PROP,
+    BONE_RIGGER_CREATED_PROP,
+    BONE_SHAPE_JSON_PROP,
+    BONE_SHAPE_OFFSET_PROP,
+    FPS_HYTALE,
+    SUFFIX_CTRL,
+    SUFFIX_IK,
+    SUFFIX_MCH,
+    UNIT_SCALE_DEFAULT,
+    armature_model_format,
+    bone_file_name,
+    effective_unit_scale,
+    is_active_armature,
+    quat_to_dict,
+    vec_to_dict,
+)
+from ..translations import (
+    localized_props,
+    register_localized_class,
+    register_refresh_hook,
+    tooltip,
+    tr,
+    unregister_localized_class,
+    unregister_refresh_hook,
+)
+
+# --- Formato .blockyanim ---
+# Ver JannisX11/hytale-blockbench-plugin, src/blockyanim.ts
+# (parseAnimationFile/compileAnimationFile), confirmado contra o código-fonte real:
+#
+#   {
+#     "formatVersion": 1,
+#     "duration": <int, em FRAMES a 60 FPS fixo -- NÃO o fps da cena>,
+#     "holdLastKeyframe": bool,
+#     "nodeAnimations": {
+#       "<nome EXATO do bone, igual ao node.name do .blockymodel>": {
+#         "position":    [{"time": <frame int>, "delta": {x,y,z},   "interpolationType": "smooth"|"linear"}],
+#         "orientation": [{"time": <frame int>, "delta": {x,y,z,w}, "interpolationType": ...}],
+#         "shapeStretch": [...]   # mesmo formato de position, opcional
+#         "shapeUvOffset": [{"time": <frame int>, "delta": {x,y}, "interpolationType": ...}]
+#       }
+#     }
+#   }
+#
+# "shapeUvOffset" -- confirmado num .blockyanim exportado pelo plugin
+# oficial: "delta" é só {x, y} (sem z), em PIXELS CRUS dentro do atlas,
+# não fração de UV normalizada (0..1) -- diferente do UV de repouso que
+# o importer calcula. Por isso o exporter não precisa saber o tamanho do
+# atlas pra escrever esse canal.
+#
+# "delta" é relativo à pose de repouso (bind pose), não absoluto. É o
+# inverso exato de como o importer constrói a pose de repouso (world =
+# parent_world @ local):
+#
+#   rest_local  = rest_matrix_do_pai⁻¹ @ rest_matrix_do_bone   (ou a
+#                 própria rest_matrix sem pai -- "local" == "armature space")
+#   pose_local  = pose_matrix_do_pai⁻¹ @ pose_matrix_do_bone   (matriz já
+#                 avaliada, depois de resolver constraints -- é o que
+#                 pose_bone.matrix devolve)
+#   delta_local = rest_local⁻¹ @ pose_local
+#
+# Isso é o inverso matemático do node_local_matrix() do importer, então
+# não precisamos "entender" a cadeia MCH->CTRL manualmente: as
+# constraints já resolvem a pose do bone original automaticamente dentro
+# do Blender, pose_bone.matrix já reflete o resultado final -- só
+# precisamos ler.
+#
+# Escala: o importer divide todo comprimento por UNIT_SCALE (1/64) ao
+# criar o rig. O compileAnimationFile oficial não aplica nenhum fator de
+# escala. Por isso multiplicamos de volta por 1/UNIT_SCALE (=64) ao
+# exportar -- operação inversa exata.
+#
+# Rotação: o Blockbench guarda rotação como Euler (ordem ZYX) na UI e só
+# converte pra quaternion na hora de gravar (setFromEuler -> quaternion).
+# Exportamos o quaternion do delta direto, sem passar por Euler -- é
+# matematicamente a mesma rotação final, e evita qualquer risco de
+# flip/gimbal que só existiria se fôssemos nós a fazer a ida e volta.
+
+# --- Detecção de bones "originais" ---
+# Filtrar por sufixo de nome (_MCH/_CTRL/_IK) falha em rigs reais, que
+# têm muito mais coisa (pole targets, bones de controle do Rigify,
+# nomes duplicados renomeados com ".001" etc.) -- nenhum bate um sufixo
+# fixo, e nem deveria, porque são construções internas do rig.
+#
+# Solução: em vez de adivinhar pelo nome, o export lê os bones de uma
+# Bone Collection explícita (Armature Properties > Bone Collections).
+# Você cria uma coleção com esse nome e arrasta pra dentro só os bones
+# originais (mesmo nome exato dos nodes do .blockymodel).
+EXPORT_COLLECTION_NAME_DEFAULT = "Hytale Export"
+UV_OFFSET_SOURCE_BONE_DEFAULT = "ui.texture_picker"
+UV_OFFSET_TARGET_BONE_DEFAULT = ""
+
+# Sufixos de fallback, usados só se a Bone Collection acima não existir
+# na armature. Valores vêm de common.py (compartilhados com rigger, que
+# é quem cria os bones com esses sufixos).
+CONTROL_SUFFIXES = (SUFFIX_MCH, SUFFIX_CTRL, SUFFIX_IK)
+
+
+def is_original_bone_name(name):
+    return not any(name.endswith(suf) for suf in CONTROL_SUFFIXES)
+
+
+# ---------------------------------------------------------------------------
+# Configurações de export persistentes na Armature (Object Data) -- "Export
+# Bone Collection" NÃO é mais property efêmera do diálogo do operador de
+# export: é guardada aqui, no dado da própria Armature, e editada pelo
+# painel do interface.py (aba Export), pra não precisar reconfigurar toda
+# vez que você abre o diálogo de export.
+#
+# Registrada aqui (não em interface.py, nem em common.py) seguindo
+# EXATAMENTE o mesmo padrão que rigger.py já usa pra hytale_ik_chains:
+# quem é DONO da lógica registra o dado direto no tipo Armature;
+# interface.py só desenha (igual ele já faz pra hytale_ik_chains, lendo
+# armature.hytale_ik_chains sem redefinir nada). Ver DEVELOPER_NOTES.md.
+#
+# Configurações de export persistentes na Armature (Object Data) -- não
+# são property efêmera do diálogo de export, ficam no dado da própria
+# Armature e são editadas pelo painel do interface.py (aba Export), pra
+# não precisar reconfigurar toda vez que abre o diálogo.
+#
+# Registrada aqui (não em interface.py, nem em common.py), mesmo padrão
+# que rigger usa pra hytale_ik_chains: quem é dono da lógica registra o
+# dado no tipo Armature; interface.py só desenha.
+#
+# HYTALE_export_settings e HYTALE_texture_picker_export_item (abaixo)
+# são alvo de PointerProperty/CollectionProperty atribuídas direto em
+# Armature -- ver register()/_redo_armature_property_assignments no fim
+# do arquivo, registrado como refresh hook por causa disso.
+def _export_settings_props(lang):
+    return {
+        "export_collection_name": StringProperty(
+            name="Export Bone Collection",
+            description=tr("exporter.prop.export_settings_collection_name", lang),
+            default=EXPORT_COLLECTION_NAME_DEFAULT,
+        ),
+    }
+
+
+@localized_props(_export_settings_props)
+class HYTALE_export_settings(PropertyGroup):
+    pass
+
+
+# Item da lista armature.hytale_texture_picker_exports (uma entrada por
+# instância de Texture Picker configurada no rigger). Cada entrada é
+# totalmente independente: seu próprio bone de controle, alvo (+
+# companions), calibração de grid -- exportar uma não interfere na
+# outra. "name" (herdada de PropertyGroup) guarda o mesmo valor de
+# uv_offset_target_bone, só pra o template_list ter algo pra mostrar por
+# padrão -- mantida em sincronia sempre que uv_offset_target_bone muda
+# (ver RIG_OT_hytale_texture_picker_create/_remove em
+# rigger/texture_picker.py, quem escreve aqui).
+def _texture_picker_export_item_props(lang):
+    return {
+        "uv_offset_source_bone": StringProperty(
+            name="UV Control Bone",
+            description=tr("exporter.prop.texture_picker_source_bone", lang),
+            default=UV_OFFSET_SOURCE_BONE_DEFAULT,
+        ),
+        "uv_offset_target_bone": StringProperty(
+            name="Target Bone (shapeUvOffset)",
+            description=tr("exporter.prop.texture_picker_target_bone", lang),
+            default=UV_OFFSET_TARGET_BONE_DEFAULT,
+        ),
+        # Companion targets: alguns personagens têm a parte animada
+        # (boca, rosto, etc.) dividida em mais de uma malha/bone
+        # (metades L/R espelhadas se encontrando no meio) que precisam
+        # da mesma mudança de expressão ao mesmo tempo -- este campo
+        # deixa o mesmo delta de shapeUvOffset ser escrito em mais bones
+        # além do uv_offset_target_bone principal. Nomes separados por
+        # vírgula, exatos (mesmo namespace de uv_offset_target_bone). Um
+        # nome que não é exportável é avisado e pulado individualmente
+        # -- não cancela o alvo principal nem os outros companions (ver
+        # sample_action()). Escrito automaticamente por "Create Texture
+        # Picker" a partir dos companion bones configurados naquela
+        # entrada -- normalmente não precisa digitar aqui na mão.
+        "uv_offset_target_bones_extra": StringProperty(
+            name="Companion Target Bones (shapeUvOffset)",
+            description=tr("exporter.prop.texture_picker_target_bones_extra", lang),
+            default="",
+        ),
+        "uv_offset_step_x": FloatProperty(
+            name="Grid Step X",
+            description=tr("exporter.prop.texture_picker_step_x", lang),
+            default=0.1,
+        ),
+        "uv_offset_px_x": FloatProperty(
+            name="Pixels per Step X",
+            description=tr("exporter.prop.texture_picker_px_x", lang),
+            default=20.0,
+        ),
+        "uv_offset_step_y": FloatProperty(
+            name="Grid Step Y",
+            description=tr("exporter.prop.texture_picker_step_y", lang),
+            default=-0.045,
+        ),
+        "uv_offset_px_y": FloatProperty(
+            name="Pixels per Step Y",
+            description=tr("exporter.prop.texture_picker_px_y", lang),
+            default=-10.0,
+        ),
+    }
+
+
+@localized_props(_texture_picker_export_item_props)
+class HYTALE_texture_picker_export_item(PropertyGroup):
+    pass
+
+
+def get_export_settings(armature_obj):
+    """Atalho pra armature_obj.data.hytale_export_settings -- usado só
+    pelo lado do exporter.py (o painel do interface.py lê o mesmo
+    caminho direto). Fallback pro próprio default da PropertyGroup se a
+    Armature ainda não tiver esse dado -- nunca trava o export."""
+    data = getattr(armature_obj, "data", None)
+    settings = getattr(data, "hytale_export_settings", None)
+    if settings is None:
+        # Instância "solta" (não vinculada a nenhuma Armature real) só
+        # pra fornecer os defaults -- nunca é lida/gravada de verdade.
+        settings = HYTALE_export_settings()
+    return settings
+
+
+def get_texture_picker_exports(armature_obj):
+    """Atalho pra armature_obj.data.hytale_texture_picker_exports (a
+    CollectionProperty de HYTALE_texture_picker_export_item -- uma
+    entrada por instância de Texture Picker). Devolve uma lista/coleção
+    vazia (nunca None) se a Armature ainda não tiver esse dado, mesmo
+    espírito de get_export_settings -- chamador não precisa checar None
+    antes de iterar."""
+    data = getattr(armature_obj, "data", None)
+    exports = getattr(data, "hytale_texture_picker_exports", None)
+    return exports if exports is not None else []
+
+
+# UIList + Add/Remove pra armature.hytale_texture_picker_exports (aba
+# Export) -- mesmo padrão de RIG_UL_hytale_ik_chains/RIG_OT_hytale_ik_chain_add/_remove
+# em rigger/bone_settings.py: quem é dono do dado registra o UIList/
+# operadores aqui, interface.py só desenha via template_list(). Add/
+# Remove existem pra ajuste manual (normalmente a lista é preenchida
+# sozinha por "Create Texture Picker").
+
+
+class HYTALE_UL_texture_picker_exports(bpy.types.UIList):
+    bl_idname = "HYTALE_UL_texture_picker_exports"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
+        row.label(text=item.uv_offset_target_bone or "(no target bone)", icon="IMAGE_DATA")
+
+
+class EXPORT_OT_texture_picker_export_add(Operator):
+    """Adiciona uma instância vazia à lista (uso manual -- normalmente
+    'Create Texture Picker', no rigger, já adiciona/atualiza a entrada
+    certa sozinho)."""
+
+    bl_idname = "armature.hytale_texture_picker_export_add"
+    bl_label = "Add Texture Picker Export"
+    description = tooltip("exporter.tooltip.texture_picker_export_add")
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return is_active_armature(context)
+
+    def execute(self, context):
+        armature = context.active_object.data
+        exports = armature.hytale_texture_picker_exports
+        item = exports.add()
+        item.uv_offset_source_bone = UV_OFFSET_SOURCE_BONE_DEFAULT
+        armature.hytale_texture_picker_exports_index = len(exports) - 1
+        return {"FINISHED"}
+
+
+class EXPORT_OT_texture_picker_export_remove(Operator):
+    """Remove uma instância da lista pelo índice (padrão: a ativa)."""
+
+    bl_idname = "armature.hytale_texture_picker_export_remove"
+    bl_label = "Remove Texture Picker Export"
+    description = tooltip("exporter.tooltip.texture_picker_export_remove")
+    bl_options = {"REGISTER", "UNDO"}
+
+    index: IntProperty(default=-1)
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return is_active_armature(context) and len(obj.data.hytale_texture_picker_exports) > 0
+
+    def execute(self, context):
+        armature = context.active_object.data
+        exports = armature.hytale_texture_picker_exports
+        index = self.index if self.index >= 0 else armature.hytale_texture_picker_exports_index
+        if 0 <= index < len(exports):
+            exports.remove(index)
+            armature.hytale_texture_picker_exports_index = max(0, min(armature.hytale_texture_picker_exports_index, len(exports) - 1))
+        return {"FINISHED"}
+
+
+def exported_bone_name(armature_obj, name, use_original_names=False):
+    """Nome a gravar no arquivo de saída para o bone 'name'. Normalmente é
+    o próprio bone.name -- mas se o importer precisou renomear esse bone
+    por colisão de nome dentro do mesmo .blockymodel (duas pastas com o
+    mesmo nome em galhos diferentes, algo que o Blockbench permite e o
+    Blender não), o nome ORIGINAL (sem sufixo .dupNN) fica guardado na
+    custom property BONE_ORIGINAL_NAME_PROP -- é esse valor que o jogo
+    espera, não o nome interno do Blender. A maioria dos bones não tem
+    essa property e cai no fallback (comportamento de sempre).
+
+    Bone renomeado pelo "Rename Bones" (BONE_RENAMED_FROM_PROP): sai com
+    o nome NOVO, a menos que use_original_names (opção "Use Original
+    Names" do export) esteja ligado -- aí sai com o nome do arquivo."""
+    bone = armature_obj.data.bones.get(name)
+    if bone is None:
+        return name
+    if bone.get(BONE_RENAMED_FROM_PROP) and not use_original_names:
+        return name
+    return bone_file_name(bone) or name
+
+
+def bones_in_collection(armature_obj, collection_name):
+    """Nomes dos bones que pertencem à Bone Collection com esse nome.
+    Retorna None se a coleção não existir na armature (pra diferenciar de
+    'existe mas está vazia')."""
+    data = armature_obj.data
+    collections = getattr(data, "collections", None)
+    if collections is None or collection_name not in collections:
+        return None
+    names = set()
+    for bone in data.bones:
+        if any(c.name == collection_name for c in bone.collections):
+            names.add(bone.name)
+    return names
+
+
+def resolve_exportable_bone_names(operator, obj, export_settings):
+    """Devolve o conjunto de nomes de bone "originais" (sem os de
+    controle _MCH/_CTRL/_IK, pole targets, bones do Rigify etc.) a
+    partir da Export Bone Collection configurada nesta Armature. Cai
+    pro fallback por sufixo de nome se a coleção não existir, avisando
+    via operator.report.
+
+    Extraída pra ser reaproveitada por qualquer exportador (FBX,
+    .blockymodel) que precise do mesmo conjunto de bones. Devolve None
+    (chamador deve {'CANCELLED'}) se não achou nenhum bone exportável --
+    nunca um set vazio."""
+    collection_name = export_settings.export_collection_name
+    collection_names = bones_in_collection(obj, collection_name)
+    if collection_names is not None:
+        if not collection_names:
+            operator.report(
+                {"ERROR"},
+                f"Bone Collection '{collection_name}' exists but has "
+                f"no bones assigned to it.",
+            )
+            return None
+        return collection_names
+
+    # Bone criado pelo Auto-Rigger (Origin automático / Root "New Bone")
+    # nunca é exportado -- não existe no modelo original.
+    exportable_names = {
+        b.name for b in obj.data.bones
+        if is_original_bone_name(b.name) and not b.get(BONE_RIGGER_CREATED_PROP)
+    }
+    operator.report(
+        {"WARNING"},
+        f"Bone Collection '{collection_name}' not found -- "
+        f"falling back to guessing bones by name suffix (_MCH/_CTRL/_IK). "
+        f"Set it in the 'Hytale Export' panel (Object Properties).",
+    )
+    if not exportable_names:
+        operator.report({"ERROR"}, "No 'original' (suffix-less) bones found.")
+        return None
+    return exportable_names
+
+
+def collect_meshes_recursive(collection, out, _seen_collections=None):
+    """Junta todo Object tipo MESH dentro de `collection`, incluindo
+    sub-collections (o importer separa malhas de referência numa
+    sub-collection própria por bone dono, ver DEVELOPER_NOTES.md ->
+    'importer.py', 'Mesh Collections separadas por bone'). `out` é um
+    set, preenchido em lugar. `_seen_collections` evita loop infinito no
+    caso (incomum, mas o Blender permite) de uma collection acabar linkada
+    dentro de si mesma indiretamente."""
+    if _seen_collections is None:
+        _seen_collections = set()
+    if collection.name in _seen_collections:
+        return
+    _seen_collections.add(collection.name)
+    for obj in collection.objects:
+        if obj.type == "MESH":
+            out.add(obj)
+    for child in collection.children:
+        collect_meshes_recursive(child, out, _seen_collections)
+
+
+def gather_character_meshes(armature_obj, include_attachments=True):
+    """Malhas de referência ligadas a esta Armature, lidas pelas custom
+    properties gravadas pelo importer.py (hytale_meshes_main_collection /
+    hytale_meshes_attachments_collection) -- não por parentesco de Object,
+    já que as malhas de referência são só posicionadas no bind pose, não
+    skinned/parented ao Armature. Devolve um set (nunca None); vazio se a
+    Armature não tiver essas properties (ex.: criada fora do importer, ou
+    'Generate Reference Meshes' estava desligado no import)."""
+    meshes = set()
+    main_name = armature_obj.get("hytale_meshes_main_collection")
+    if main_name:
+        main_collection = bpy.data.collections.get(main_name)
+        if main_collection is not None:
+            collect_meshes_recursive(main_collection, meshes)
+    if include_attachments:
+        attach_name = armature_obj.get("hytale_meshes_attachments_collection")
+        if attach_name:
+            attach_collection = bpy.data.collections.get(attach_name)
+            if attach_collection is not None:
+                collect_meshes_recursive(attach_collection, meshes)
+    return meshes
+
+
+@contextlib.contextmanager
+def temporary_deform_flags(armature_data, exportable_names):
+    """Liga bone.use_deform=True só nos bones 'originais' (exportable_names)
+    e desliga em todo o resto (_MCH/_CTRL/_IK, pole targets, bones do
+    Rigify etc.) -- usado junto com use_armature_deform_only=True do
+    exportador FBX nativo do Blender, pra que o esqueleto exportado só
+    tenha os bones que um DCC/engine externo deveria ver, sem precisar
+    duplicar a Armature inteira só pra deletar bones. Restaura os valores
+    originais de use_deform ao sair do bloco, inclusive se o export falhar
+    no meio (bloco 'with')."""
+    original = {bone.name: bone.use_deform for bone in armature_data.bones}
+    try:
+        for bone in armature_data.bones:
+            bone.use_deform = bone.name in exportable_names
+        yield
+    finally:
+        for bone in armature_data.bones:
+            if bone.name in original:
+                bone.use_deform = original[bone.name]
+
+
+def quantize_value(v, step):
+    if step <= 0.0:
+        return v
+    return round(v / step) * step
+
+
+def quantize_vector(v, step):
+    if step <= 0.0:
+        return v
+    return Vector((quantize_value(v.x, step), quantize_value(v.y, step), quantize_value(v.z, step)))
+
+
+def quantize_quaternion(q, step):
+    """Arredonda cada componente pra um grid fixo e renormaliza -- suprime
+    ruído de ponto flutuante que sobra em cima de rotação real, sem
+    depender de a rotação ser (perto de) identidade."""
+    if step <= 0.0:
+        return q
+    qq = Quaternion((
+        quantize_value(q.w, step),
+        quantize_value(q.x, step),
+        quantize_value(q.y, step),
+        quantize_value(q.z, step),
+    ))
+    if qq.magnitude < 1e-8:
+        return q
+    qq.normalize()
+    return qq
+
+
+def sample_uv_offset_px(control_pbone, opts):
+    """Lê a Location (pose, local) do bone de controle (ex.: 'ui.texture_picker')
+    e reproduz em Python a MESMA matemática de snap-to-grid que o driver do
+    Mapping node do usuário já faz no shader -- só que devolvendo pixels
+    crus (o que o .blockyanim espera pro shapeUvOffset), não a fração de UV
+    que o driver usa internamente pro shader. 'round()' aqui é o Python
+    nativo, mesma matemática que o 'round()' disponível nas expressões de
+    Driver do Blender.
+
+    Devolve INTEIROS (não float): confirmado que o parser do jogo lê
+    'shapeUvOffset[].delta.x/y' como Int32 -- um float aqui (mesmo um
+    valor "redondo" tipo 32.0, que o json.dump ainda escreve como
+    "32.0") quebra a leitura do arquivo no jogo (erro reportado:
+    "The JSON value could not be converted to System.Int32" apontando
+    pra esse path exato). Isso é diferente de position/orientation/
+    shapeStretch, que continuam genuinamente float -- só o UV do atlas é
+    inteiro por natureza (pixel cru), então essa conversão fica isolada
+    aqui, não em round_floats_for_output (que é genérico pros outros
+    canais)."""
+    loc = control_pbone.location
+    step_x = opts.uv_offset_step_x
+    step_y = opts.uv_offset_step_y
+    px_x = round(loc.x / step_x) * opts.uv_offset_px_x if step_x != 0 else 0.0
+    px_y = round(loc.y / step_y) * opts.uv_offset_px_y if step_y != 0 else 0.0
+    # int(round(...)) em vez de int(...) puro: já vem "redondo" da
+    # matemática de snap-to-grid acima, mas passar por round() de novo
+    # evita truncar errado por ruído de ponto flutuante (ex.: 31.999999
+    # virando 31 em vez de 32).
+    return int(round(px_x)), int(round(px_y))
+
+
+# ---------------------------------------------------------------------------
+# Correção de sinal de quaternion (dupla cobertura) + redução de keyframes
+# por Ramer-Douglas-Peucker (RDP). Duas melhorias relacionadas: RDP usa
+# slerp como referência pra decidir o que descartar, e slerp só anda pelo
+# caminho CURTO na esfera se os sinais forem consistentes -- por isso o
+# sign-fix tem que rodar ANTES da redução (não depois, e não seria útil
+# aplicado separadamente).
+# ---------------------------------------------------------------------------
+
+
+def fix_quaternion_sign(quat, prev_quat):
+    """Quaternions têm dupla cobertura: q e -q representam exatamente a
+    mesma rotação. Mas se o sinal 'vira' de um frame amostrado pro outro
+    sem nenhum motivo geométrico (o que acontece livremente, já que cada
+    frame deriva o quaternion de uma matriz de forma independente, sem
+    continuidade garantida), duas coisas quebram: (1) o slerp no jogo
+    interpola pelo caminho LONGO ao redor da esfera em vez do curto,
+    produzindo um 'chacoalhão' visual mesmo a rotação matematicamente
+    batendo em cada keyframe individual; (2) qualquer cálculo de distância
+    entre quaternions consecutivos (dot product) fica errado, incluindo o
+    da redução por RDP logo abaixo. Corrige escolhendo, a cada frame, o
+    sinal mais próximo do frame anterior (via dot product); no primeiro
+    frame de cada bone (prev_quat is None) canoniza pra w >= 0, só pra ter
+    um ponto de partida determinístico."""
+    if prev_quat is None:
+        if quat.w < 0:
+            return Quaternion((-quat.w, -quat.x, -quat.y, -quat.z))
+        return quat
+    if quat.dot(prev_quat) < 0:
+        return Quaternion((-quat.w, -quat.x, -quat.y, -quat.z))
+    return quat
+
+
+def _rdp_distance_vec(t, v, t0, v0, tn, vn):
+    """Distância (unidades de jogo) entre o valor REALMENTE amostrado em
+    't' e o valor que uma interpolação linear simples entre os dois
+    pontos-âncora (t0,v0) e (tn,vn) preveria pra esse mesmo instante --
+    não é distância ponto-reta no espaço 3D pura, é 'o quanto o sample
+    real se desvia de uma reta na CURVA AO LONGO DO TEMPO', que é o que
+    keyframe redution quer preservar."""
+    if tn == t0:
+        return (v - v0).length
+    frac = (t - t0) / (tn - t0)
+    return (v - v0.lerp(vn, frac)).length
+
+
+def _rdp_distance_quat(t, q, t0, q0, tn, qn):
+    """Mesma ideia que _rdp_distance_vec, mas pra rotação: a 'reta' de
+    referência é um slerp entre os dois quaternions-âncora (só funciona
+    corretamente com sinais já consistentes -- ver fix_quaternion_sign), e
+    a distância usa a MESMA métrica de produto escalar que
+    'rotation_epsilon'/'rotation_zero_epsilon' já usam em todo o resto do
+    arquivo, pra manter a mesma escala/intuição de tolerância."""
+    if tn == t0:
+        return 0.0
+    frac = (t - t0) / (tn - t0)
+    ref = q0.slerp(qn, frac)
+    return abs(abs(q.dot(ref)) - 1.0)
+
+
+def rdp_reduce_indices(samples, epsilon, distance_fn):
+    """Ramer-Douglas-Peucker, versão ITERATIVA (pilha explícita, não
+    recursão -- animações bakeadas longas podem ter profundidade de
+    recursão patológica e estourar o limite do Python, então evitamos
+    recursão de propósito). 'samples' é uma lista [(tempo, valor), ...]
+    JÁ ORDENADA por tempo. Devolve o SET de índices (relativos a
+    'samples') que devem ser mantidos como keyframe -- os extremos (0 e
+    len-1) sempre entram.
+
+    Diferença chave pro método antigo (comparar cada frame só com o
+    ÚLTIMO FRAME ESCRITO): RDP olha o segmento INTEIRO entre dois pontos-
+    âncora de cada vez, então um trecho longo e quase-linear (muitos
+    frames intermediários) colapsa pra só os dois extremos de uma vez,
+    mesmo que a soma de pequenos desvios frame-a-frame tivesse escapado
+    de um epsilon local. Resultado: arquivos menores com a mesma
+    fidelidade visual, principalmente em eases/curvas suaves com muitos
+    frames amostrados no meio."""
+    n = len(samples)
+    if n == 0:
+        return set()
+    if n < 3:
+        return set(range(n))
+
+    keep = {0, n - 1}
+    stack = [(0, n - 1)]
+    while stack:
+        start, end = stack.pop()
+        if end <= start + 1:
+            continue
+        t0, v0 = samples[start]
+        tn, vn = samples[end]
+        max_dist = -1.0
+        max_idx = -1
+        for i in range(start + 1, end):
+            ti, vi = samples[i]
+            d = distance_fn(ti, vi, t0, v0, tn, vn)
+            if d > max_dist:
+                max_dist = d
+                max_idx = i
+        if max_dist > epsilon:
+            keep.add(max_idx)
+            stack.append((start, max_idx))
+            stack.append((max_idx, end))
+    return keep
+
+
+# Janela (em frames, unidades de hytale_time) pra considerar dois pontos
+# significativos de BONES DIFERENTES como o mesmo 'evento' de troca de
+# pose. Não é exposta na UI de propósito -- ver sync_nearby_keyframes().
+SYNC_WINDOW_FRAMES = 3
+
+
+def sync_nearby_keyframes(keep_by_bone, frame_times):
+    """RDP roda por bone de forma independente, então bones diferentes
+    podem escolher manter keyframes em tempos DIFERENTES pra descrever a
+    MESMA troca de pose (torso reduzido a uma reta larga enquanto um
+    braço mantém frames densos por um movimento rápido, por exemplo) --
+    cada canal fica individualmente correto, mas o descompasso de tempo
+    entre bones pode aparecer como tremedeira visual.
+
+    Em vez de sincronizar TUDO contra TUDO na timeline inteira (testado:
+    isso incha o arquivo várias vezes de tamanho, inclusive sincronizando
+    bones que não têm nada a ver um com o outro num dado momento), aqui
+    só juntamos pontos de bones DIFERENTES que já caem PRÓXIMOS no tempo
+    entre si (dentro de SYNC_WINDOW_FRAMES) -- ou seja, só quando parece
+    ser genuinamente o mesmo evento de pose acontecendo em mais de um
+    bone ao mesmo tempo. Um bone com um movimento isolado, longe de
+    qualquer outro evento, não é afetado e não ganha keyframes extras.
+
+    'keep_by_bone': dict nome -> set de índices (já calculado por
+    rdp_reduce_indices, pra UM tipo de canal). 'frame_times': lista de
+    hytale_time por índice (a mesma pra todo bone, já que todos amostram
+    exatamente os mesmos frames). Devolve um NOVO dict com os keep-sets
+    expandidos onde necessário."""
+    n = len(frame_times)
+
+    # Extremos (0 e n-1) sempre estão em TODO bone -- não representam
+    # 'eventos' de transição, e incluí-los aqui faria todo bone virar um
+    # único cluster gigante através deles. Só agrupamos os pontos do
+    # MEIO.
+    events = sorted(
+        (frame_times[i], name, i)
+        for name, idxs in keep_by_bone.items()
+        for i in idxs
+        if 0 < i < n - 1
+    )
+    if not events:
+        return keep_by_bone
+
+    clusters = []
+    current = [events[0]]
+    for ev in events[1:]:
+        if ev[0] - current[-1][0] <= SYNC_WINDOW_FRAMES:
+            current.append(ev)
+        else:
+            clusters.append(current)
+            current = [ev]
+    clusters.append(current)
+
+    result = {name: set(idxs) for name, idxs in keep_by_bone.items()}
+    for cluster in clusters:
+        bones_here = {name for _, name, _ in cluster}
+        if len(bones_here) < 2:
+            continue  # só um bone envolvido -- nada pra sincronizar
+        indices_here = {i for _, _, i in cluster}
+        for name in bones_here:
+            result[name] |= indices_here
+    return result
+
+
+def local_matrix(matrix_by_bone, bone_name, parent_name):
+    """Matriz relativa ao pai, dado um dict {nome: matriz em armature-space}.
+    Bone sem pai: 'local' == 'armature space' (mesma convenção do import)."""
+    m = matrix_by_bone[bone_name]
+    if parent_name is None:
+        return m
+    return matrix_by_bone[parent_name].inverted() @ m
+
+
+def rest_matrices(armature_obj):
+    """Matriz de repouso (armature-space) de cada bone, a partir de
+    Bone.matrix_local (não muda com a pose atual, não precisa de Edit Mode)."""
+    out = {}
+    for bone in armature_obj.data.bones:
+        out[bone.name] = bone.matrix_local.copy()
+    return out
+
+
+def pose_matrices(armature_obj):
+    """Matriz da pose ATUAL (já avaliada, pós-constraints), armature-space,
+    de cada pose bone. Precisa ser chamado DEPOIS de scene.frame_set() +
+    depsgraph atualizado."""
+    out = {}
+    for pbone in armature_obj.pose.bones:
+        out[pbone.name] = pbone.matrix.copy()
+    return out
+
+
+def armature_unit_scale(armature_obj, character_unit_scale):
+    """Escala efetiva desta Armature: o "Unit Scale" dos operadores é
+    definido pra Character (64/bloco); Prop (32/bloco) usa o dobro -- ver
+    MODEL_FORMAT_* / effective_unit_scale em common.py. O formato vem de
+    ARMATURE_MODEL_FORMAT_PROP, gravada pelo importer."""
+    return effective_unit_scale(character_unit_scale, armature_model_format(armature_obj))
+
+
+def rest_local_positions(armature_obj, rest_by_bone, exportable_names, unit_scale):
+    """v0.10.19 -- posição LOCAL (relativa ao pai) de cada bone exportável
+    NA POSE DE REPOUSO (rest/bind pose), em unidades de jogo -- não muda
+    entre frames (repouso é fixo), calculada uma vez só ANTES do loop de
+    frames (diferente de compute_deltas, que roda todo frame). Usada só
+    por Bake Parent Scale into Children (ver sample_action()), pra saber o
+    quanto "puxar" o pivot de cada filho em direção ao pivot do pai quando
+    o pai encolhe/cresce -- sem isso, o filho encolhe no PRÓPRIO lugar em
+    vez de se aproximar/afastar do pai, ficando com aparência errada
+    (gap/sobreposição) mesmo com o tamanho certo."""
+    inv_scale = 1.0 / armature_unit_scale(armature_obj, unit_scale)
+    out = {}
+    for pbone in armature_obj.pose.bones:
+        name = pbone.name
+        if name not in exportable_names:
+            continue
+        parent_name = pbone.parent.name if pbone.parent else None
+        rest_local = local_matrix(rest_by_bone, name, parent_name)
+        out[name] = rest_local.to_translation() * inv_scale
+    return out
+
+
+def compute_deltas(armature_obj, rest_by_bone, pose_by_bone, exportable_names, unit_scale):
+    """Para cada bone exportável, calcula (posição delta em unidades de
+    jogo, quaternion delta, escala delta) na pose ATUAL vs repouso."""
+    results = {}
+    inv_scale = 1.0 / armature_unit_scale(armature_obj, unit_scale)
+    for pbone in armature_obj.pose.bones:
+        name = pbone.name
+        if name not in exportable_names:
+            continue
+        parent_name = pbone.parent.name if pbone.parent else None
+
+        rest_local = local_matrix(rest_by_bone, name, parent_name)
+        pose_local = local_matrix(pose_by_bone, name, parent_name)
+
+        delta = rest_local.inverted() @ pose_local
+        pos, quat, scale = delta.decompose()
+
+        results[name] = (pos * inv_scale, quat, scale)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Amostragem de frames
+# ---------------------------------------------------------------------------
+
+
+def _iter_action_fcurves(action):
+    """Compat 4.5/5.0+: Action.fcurves (API "legacy") foi removida no
+    Blender 5.0 -- bpy.types.Action Removed: fcurves/groups/id_root.
+    Em 5.0+ as F-Curves ficam em layers -> strips -> channelbags;
+    percorre essa estrutura manualmente pra continuar pegando TODO
+    F-Curve da Action (qualquer slot/bone/canal), igual o antigo
+    action.fcurves fazia. Mantém o caminho antigo em <=4.5."""
+    if hasattr(action, "fcurves"):
+        yield from action.fcurves
+        return
+    for layer in action.layers:
+        for strip in layer.strips:
+            if strip.type != "KEYFRAME":
+                continue
+            for channelbag in strip.channelbags:
+                yield from channelbag.fcurves
+
+
+def collect_all_keyframe_frames(action, frame_start, frame_end):
+    """Modo 'preservar keyframes': junta os frames de TODO fcurve da Action
+    inteira (qualquer bone, qualquer canal -- CTRL, IK, pole targets, MCH
+    manualmente chaveado, o que for), dentro do range escolhido.
+
+    Deliberadamente não tentamos adivinhar qual bone de controle anima qual
+    bone original por convenção de nome -- seria frágil (pole targets, por
+    exemplo, raramente seguem o padrão 'NomeOriginal_ALGO'). Em vez disso,
+    qualquer frame onde QUALQUER coisa no rig tem um keyframe vira um ponto
+    de amostragem pra TODOS os bones originais. Isso é uma simplificação:
+    se você chavear controladores diferentes em frames diferentes (em vez
+    de posar tudo junto), essa união ainda cobre certo, só que pode gerar
+    alguns keyframes "redundantes" em bones que não mudaram naquele frame
+    específico -- inofensivo, só deixa o arquivo um pouco maior."""
+    frames = set()
+    if action is None:
+        return frames
+    for fcurve in _iter_action_fcurves(action):
+        for kp in fcurve.keyframe_points:
+            f = kp.co.x
+            if frame_start <= f <= frame_end:
+                frames.add(round(f))
+    return frames
+
+
+def frame_to_hytale_time(frame, frame_start, fps):
+    """Frame da timeline do Blender -> 'time' do .blockyanim (frame inteiro
+    a 60 FPS, relativo ao INÍCIO do range exportado, ou seja o primeiro
+    frame exportado sempre vira time=0)."""
+    seconds = (frame - frame_start) / fps
+    return round(seconds * FPS_HYTALE)
+
+
+def sanitize_filename(name):
+    """Nomes de Action podem ter caracteres inválidos em nome de arquivo
+    (: / \\ etc) -- troca por '_'."""
+    cleaned = re.sub(r'[<>:"/\\|?*]', "_", name).strip()
+    return cleaned or "animation"
+
+
+def round_floats_for_output(obj, decimals):
+    """Arredonda todo float da estrutura pra um número fixo de casas
+    decimais, recursivamente. Só cosmético pra tamanho de arquivo -- NÃO
+    remove nenhum keyframe, só encurta a representação em texto de cada
+    número (evita algo tipo 0.30000000000000004 quando o valor real já foi
+    quantizado/arredondado antes)."""
+    if isinstance(obj, float):
+        return round(obj, decimals)
+    if isinstance(obj, dict):
+        return {k: round_floats_for_output(v, decimals) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [round_floats_for_output(v, decimals) for v in obj]
+    return obj
+
+
+def _is_flat_dict(d):
+    """True se 'd' só tem valores escalares (nada de dict/list dentro) --
+    o caso de 'delta':{x,y,z,w} ou {x,y}. Usado por dump_pretty_blockyanim
+    pra decidir o que colapsa numa linha só."""
+    return isinstance(d, dict) and all(not isinstance(v, (dict, list)) for v in d.values())
+
+
+def dump_pretty_blockyanim(content, indent=2):
+    """Serializador PRÓPRIO pro modo Pretty Print (opts.pretty_print_json)
+    -- NÃO usa json.dump(indent=2) puro. Motivo: o indent do Python expande
+    QUALQUER dict aninhado recursivamente, uma linha por campo -- inclusive
+    coisas tipo 'delta':{x,y,z,w}, que o Blockbench mantém numa linha só.
+    Sem isso, o arquivo pretty-print sai bem maior que o do Blockbench
+    (cada keyframe ganha ~5 linhas extras só pro 'delta'/'scale'), o que é
+    exatamente a causa do arquivo pretty-print ter saído mais pesado que o
+    reexport do Blockbench.
+
+    Regra: qualquer dict cujos valores sejam TODOS escalares vira uma
+    linha só (delta, scale etc.); dicts/listas com estrutura de verdade
+    (arrays de keyframes, canais, nodeAnimations) continuam multi-linha,
+    exatamente como um json.dump(indent=2) normal faria."""
+
+    def encode(o, level):
+        pad = " " * (indent * level)
+        pad_in = " " * (indent * (level + 1))
+        if isinstance(o, dict):
+            if not o:
+                return "{}"
+            if _is_flat_dict(o):
+                items = ", ".join(f"{json.dumps(k)}: {json.dumps(v)}" for k, v in o.items())
+                return "{" + items + "}"
+            lines = [f"{pad_in}{json.dumps(k)}: {encode(v, level + 1)}" for k, v in o.items()]
+            return "{\n" + ",\n".join(lines) + "\n" + pad + "}"
+        if isinstance(o, list):
+            if not o:
+                return "[]"
+            lines = [f"{pad_in}{encode(v, level + 1)}" for v in o]
+            return "[\n" + ",\n".join(lines) + "\n" + pad + "]"
+        return json.dumps(o)
+
+    return encode(content, 0)
+
+
+# ---------------------------------------------------------------------------
+# Amostragem de UMA Action -> node_animations. Extraído em função separada
+# pra ser reaproveitado uma vez por Action marcada no export em lote.
+# ---------------------------------------------------------------------------
+
+
+def sample_action(context, obj, action, exportable_names, rest_by_bone, rest_local_pos, opts):
+    """'opts' é o próprio operador (self) -- só lemos as Properties dele.
+    Assume que obj.animation_data.action já foi setado pra 'action' antes
+    de chamar. 'rest_local_pos' -- ver rest_local_positions(), só usado
+    quando opts.bake_scale_hierarchy está ligado. Devolve (node_animations,
+    frame_start, frame_end, fps)."""
+    scene = context.scene
+    fps = scene.render.fps / scene.render.fps_base
+
+    frame_start = int(round(action.frame_range[0]))
+    frame_end = int(round(action.frame_range[1]))
+    if frame_end <= frame_start:
+        frame_end = frame_start + 1
+
+    if opts.bake_animation:
+        frames = list(range(frame_start, frame_end + 1, opts.frame_step))
+        if frames[-1] != frame_end:
+            frames.append(frame_end)
+        # Bake = dado denso, frame a frame -- 'smooth' (spline) por cima
+        # disso só amplifica ruído sub-visível em vez de suavizar nada
+        # (a curva já ESTÁ na resolução máxima). Por isso não é nem opção
+        # aqui: é sempre 'linear' quando Bake Animation está ligado.
+        interp = "linear"
+    else:
+        frames = sorted(collect_all_keyframe_frames(action, frame_start, frame_end))
+        if opts.force_start_end_keying:
+            frames = sorted(set(frames) | {frame_start, frame_end})
+        if not frames:
+            frames = [frame_start, frame_end]
+        interp = opts.preserved_interpolation
+
+    node_animations = {
+        name: {
+            "position": [],
+            "orientation": [],
+            "shapeStretch": [],
+            # Sempre presentes (mesmo vazios) nos arquivos oficiais da
+            # Hytale -- confirmado comparando com uma animação oficial
+            # (Sit.blockyanim). "shapeVisible" nunca é populado (não temos
+            # equivalente de visibilidade animada no pipeline do Blender),
+            # mas o campo TEM que existir, mesmo vazio -- a ausência total
+            # da chave é a suspeita mais forte pro import falhar dentro do
+            # próprio jogo (o parser do Blockbench é tolerante a isso, o
+            # do jogo pode não ser). "shapeUvOffset" É populado se este
+            # bone for alvo de alguma entrada em hytale_texture_picker_
+            # exports (ver sample_uv_offset_px, e o setup de uv_entries
+            # logo abaixo).
+            "shapeVisible": [],
+            "shapeUvOffset": [],
+        }
+        for name in exportable_names
+    }
+    # Amostras acumuladas por bone/canal ANTES de qualquer redução -- RDP
+    # precisa enxergar a curva inteira entre dois pontos-âncora pra decidir
+    # o que descartar, então não dá pra escrever direto em node_animations
+    # dentro do loop de frames como antes (isso só permitia comparar cada
+    # frame com o último ESCRITO, que é o método mais fraco).
+    pos_samples = {name: [] for name in exportable_names}
+    quat_samples = {name: [] for name in exportable_names}
+    scale_samples = {name: [] for name in exportable_names}
+
+    last_raw_quat = {}
+    zero_vec = Vector((0.0, 0.0, 0.0))
+    identity_scale = Vector((1.0, 1.0, 1.0))
+    identity_quat = Quaternion((1.0, 0.0, 0.0, 0.0))
+
+    # v0.12 -- itera armature.hytale_texture_picker_exports inteira (uma
+    # entrada por instância de Texture Picker, ver HYTALE_texture_picker_
+    # export_item em cima) em vez de ler um conjunto fixo de campos de uma
+    # PointerProperty única -- cada instância é resolvida/validada aqui
+    # UMA vez (fora do loop de frames), com seu próprio control bone,
+    # lista de target bones (principal + companions) e estado de dedupe
+    # ("last_sampled"), pra várias instâncias independentes exportarem no
+    # mesmo arquivo sem pisar uma na outra. Uma entrada com problema
+    # (bone de controle ou alvo principal não encontrado) é avisada e
+    # PULADA -- não cancela as outras entradas da lista.
+    #
+    # opts.export_texture_picker (checkbox por exportação, não persiste
+    # com o arquivo -- ver EXPORT_OT_hytale_blockyanim.draw()): lista
+    # VAZIA aqui, sem nem entrar no loop, se estiver desligado -- desliga
+    # 'shapeUvOffset' pra ESTA exportação sem apagar nenhuma instância
+    # configurada (as instâncias em si continuam salvas na Armature).
+    uv_entries = []
+    for uv_item in get_texture_picker_exports(obj) if opts.export_texture_picker else ():
+        control_pbone = obj.pose.bones.get(uv_item.uv_offset_source_bone)
+        if control_pbone is None:
+            opts.report(
+                {"WARNING"},
+                f"Texture Picker: bone de controle '{uv_item.uv_offset_source_bone}' não "
+                f"encontrado no Armature -- pulando esta instância (alvo "
+                f"'{uv_item.uv_offset_target_bone}') na Action '{action.name}'.",
+            )
+            continue
+        if uv_item.uv_offset_target_bone not in node_animations:
+            opts.report(
+                {"WARNING"},
+                f"Texture Picker: bone alvo '{uv_item.uv_offset_target_bone}' não está "
+                f"entre os bones exportáveis -- pulando esta instância na Action "
+                f"'{action.name}'.",
+            )
+            continue
+        # v0.10.13 -- Companion targets: mesmo delta gravado em mais de um
+        # bone dentro da MESMA instância (ver comentário grande em
+        # HYTALE_texture_picker_export_item.uv_offset_target_bones_extra).
+        # Nome que não é exportável é avisado e IGNORADO individualmente --
+        # não cancela o alvo principal nem os outros companions DESTA
+        # instância (diferente do alvo principal, cuja ausência cancela a
+        # instância inteira, ver acima).
+        target_bones = [uv_item.uv_offset_target_bone]
+        for extra_name in (uv_item.uv_offset_target_bones_extra or "").split(","):
+            extra_name = extra_name.strip()
+            if not extra_name or extra_name in target_bones:
+                continue  # vazio, ou duplicado do principal/de outro companion já aceito
+            if extra_name not in node_animations:
+                opts.report(
+                    {"WARNING"},
+                    f"Texture Picker: bone extra '{extra_name}' não está entre os bones "
+                    f"exportáveis -- pulando esse alvo (os outros continuam) na Action "
+                    f"'{action.name}'.",
+                )
+                continue
+            target_bones.append(extra_name)
+        uv_entries.append({
+            "control_pbone": control_pbone,
+            "target_bones": target_bones,
+            "settings": uv_item,  # sample_uv_offset_px só lê step_x/px_x/step_y/px_y -- o item já tem esses 4 campos
+            "last_sampled": None,  # dedupe é POR INSTÂNCIA agora -- cada uma tem seu próprio último valor amostrado
+        })
+
+    for frame in frames:
+        is_edge_frame = frame == frames[0] or frame == frames[-1]
+
+        scene.frame_set(frame)
+        context.view_layer.update()
+
+        pose_by_bone = pose_matrices(obj)
+        deltas = compute_deltas(obj, rest_by_bone, pose_by_bone, exportable_names, opts.unit_scale)
+        hytale_time = frame_to_hytale_time(frame, frame_start, fps)
+
+        # v0.10.18 -- Bake Parent Scale into Children: calcula, pra este
+        # frame, o scale "em cascata" de cada bone (produto do próprio
+        # scale LOCAL -- já em `deltas` -- com o de TODOS os ancestrais
+        # exportáveis, subindo a hierarquia). Memoizado num dict só deste
+        # frame (cascaded_scale_cache) -- cada bone calculado uma vez só,
+        # mesmo se vários irmãos compartilharem o mesmo ancestral. Só
+        # existe se o toggle estiver ligado -- custo zero quando desligado.
+        cascaded_scale_cache = {}
+
+        def _cascaded_scale(bone_name):
+            if bone_name in cascaded_scale_cache:
+                return cascaded_scale_cache[bone_name]
+            own_scale = deltas[bone_name][2] if bone_name in deltas else Vector((1.0, 1.0, 1.0))
+            pbone = obj.pose.bones.get(bone_name)
+            if pbone is not None and pbone.parent is not None and pbone.parent.name in exportable_names:
+                parent_scale = _cascaded_scale(pbone.parent.name)
+                result = Vector((
+                    own_scale.x * parent_scale.x,
+                    own_scale.y * parent_scale.y,
+                    own_scale.z * parent_scale.z,
+                ))
+            else:
+                result = own_scale
+            cascaded_scale_cache[bone_name] = result
+            return result
+
+        for name, (pos, quat, scale) in deltas.items():
+            # Correção de sinal (dupla cobertura, q == -q) -- ANTES de
+            # quantizar e ANTES de acumular pra RDP, pra continuidade
+            # correta nos dois. Ver fix_quaternion_sign().
+            quat = fix_quaternion_sign(quat, last_raw_quat.get(name))
+            last_raw_quat[name] = quat
+
+            # Também exige opts.export_scale, não só o próprio toggle: a
+            # UI trava "Bake Parent Scale into Children" quando "Export
+            # Scale" está desligado, mas isso não reseta o valor
+            # guardado -- sem essa checagem, um usuário que ligou o Bake
+            # e depois desligou o Export Scale exportaria a posição dos
+            # filhos corrigida como se o pai tivesse encolhido, mas o
+            # shapeStretch do próprio pai nunca sairia no arquivo.
+            if opts.bake_scale_hierarchy and opts.export_scale:
+                scale = _cascaded_scale(name)
+                # Corrige o pivot do filho junto com o tamanho (ver
+                # rest_local_positions()) -- sem isso o filho encolhe no
+                # próprio lugar em vez de se aproximar/afastar do pivot
+                # do pai, causando gap/sobreposição visual mesmo com o
+                # tamanho certo. Fórmula (por eixo): nova_posição =
+                # posição_de_repouso * (escala_do_pai - 1) + posição_
+                # própria_atual * escala_do_pai -- reconstrói o que a
+                # composição de matriz de verdade faria (child_world =
+                # parent_world @ child_local), já que o Hytale não faz
+                # essa composição sozinho (confirmado ao vivo: pai
+                # escalado não move os filhos no Blockbench).
+                pbone_current = obj.pose.bones.get(name)
+                if pbone_current is not None and pbone_current.parent is not None \
+                        and pbone_current.parent.name in exportable_names:
+                    parent_scale = _cascaded_scale(pbone_current.parent.name)
+                    rest_pos = rest_local_pos.get(name, Vector((0.0, 0.0, 0.0)))
+                    pos = Vector((
+                        rest_pos.x * (parent_scale.x - 1.0) + pos.x * parent_scale.x,
+                        rest_pos.y * (parent_scale.y - 1.0) + pos.y * parent_scale.y,
+                        rest_pos.z * (parent_scale.z - 1.0) + pos.z * parent_scale.z,
+                    ))
+
+            if opts.quantize_values:
+                pos = quantize_vector(pos, opts.position_quantize_step)
+                quat = quantize_quaternion(quat, opts.rotation_quantize_step)
+                scale = quantize_vector(scale, opts.scale_quantize_step)
+
+            # NÃO zeramos aqui (frame a frame) -- ver o comentário grande
+            # logo após este loop ("Noise floor: canal inteiro, não frame a
+            # frame"). Zerar um frame isolado quando ele calha de estar
+            # perto da identidade não distingue ruído estático real de uma
+            # ease genuína que só COMEÇA perto de zero, e produzia um pulo
+            # visual bem no início dela (bug corrigido).
+
+            pos_samples[name].append((hytale_time, pos))
+            quat_samples[name].append((hytale_time, quat))
+            if opts.export_scale:
+                scale_samples[name].append((hytale_time, scale))
+
+        # Itera todas as instâncias resolvidas (uv_entries) -- cada uma
+        # lê seu próprio control_pbone e escreve nos seus próprios
+        # target_bones, com dedupe independente por instância.
+        for uv_entry in uv_entries:
+            px_x, px_y = sample_uv_offset_px(uv_entry["control_pbone"], uv_entry["settings"])
+
+            # Dedupe por igualdade exata (não epsilon/RDP) -- o valor já
+            # é discreto (snap-to-grid), então dois frames iguais em
+            # sequência são 100% redundantes. RDP assume uma curva
+            # contínua interpolável entre âncoras, o que não faz sentido
+            # pra um offset de atlas em degraus.
+            #
+            # O dedupe vive dentro do dict de cada uv_entry
+            # ("last_sampled"), não num dict global -- cada instância
+            # tem sua própria última amostra, senão a instância B
+            # "roubaria" o dedupe da instância A no mesmo frame (bug:
+            # mudar só a boca não escreveria o primeiro frame da mão se
+            # os dois valores calharem iguais).
+            write_uv = True
+            if not is_edge_frame and uv_entry["last_sampled"] == (px_x, px_y):
+                write_uv = False
+            uv_entry["last_sampled"] = (px_x, px_y)
+            if write_uv:
+                for target_name in uv_entry["target_bones"]:
+                    node_animations[target_name]["shapeUvOffset"].append(
+                        {
+                            "time": hytale_time,
+                            "delta": {"x": px_x, "y": px_y},
+                            "interpolationType": interp,
+                        }
+                    )
+
+    # --- Noise floor: canal inteiro, não frame a frame ---
+    #
+    # Bug histórico corrigido aqui: aplicar o epsilon dentro do loop de
+    # frames, testando cada amostra isoladamente contra a identidade,
+    # funciona bem pro ruído de IK (desvio praticamente constante em
+    # todos os frames) mas quebra qualquer ease genuína cujos primeiros
+    # frames comecem perto de zero -- esses frames eram zerados à força,
+    # e o frame em que o movimento real ultrapassava o epsilon
+    # "aparecia" sem transição (o soco/tremedeira visto no começo de
+    # algumas animações).
+    #
+    # A distinção que importa: "esse canal nunca sai da vizinhança da
+    # identidade em nenhum frame" (ruído estático de verdade, pode virar
+    # identidade) é diferente de "esse frame específico calha de estar
+    # perto da identidade" (pode ser só o início de um movimento real).
+    # Por isso a checagem roda aqui, depois de já termos todas as
+    # amostras do bone -- só zera o canal inteiro se ele nunca, em
+    # nenhum ponto, sair do epsilon; senão nenhum frame é tocado.
+    for name in exportable_names:
+        samples_p = pos_samples[name]
+        if samples_p and all(v.length < opts.position_zero_epsilon for _, v in samples_p):
+            pos_samples[name] = [(t, zero_vec) for t, _ in samples_p]
+
+        samples_s = scale_samples[name]
+        if samples_s and all((v - identity_scale).length < opts.scale_zero_epsilon for _, v in samples_s):
+            scale_samples[name] = [(t, identity_scale) for t, _ in samples_s]
+
+        samples_q = quat_samples[name]
+        if samples_q and all(
+            abs(abs(q.dot(identity_quat)) - 1.0) < opts.rotation_zero_epsilon for _, q in samples_q
+        ):
+            quat_samples[name] = [(t, identity_quat) for t, _ in samples_q]
+
+    # Redução de keyframes (RDP) + escrita final de position/orientation/
+    # shapeStretch. Quando 'skip_redundant_frames' está desligado, mantém
+    # TODAS as amostras (mesmo comportamento de sempre, sem redução).
+    if opts.skip_redundant_frames:
+        keep_p_by_bone = {
+            name: rdp_reduce_indices(pos_samples[name], opts.position_epsilon, _rdp_distance_vec)
+            for name in exportable_names
+        }
+        keep_q_by_bone = {
+            name: rdp_reduce_indices(quat_samples[name], opts.rotation_epsilon, _rdp_distance_quat)
+            for name in exportable_names
+        }
+        keep_s_by_bone = {
+            name: rdp_reduce_indices(scale_samples[name], opts.position_epsilon, _rdp_distance_vec)
+            for name in exportable_names
+        }
+
+        # Sempre ativo (sem opção separada pra lembrar) -- sincroniza só
+        # os bones cujos pontos significativos já caem próximos no tempo
+        # entre si (mesmo evento de troca de pose). Ver
+        # sync_nearby_keyframes() pra por que não sincronizamos TUDO
+        # contra TUDO na timeline inteira (custo de arquivo alto demais
+        # pra ser padrão).
+        frame_times = [t for t, _ in next(iter(pos_samples.values()))] if pos_samples else []
+        if frame_times:
+            keep_p_by_bone = sync_nearby_keyframes(keep_p_by_bone, frame_times)
+            keep_q_by_bone = sync_nearby_keyframes(keep_q_by_bone, frame_times)
+            keep_s_by_bone = sync_nearby_keyframes(keep_s_by_bone, frame_times)
+
+        keep_by_bone = {
+            name: (keep_p_by_bone[name], keep_q_by_bone[name], keep_s_by_bone[name])
+            for name in exportable_names
+        }
+    else:
+        keep_by_bone = {
+            name: (
+                range(len(pos_samples[name])),
+                range(len(quat_samples[name])),
+                range(len(scale_samples[name])),
+            )
+            for name in exportable_names
+        }
+
+    for name in exportable_names:
+        samples_p = pos_samples[name]
+        samples_q = quat_samples[name]
+        samples_s = scale_samples[name]
+        keep_p, keep_q, keep_s = keep_by_bone[name]
+
+        for i in sorted(keep_p):
+            t, pos = samples_p[i]
+            node_animations[name]["position"].append(
+                {"time": t, "delta": vec_to_dict(pos), "interpolationType": interp}
+            )
+        for i in sorted(keep_q):
+            t, quat = samples_q[i]
+            node_animations[name]["orientation"].append(
+                {"time": t, "delta": quat_to_dict(quat), "interpolationType": interp}
+            )
+        for i in sorted(keep_s):
+            t, scale = samples_s[i]
+            node_animations[name]["shapeStretch"].append(
+                {"time": t, "delta": vec_to_dict(scale), "interpolationType": interp}
+            )
+
+    # Limpeza: canal todo-zero (posição), todo-identidade (rotação/escala)
+    # vira array vazio; bone sem NENHUM dado em nenhum canal é descartado.
+    cleaned = {}
+    for name, chans in node_animations.items():
+        pos_kfs = chans["position"]
+        if pos_kfs and all(
+            kf["delta"]["x"] == 0.0 and kf["delta"]["y"] == 0.0 and kf["delta"]["z"] == 0.0
+            for kf in pos_kfs
+        ):
+            chans["position"] = []
+
+        orient_kfs = chans["orientation"]
+        if orient_kfs and all(
+            kf["delta"]["x"] == 0.0 and kf["delta"]["y"] == 0.0 and kf["delta"]["z"] == 0.0 and kf["delta"]["w"] == 1.0
+            for kf in orient_kfs
+        ):
+            chans["orientation"] = []
+
+        scale_kfs = chans["shapeStretch"]
+        if scale_kfs and all(
+            kf["delta"]["x"] == 1.0 and kf["delta"]["y"] == 1.0 and kf["delta"]["z"] == 1.0
+            for kf in scale_kfs
+        ):
+            chans["shapeStretch"] = []
+
+        if chans["position"] or chans["orientation"] or chans["shapeStretch"] or chans["shapeUvOffset"]:
+            cleaned[exported_bone_name(obj, name, getattr(opts, "use_original_names", False))] = chans
+
+    return cleaned, frame_start, frame_end, fps
+
+
+# ---------------------------------------------------------------------------
+# Lista de Actions no painel de export, estilo Auto Rig Pro: checkbox por
+# Action + Select All / Deselect All.
+# ---------------------------------------------------------------------------
+
+
+class HYTALE_action_export_item(PropertyGroup):
+    action_name: StringProperty()
+    export: BoolProperty(default=False)
+
+
+class HYTALE_UL_action_export_list(bpy.types.UIList):
+    bl_idname = "HYTALE_UL_action_export_list"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
+        row = layout.row(align=True)
+        row.prop(item, "export", text="")
+        row.label(text=item.action_name)
+
+
+class HYTALE_OT_select_all_actions(Operator):
+    """Marca/desmarca todas as Actions da lista de export (botões dentro
+    do painel do export -- só funciona enquanto o diálogo de export está
+    aberto, via context.active_operator)."""
+
+    bl_idname = "hytale.select_all_actions"
+    bl_label = "Select/Deselect All"
+    description = tooltip("exporter.tooltip.select_all_actions")
+    bl_options = {"INTERNAL"}
+
+    value: BoolProperty(default=True)
+
+    def execute(self, context):
+        op = context.active_operator
+        if op is None or not hasattr(op, "action_items"):
+            self.report({"WARNING"}, "Export dialog isn't open.")
+            return {"CANCELLED"}
+        for item in op.action_items:
+            item.export = self.value
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# Operador de export -- em lote: 1 arquivo .blockyanim por Action marcada,
+# escritos numa pasta escolhida (não um único arquivo).
+# ---------------------------------------------------------------------------
+
+
+# v0.14 -- todas as properties de EXPORT_OT_hytale_blockyanim (mesmo as
+# sem tooltip, tipo os 6 toggles show_*) vêm desta função --
+# @localized_props precisa do dict COMPLETO pra reconstruir a classe
+# quando o idioma muda (ver translations/__init__.py, seção "Tooltip
+# de campo"). Diferente de HYTALE_export_settings/HYTALE_texture_picker_
+# export_item acima, esta classe é um Operator -- suas properties NÃO
+# persistem no .blend (só duram enquanto o diálogo de export está
+# aberto), então não tem o cuidado especial de type= externo.
+def _blockyanim_export_props(lang):
+    return {
+        "directory": StringProperty(subtype="DIR_PATH"),
+        "action_items": CollectionProperty(type=HYTALE_action_export_item),
+        "action_items_index": IntProperty(),
+        # ---------------- Geral (sempre visível) ----------------
+        "bake_animation": BoolProperty(
+            name="Bake Every Frame",
+            description=tr("exporter.prop.blockyanim_bake_animation", lang),
+            default=True,
+        ),
+        "is_loop": BoolProperty(
+            name="Loop?",
+            description=tr("exporter.prop.blockyanim_is_loop", lang),
+            default=False,
+        ),
+        "force_start_end_keying": BoolProperty(
+            name="Keep First & Last Frame",
+            description=tr("exporter.prop.blockyanim_force_start_end_keying", lang),
+            default=True,
+        ),
+        # Mesma opção do .blockymodel -- ver exported_bone_name().
+        "use_original_names": BoolProperty(
+            name="Use Original Names",
+            description=tr("exporter.prop.use_original_names", lang),
+            default=False,
+        ),
+        "show_optimization": BoolProperty(name="Optimization", default=False),
+        "show_stretch": BoolProperty(name="Stretch Animation", default=False),
+        "show_uv": BoolProperty(name="Texture Picker", default=False),
+        "show_rig": BoolProperty(name="Rig Setup", default=False),
+        "show_format": BoolProperty(name="File Format", default=False),
+        "show_reexport": BoolProperty(name="Re-Export", default=False),
+        # v0.12.2 -- checkbox por exportação (não persiste com o arquivo --
+        # mesmo espírito de 'Bake Parent Scale into Children' dentro de
+        # Stretch Animation). Fica DENTRO da caixa colapsável show_uv (ver
+        # draw()) -- configurar as instâncias em si fica na aba Export do
+        # Object Properties; este liga/desliga só decide se ESTA exportação
+        # inclui shapeUvOffset ou não, sem apagar nenhuma instância.
+        "export_texture_picker": BoolProperty(
+            name="Export Texture Picker",
+            description=tr("exporter.prop.blockyanim_export_texture_picker", lang),
+            default=True,
+        ),
+        # ---------------- Avançado (cada categoria colapsa por conta própria,
+        # ver draw() -- não existe mais um "Advanced Options" único envolvendo
+        # todas elas) ----------------
+        "frame_step": IntProperty(
+            name="Frame Step",
+            description=tr("exporter.prop.blockyanim_frame_step", lang),
+            default=1,
+            min=1,
+        ),
+        "preserved_interpolation": EnumProperty(
+            name="Curve Style",
+            description=tr("exporter.prop.blockyanim_preserved_interpolation", lang),
+            items=[
+                (
+                    "smooth",
+                    "Smooth",
+                    tr("exporter.prop.blockyanim_preserved_interpolation_item_smooth", lang),
+                ),
+                (
+                    "linear",
+                    "Linear",
+                    tr("exporter.prop.blockyanim_preserved_interpolation_item_linear", lang),
+                ),
+            ],
+            default="smooth",
+        ),
+        "quantize_values": BoolProperty(
+            name="Snap to Grid",
+            description=tr("exporter.prop.blockyanim_quantize_values", lang),
+            default=True,
+        ),
+        "position_quantize_step": FloatProperty(
+            name="Position Step",
+            description=tr("exporter.prop.blockyanim_position_quantize_step", lang),
+            default=0.0001,
+            min=0.0,
+        ),
+        "rotation_quantize_step": FloatProperty(
+            name="Rotation Step",
+            description=tr("exporter.prop.blockyanim_rotation_quantize_step", lang),
+            default=0.00001,
+            min=0.0,
+        ),
+        "scale_quantize_step": FloatProperty(
+            name="Stretch Step",
+            description=tr("exporter.prop.blockyanim_scale_quantize_step", lang),
+            default=0.0001,
+            min=0.0,
+        ),
+        "position_zero_epsilon": FloatProperty(
+            name="Position Noise Floor",
+            description=tr("exporter.prop.blockyanim_position_zero_epsilon", lang),
+            default=0.001,
+            min=0.0,
+        ),
+        "rotation_zero_epsilon": FloatProperty(
+            name="Rotation Noise Floor",
+            description=tr("exporter.prop.blockyanim_rotation_zero_epsilon", lang),
+            default=0.0001,
+            min=0.0,
+        ),
+        "skip_redundant_frames": BoolProperty(
+            name="Remove Extra Frames",
+            description=tr("exporter.prop.blockyanim_skip_redundant_frames", lang),
+            default=False,
+        ),
+        "position_epsilon": FloatProperty(
+            name="Position Tolerance",
+            description=tr("exporter.prop.blockyanim_position_epsilon", lang),
+            default=0.001,
+            min=0.0,
+        ),
+        "rotation_epsilon": FloatProperty(
+            name="Rotation Tolerance",
+            description=tr("exporter.prop.blockyanim_rotation_epsilon", lang),
+            default=0.0001,
+            min=0.0,
+        ),
+        "export_scale": BoolProperty(
+            name="Export Stretch (Scale)",
+            description=tr("exporter.prop.blockyanim_export_scale", lang),
+            default=True,
+        ),
+        "scale_zero_epsilon": FloatProperty(
+            name="Stretch Noise Floor",
+            description=tr("exporter.prop.blockyanim_scale_zero_epsilon", lang),
+            default=0.001,
+            min=0.0,
+        ),
+        # Diferente do Blender (onde escalar um bone pai encolhe os
+        # filhos junto na viewport, "Inherit Scale"), o Hytale/
+        # Blockbench não herda escala pela hierarquia: cada bone tem seu
+        # shapeStretch totalmente independente. Sem este toggle, uma
+        # animação que só escala o bone pai no Blender exporta um
+        # shapeStretch que só existe nele -- os filhos ficam parados em
+        # 1.0 e não encolhem no Blockbench/jogo. Ligado, cada bone
+        # exportável recebe o produto do próprio scale local com o de
+        # todos os ancestrais exportáveis (mesmo espírito de "Inherit
+        # Scale: Full"), calculado só na hora de amostrar, sem alterar
+        # keyframe nenhum na Action.
+        #
+        # Só o tamanho não bastava: os filhos encolhiam em torno do
+        # próprio pivot, em vez de se aproximar do pivot do pai. Por
+        # isso também corrige a posição de cada filho (ver
+        # rest_local_positions() + fórmula em sample_action()), puxando
+        # o pivot proporcionalmente à escala em cascata -- reconstrói
+        # "child_world = parent_world @ child_local", que o Hytale não
+        # faz sozinho.
+        "bake_scale_hierarchy": BoolProperty(
+            name="Bake Parent Scale into Children",
+            description=tr("exporter.prop.blockyanim_bake_scale_hierarchy", lang),
+            default=False,
+        ),
+        # v0.6.5/v0.12 -- os 4 campos de calibração de UV moraram aqui,
+        # depois numa PointerProperty única na Armature; agora moram no
+        # item de armature.hytale_texture_picker_exports (uma calibração
+        # por instância).
+        "unit_scale": FloatProperty(
+            name="Blender Units per Game Unit",
+            description=tr("exporter.prop.blockyanim_unit_scale", lang),
+            default=UNIT_SCALE_DEFAULT,
+            min=0.0001,
+            max=10.0,
+        ),
+        "output_decimal_places": IntProperty(
+            name="Decimal Places",
+            description=tr("exporter.prop.blockyanim_output_decimal_places", lang),
+            default=6,
+            min=1,
+            max=12,
+        ),
+        "pretty_print_json": BoolProperty(
+            name="Readable JSON",
+            description=tr("exporter.prop.blockyanim_pretty_print_json", lang),
+            default=False,
+        ),
+        "use_source_metadata": BoolProperty(
+            name="Keep Imported Timing",
+            description=tr("exporter.prop.blockyanim_use_source_metadata", lang),
+            default=False,
+        ),
+    }
+
+
+# Compartilhado pelos 4 operadores de export "grande" abaixo (.blockyanim,
+# .blockymodel, FBX model, FBX anim): todos exigem o mesmo Armature ativo
+# e tinham o mesmo poll()/invoke() copiado e colado -- extraído aqui pra
+# não divergir com o tempo (ex: a mensagem de erro mudar num lugar e não
+# nos outros três). poll() usa is_active_armature() (common.py) direto --
+# _poll_active_armature separado foi removido por duplicar a mesma lógica.
+
+
+def _require_active_armature(operator, context):
+    """Valida que há um Armature ativo/selecionado, reportando o erro padrão
+    se não houver. Retorna o Armature, ou None (já reportado) caso contrário."""
+    if not is_active_armature(context):
+        operator.report({"ERROR"}, "Select/activate the Armature you want to export first.")
+        return None
+    return context.active_object
+
+
+def _invoke_model_export_dialog(operator, context, extension):
+    """invoke() compartilhado pelos exports de arquivo único (.blockymodel,
+    FBX model): valida o Armature ativo, monta o filepath padrão a partir
+    do nome dele e abre o file browser."""
+    obj = _require_active_armature(operator, context)
+    if obj is None:
+        return {"CANCELLED"}
+    base_dir = os.path.dirname(bpy.data.filepath) if bpy.data.filepath else os.path.expanduser("~")
+    operator.filepath = os.path.join(base_dir, sanitize_filename(obj.name) + extension)
+    context.window_manager.fileselect_add(operator)
+    return {"RUNNING_MODAL"}
+
+
+def _invoke_action_export_dialog(operator, context):
+    """invoke() compartilhado pelos exports em lote de Actions (.blockyanim,
+    FBX anim): valida o Armature ativo, popula action_items com todas as
+    Actions da cena (marcando a Action ativa) e abre o file browser de pasta."""
+    obj = _require_active_armature(operator, context)
+    if obj is None:
+        return {"CANCELLED"}
+
+    current_action_name = None
+    if obj.animation_data and obj.animation_data.action:
+        current_action_name = obj.animation_data.action.name
+
+    operator.action_items.clear()
+    for action in sorted(bpy.data.actions, key=lambda a: a.name.lower()):
+        item = operator.action_items.add()
+        item.action_name = action.name
+        item.export = action.name == current_action_name
+
+    operator.directory = os.path.dirname(bpy.data.filepath) if bpy.data.filepath else os.path.expanduser("~")
+    context.window_manager.fileselect_add(operator)
+    return {"RUNNING_MODAL"}
+
+
+def _draw_use_original_names(operator, context, layout):
+    """Checkbox "Use Original Names" (.blockymodel/.blockyanim) -- só
+    habilitada quando algum bone foi renomeado pelo Rename Bones."""
+    obj = context.active_object
+    renamed = obj is not None and obj.type == "ARMATURE" and any(
+        b.get(BONE_RENAMED_FROM_PROP) for b in obj.data.bones
+    )
+    row = layout.row()
+    row.enabled = renamed
+    row.prop(operator, "use_original_names")
+
+
+def _draw_actions_export_box(operator, layout):
+    """draw() comum à caixa 'Actions to Export' -- chamado pelos dois
+    operadores de export em lote de Actions abaixo (.blockyanim, FBX
+    anim), que compartilham a mesma UI de seleção/lista de Actions."""
+    actions_box = layout.box()
+    actions_box.label(text="Actions to Export", icon="ACTION")
+    row = actions_box.row(align=True)
+    op_all = row.operator(HYTALE_OT_select_all_actions.bl_idname, text="Select All")
+    op_all.value = True
+    op_none = row.operator(HYTALE_OT_select_all_actions.bl_idname, text="Deselect All")
+    op_none.value = False
+    actions_box.template_list(
+        "HYTALE_UL_action_export_list", "",
+        operator, "action_items",
+        operator, "action_items_index",
+        rows=8,
+    )
+    n_selected = sum(1 for it in operator.action_items if it.export)
+    actions_box.label(text=f"{n_selected} action(s) selected")
+
+
+@localized_props(_blockyanim_export_props)
+class EXPORT_OT_hytale_blockyanim(Operator):
+    """Batch-export one or more Actions of the selected/active Armature to Hytale's .blockyanim format -- one file per Action, into a chosen folder"""
+
+    bl_idname = "export_scene.hytale_blockyanim"
+    bl_label = "Export Hytale Animations (.blockyanim)"
+    description = tooltip("exporter.tooltip.blockyanim")
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        return is_active_armature(context)
+
+    def invoke(self, context, event):
+        return _invoke_action_export_dialog(self, context)
+
+    def draw(self, context):
+        layout = self.layout
+
+        _draw_actions_export_box(self, layout)
+
+        general_box = layout.box()
+        general_box.prop(self, "bake_animation")
+        general_box.prop(self, "is_loop")
+        fsub = general_box.column()
+        fsub.enabled = not self.bake_animation
+        fsub.prop(self, "force_start_end_keying")
+        _draw_use_original_names(self, context, general_box)
+
+        layout.prop(
+            self, "show_optimization",
+            icon="TRIA_DOWN" if self.show_optimization else "TRIA_RIGHT",
+            emboss=False,
+        )
+        if self.show_optimization:
+            opt_box = layout.box()
+
+            step_col = opt_box.column()
+            step_col.enabled = self.bake_animation
+            step_col.prop(self, "frame_step")
+
+            interp_col = opt_box.column()
+            interp_col.enabled = not self.bake_animation
+            interp_col.prop(self, "preserved_interpolation")
+
+            opt_box.separator()
+            opt_box.prop(self, "quantize_values")
+            quant_col = opt_box.column()
+            quant_col.enabled = self.quantize_values
+            quant_col.prop(self, "position_quantize_step")
+            quant_col.prop(self, "rotation_quantize_step")
+            quant_col.prop(self, "scale_quantize_step")
+
+            opt_box.separator()
+            opt_box.prop(self, "position_zero_epsilon")
+            opt_box.prop(self, "rotation_zero_epsilon")
+
+            opt_box.separator()
+            opt_box.prop(self, "skip_redundant_frames")
+            skip_col = opt_box.column()
+            skip_col.enabled = self.skip_redundant_frames
+            skip_col.prop(self, "position_epsilon")
+            skip_col.prop(self, "rotation_epsilon")
+
+        layout.prop(
+            self, "show_stretch",
+            icon="TRIA_DOWN" if self.show_stretch else "TRIA_RIGHT",
+            emboss=False,
+        )
+        if self.show_stretch:
+            stretch_box = layout.box()
+            stretch_box.prop(self, "export_scale")
+            scale_col = stretch_box.column()
+            scale_col.enabled = self.export_scale
+            scale_col.prop(self, "scale_zero_epsilon")
+            scale_col.prop(self, "bake_scale_hierarchy")
+
+        # Campos de calibração (Grid Step/Pixels per Step) moram 100% na
+        # aba Export do Object Properties junto do resto de cada
+        # instância (Source/Target/Companion Bones) -- um lugar só por
+        # instância, sem ambiguidade de "qual está selecionada".
+        layout.prop(
+            self, "show_uv",
+            icon="TRIA_DOWN" if self.show_uv else "TRIA_RIGHT",
+            emboss=False,
+        )
+        if self.show_uv:
+            uv_box = layout.box()
+            configured_count = (
+                len(get_texture_picker_exports(context.active_object))
+                if context.active_object is not None and context.active_object.type == "ARMATURE"
+                else 0
+            )
+            uv_box.prop(self, "export_texture_picker")
+            count_row = uv_box.row()
+            count_row.label(text=f"{configured_count} instance(s) configured.")
+
+        layout.prop(
+            self, "show_rig",
+            icon="TRIA_DOWN" if self.show_rig else "TRIA_RIGHT",
+            emboss=False,
+        )
+        if self.show_rig:
+            rig_box = layout.box()
+            rig_box.prop(self, "unit_scale")
+
+        layout.prop(
+            self, "show_format",
+            icon="TRIA_DOWN" if self.show_format else "TRIA_RIGHT",
+            emboss=False,
+        )
+        if self.show_format:
+            format_box = layout.box()
+            format_box.prop(self, "output_decimal_places")
+            format_box.prop(self, "pretty_print_json")
+
+        layout.prop(
+            self, "show_reexport",
+            icon="TRIA_DOWN" if self.show_reexport else "TRIA_RIGHT",
+            emboss=False,
+        )
+        if self.show_reexport:
+            reexport_box = layout.box()
+            reexport_box.prop(self, "use_source_metadata")
+
+    def execute(self, context):
+        obj = _require_active_armature(self, context)
+        if obj is None:
+            return {"CANCELLED"}
+        if obj.animation_data is None:
+            obj.animation_data_create()
+
+        selected_items = [it for it in self.action_items if it.export]
+        if not selected_items:
+            self.report({"ERROR"}, "No Action selected -- check at least one in the list.")
+            return {"CANCELLED"}
+
+        if not self.directory:
+            self.report({"ERROR"}, "No output folder selected.")
+            return {"CANCELLED"}
+        os.makedirs(self.directory, exist_ok=True)
+
+        export_settings = get_export_settings(obj)
+
+        exportable_names = resolve_exportable_bone_names(self, obj, export_settings)
+        if exportable_names is None:
+            return {"CANCELLED"}
+
+        rest_by_bone = rest_matrices(obj)
+        # v0.10.19 -- só usado por Bake Parent Scale into Children (ver
+        # rest_local_positions()) -- calculado aqui, uma vez só pra toda a
+        # sessão de export (repouso é fixo, não muda por Action/frame).
+        rest_local_pos = rest_local_positions(obj, rest_by_bone, exportable_names, self.unit_scale)
+
+        original_action = obj.animation_data.action
+        original_frame = context.scene.frame_current
+
+        exported_files = []
+        try:
+            for item in selected_items:
+                action = bpy.data.actions.get(item.action_name)
+                if action is None:
+                    self.report({"WARNING"}, f"Action '{item.action_name}' not found anymore, skipping.")
+                    continue
+
+                obj.animation_data.action = action
+                node_animations, frame_start, frame_end, fps = sample_action(
+                    context, obj, action, exportable_names, rest_by_bone, rest_local_pos, self
+                )
+
+                duration_seconds = (frame_end - frame_start) / fps
+                computed_duration = max(1, round(duration_seconds * FPS_HYTALE))
+
+                # Se este Action veio do anim_importer.py e ainda carrega os
+                # valores originais do arquivo (ver _stamp_action_source_metadata
+                # em anim_importer.py), preferir eles em vez do que acabamos de
+                # recalcular a partir do frame range atual -- ver
+                # use_source_metadata, acima, pra quando isso NÃO é desejado.
+                duration_value = computed_duration
+                hold_last_value = not self.is_loop
+                if self.use_source_metadata:
+                    stamped_duration = action.get(ACTION_SOURCE_DURATION_PROP)
+                    if stamped_duration is not None:
+                        duration_value = max(1, int(round(stamped_duration)))
+                    stamped_hold_last = action.get(ACTION_SOURCE_HOLD_LAST_KEYFRAME_PROP)
+                    if stamped_hold_last is not None:
+                        hold_last_value = bool(stamped_hold_last)
+
+                content = {
+                    "formatVersion": 1,
+                    "duration": duration_value,
+                    "holdLastKeyframe": hold_last_value,
+                    "nodeAnimations": node_animations,
+                }
+
+                filename = sanitize_filename(action.name) + ".blockyanim"
+                filepath = os.path.join(self.directory, filename)
+                # newline="\n" é proposital nos dois modos: sem isso, o
+                # Python no Windows converte cada "\n" que escrevermos pra
+                # "\r\n" (modo texto padrão do SO) -- no modo Pretty Print
+                # (que tem uma linha por campo) isso sozinho já adiciona um
+                # byte extra por linha (~65KB num arquivo deste tamanho),
+                # sem ganhar nada em troca. O Blockbench/o jogo leem "\n"
+                # puro sem problema.
+                with open(filepath, "w", encoding="utf-8", newline="\n") as f:
+                    rounded = round_floats_for_output(content, self.output_decimal_places)
+                    if self.pretty_print_json:
+                        f.write(dump_pretty_blockyanim(rounded))
+                    else:
+                        json.dump(rounded, f, separators=(",", ":"))
+                exported_files.append(filename)
+        finally:
+            obj.animation_data.action = original_action
+            context.scene.frame_set(original_frame)
+            context.view_layer.update()
+
+        if not exported_files:
+            self.report({"ERROR"}, "Nothing was exported.")
+            return {"CANCELLED"}
+
+        self.report(
+            {"INFO"},
+            f"Exported {len(exported_files)} file(s) to '{self.directory}': " + ", ".join(exported_files),
+        )
+        return {"FINISHED"}
+
+
+# --- Export .blockymodel ---
+
+
+# Confirmado contra um arquivo real exportado direto do Blockbench
+# (Correto_Dark_Bunny.blockymodel): a geometria/posição já batia quase
+# exatamente com o que calculamos (confirmado node a node), mas duas
+# diferenças estruturais reais precisavam de correção:
+#   1) Nível raiz também tem "format" ("character" pros personagens) e
+#      "lod" ("auto") -- não só "nodes".
+#   2) Todo node tem um "id" (string sequencial) e o "shape" de TODO
+#      node (incluindo os "type":"none") sempre tem todas estas chaves:
+#      "stretch":{x:1,y:1,z:1}, "settings.isPiece":false, "textureLayout"
+#      (nunca omitido, {} quando "none"), "unwrapMode":"custom",
+#      "visible":true, "doubleSided":false, "shadingMode":"flat".
+# finalize_shape_for_export(), abaixo, monta esse schema completo pra
+# qualquer shape "core" (só type/offset/settings.size/textureLayout, que
+# é tudo que de fato calculamos/guardamos) sem sobrescrever nenhum campo
+# que já exista no shape salvo -- só preenche o que falta.
+
+
+_SHAPE_DEFAULTS = {
+    "stretch": {"x": 1, "y": 1, "z": 1},
+    "unwrapMode": "custom",
+    "visible": True,
+    "doubleSided": False,
+    "shadingMode": "flat",
+}
+
+
+def finalize_shape_for_export(shape_core):
+    """Devolve um dict 'shape' completo (todas as chaves que o formato
+    real sempre grava -- ver nota grande acima), a partir de um shape
+    'core' (só o que a gente calcula/guarda de verdade: type/offset/
+    settings.size/textureLayout, ou {} pra pivot puro). Não destrutivo:
+    qualquer chave que já exista em `shape_core` (ex.: veio de um
+    .blockymodel original, snapshot cru com mais campos) tem prioridade
+    sobre o default."""
+    shape_core = shape_core or {}
+    result = {"type": shape_core.get("type", "none")}
+    result["offset"] = shape_core.get("offset", {"x": 0.0, "y": 0.0, "z": 0.0})
+    result["stretch"] = shape_core.get("stretch", _SHAPE_DEFAULTS["stretch"])
+    settings = dict(shape_core.get("settings", {}))
+    settings.setdefault("isPiece", False)
+    result["settings"] = settings
+    result["textureLayout"] = shape_core.get("textureLayout", {})
+    result["unwrapMode"] = shape_core.get("unwrapMode", _SHAPE_DEFAULTS["unwrapMode"])
+    result["visible"] = shape_core.get("visible", _SHAPE_DEFAULTS["visible"])
+    result["doubleSided"] = shape_core.get("doubleSided", _SHAPE_DEFAULTS["doubleSided"])
+    result["shadingMode"] = shape_core.get("shadingMode", _SHAPE_DEFAULTS["shadingMode"])
+    return result
+
+
+def build_export_node_tree(armature_obj, exportable_names, unit_scale, rest_by_bone, use_original_names=False):
+    """Reconstrói a lista de root 'nodes' a partir dos bones exportáveis
+    desta Armature. Devolve (root_nodes, warnings) -- warnings é uma
+    lista de nomes de bone sem BONE_SHAPE_JSON_PROP salvo (exportados
+    como "pivot puro", {"type": "none"}, sem shape/UV de verdade).
+
+    Todo node sempre tem a chave "shape" (mesmo pivot puro vira
+    {"type": "none"} em vez de omitir a chave -- confirmado por um erro
+    real do plugin oficial ao ler node.shape.type sem checar se "shape"
+    existe primeiro).
+
+    BONE_SHAPE_JSON_PROP guarda uma lista: índice 0 é o shape do próprio
+    bone (pode ser {} = pivot puro), índices seguintes são "peças
+    extras" (cubos além do primeiro, ou com rotação própria) que viram
+    nodes filhos sintéticos aqui -- existem só no arquivo exportado, não
+    são bones de verdade no Blender, e por isso não animam independente
+    (ficam sempre rígidos relativos ao bone dono -- correto pra roupa em
+    camada, orelha extra, etc.). Dado gravado por uma versão anterior
+    (dict único, não lista) ainda funciona, só sem essas duas melhorias.
+
+    Hierarquia: usa o bone.parent real do Blender, andando pro ancestral
+    mais próximo que também esteja em exportable_names se o pai direto
+    não estiver -- normalmente o pai direto já é exportável, então esse
+    caso é só uma rede de segurança.
+
+    Ordena os filhos por nome (alfabético) pra uma saída determinística
+    -- a ordem dos nodes dentro de "children" não muda a topologia da
+    árvore nem a posição/orientação de nada."""
+    unit_scale = armature_unit_scale(armature_obj, unit_scale)
+    bones_by_name = {b.name: b for b in armature_obj.data.bones}
+    warnings = []
+    next_id = [1]  # lista (não int) só pra ser mutável dentro de build_node
+
+    def nearest_exportable_parent(bone):
+        p = bone.parent
+        while p is not None and p.name not in exportable_names:
+            p = p.parent
+        return p.name if p is not None else None
+
+    children_by_parent = {}
+    for name in exportable_names:
+        parent_name = nearest_exportable_parent(bones_by_name[name])
+        children_by_parent.setdefault(parent_name, []).append(name)
+
+    def build_node(name):
+        bone = bones_by_name[name]
+        parent_name = nearest_exportable_parent(bone)
+
+        rest_local = local_matrix(rest_by_bone, name, parent_name)
+        pos_local, rot_local, _scale = rest_local.decompose()
+
+        parent_offset = Vector((0.0, 0.0, 0.0))
+        if parent_name is not None:
+            stored = bones_by_name[parent_name].get(BONE_SHAPE_OFFSET_PROP)
+            if stored is not None:
+                parent_offset = Vector(stored)
+
+        raw_pos = (pos_local - parent_offset) / unit_scale
+
+        shape_json = bone.get(BONE_SHAPE_JSON_PROP)
+        primary_shape = {}
+        extra_pieces = []
+        if shape_json:
+            try:
+                parsed = json.loads(shape_json)
+                if isinstance(parsed, list):
+                    # Formato novo: [shape_do_proprio_bone, {shape,
+                    # position, orientation} de cada cubo extra...]
+                    if parsed:
+                        primary_shape = parsed[0] or {}
+                        extra_pieces = [p for p in parsed[1:] if isinstance(p, dict)]
+                else:
+                    # Retrocompat com dado gravado por uma versão
+                    # anterior (dict único, sem lista) -- ainda é um
+                    # "shape" válido, só sem a correção de offset nova
+                    # nem suporte a múltiplos cubos (precisa reimportar
+                    # pra ganhar isso).
+                    primary_shape = parsed or {}
+            except (TypeError, ValueError):
+                warnings.append(name)
+        else:
+            warnings.append(name)
+
+        node = {
+            "id": str(next_id[0]),
+            "name": exported_bone_name(armature_obj, name, use_original_names),
+            "position": vec_to_dict(raw_pos),
+            "orientation": quat_to_dict(rot_local),
+            # "shape" é obrigatório em todo node, mesmo sem geometria
+            # (confirmado por um erro real do plugin oficial: "Cannot
+            # read properties of undefined (reading 'type')", lê
+            # node.shape.type incondicionalmente). O dict tem o schema
+            # completo -- ver finalize_shape_for_export().
+            "shape": finalize_shape_for_export(primary_shape),
+        }
+        next_id[0] += 1
+
+        children = [build_node(child) for child in sorted(children_by_parent.get(name, []))]
+
+        # Cada cubo "extra" (além do primeiro sem rotação própria) virou
+        # uma entrada em extra_pieces no import (ver
+        # bbmodel_element_local_transform/build_bbmodel_recursive em
+        # importer.py) -- já vem com position/orientation prontos
+        # (relativos a este bone, com a correção de offset já aplicada).
+        # Empacotado como node filho sintético (existe só no
+        # .blockymodel exportado, não é bone de verdade -- fica sempre
+        # rígido relativo ao bone dono, correto pra camada de roupa,
+        # orelha extra, etc.).
+        base_name = exported_bone_name(armature_obj, name, use_original_names)
+        for i, piece in enumerate(extra_pieces):
+            children.append({
+                "id": str(next_id[0]),
+                "name": f"{base_name}_piece{i + 2}",
+                "position": piece.get("position", {"x": 0.0, "y": 0.0, "z": 0.0}),
+                "orientation": piece.get("orientation", {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}),
+                "shape": finalize_shape_for_export(piece.get("shape")),
+            })
+            next_id[0] += 1
+
+        if children:
+            node["children"] = children
+        return node
+
+    roots = sorted(children_by_parent.get(None, []))
+    return [build_node(r) for r in roots], warnings
+
+
+def _blockymodel_export_props(lang):
+    return {
+        "filepath": StringProperty(subtype="FILE_PATH"),
+        "unit_scale": FloatProperty(
+            name="Blender Units per Game Unit",
+            description=tr("exporter.prop.blockymodel_unit_scale", lang),
+            default=UNIT_SCALE_DEFAULT,
+            min=0.0001,
+            max=10.0,
+        ),
+        "output_decimal_places": IntProperty(
+            name="Decimal Places",
+            description=tr("exporter.prop.blockymodel_output_decimal_places", lang),
+            default=6,
+            min=1,
+            max=12,
+        ),
+        "pretty_print_json": BoolProperty(
+            name="Readable JSON",
+            description=tr("exporter.prop.blockymodel_pretty_print_json", lang),
+            default=False,
+        ),
+        # Bones renomeados pelo "Rename Bones" (All Bones) saem com o nome
+        # novo; ligado, saem com o nome de antes do rename (o do jogo).
+        "use_original_names": BoolProperty(
+            name="Use Original Names",
+            description=tr("exporter.prop.use_original_names", lang),
+            default=False,
+        ),
+    }
+
+
+@localized_props(_blockymodel_export_props)
+class EXPORT_OT_hytale_blockymodel(Operator):
+    """Export the selected/active Armature's rest pose (bind pose) to Hytale's .blockymodel format -- position/orientation come from the current bone transforms, shape/UV data comes from what was captured when the character was imported"""
+
+    bl_idname = "export_scene.hytale_blockymodel"
+    bl_label = "Export Hytale Model (.blockymodel)"
+    description = tooltip("exporter.tooltip.blockymodel")
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        return is_active_armature(context)
+
+    def invoke(self, context, event):
+        return _invoke_model_export_dialog(self, context, ".blockymodel")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "unit_scale")
+        layout.prop(self, "output_decimal_places")
+        layout.prop(self, "pretty_print_json")
+        _draw_use_original_names(self, context, layout)
+
+    def execute(self, context):
+        obj = _require_active_armature(self, context)
+        if obj is None:
+            return {"CANCELLED"}
+        if not self.filepath:
+            self.report({"ERROR"}, "No output file selected.")
+            return {"CANCELLED"}
+
+        export_settings = get_export_settings(obj)
+        exportable_names = resolve_exportable_bone_names(self, obj, export_settings)
+        if exportable_names is None:
+            return {"CANCELLED"}
+
+        rest_by_bone = rest_matrices(obj)
+        root_nodes, warnings = build_export_node_tree(
+            obj, exportable_names, self.unit_scale, rest_by_bone, self.use_original_names
+        )
+
+        if not root_nodes:
+            self.report(
+                {"ERROR"},
+                "Nothing to export -- no root bone found in the exportable set "
+                "(every exportable bone has an exportable ancestor?).",
+            )
+            return {"CANCELLED"}
+
+        # "format"/"lod" no nível raiz, confirmados contra um export de
+        # verdade do Blockbench pro mesmo personagem -- "auto" é o valor
+        # de referência pro campo "lod". "format" segue o que o importer gravou na
+        # Armature ("character"/"prop" -- ver ARMATURE_MODEL_FORMAT_PROP em
+        # common.py); rig sem essa property (import antigo) = "character".
+        content = {"nodes": root_nodes, "format": armature_model_format(obj), "lod": "auto"}
+
+        filepath = self.filepath
+        if not filepath.lower().endswith(".blockymodel"):
+            filepath += ".blockymodel"
+
+        # newline="\n" -- mesmo motivo do .blockyanim (ver comentário
+        # grande em EXPORT_OT_hytale_blockyanim.execute()).
+        with open(filepath, "w", encoding="utf-8", newline="\n") as f:
+            rounded = round_floats_for_output(content, self.output_decimal_places)
+            if self.pretty_print_json:
+                f.write(dump_pretty_blockyanim(rounded))
+            else:
+                json.dump(rounded, f, separators=(",", ":"))
+
+        if warnings:
+            distinct = sorted(set(warnings))
+            preview = ", ".join(distinct[:5])
+            more = f" (+{len(distinct) - 5} more)" if len(distinct) > 5 else ""
+            self.report(
+                {"WARNING"},
+                f"{len(distinct)} bone(s) had no shape data saved (imported before this "
+                f"feature, or created manually) -- exported as pivot-only, shape/UV lost: "
+                f"{preview}{more}. Re-import the original .blockymodel to fix this.",
+            )
+
+        self.report(
+            {"INFO"},
+            f"Exported '{os.path.basename(filepath)}' ({len(exportable_names)} bone(s)).",
+        )
+        return {"FINISHED"}
+
+
+# --- Export FBX ---
+# Empacota o exportador FBX nativo do Blender (bpy.ops.export_scene.fbx)
+# com o preparo específico do Hytale, em vez de reimplementar leitura/
+# escrita de FBX do zero. Dois operadores, mesmo espírito Model/
+# Animation de .blockymodel/.blockyanim:
+#   EXPORT_OT_hytale_fbx_model -- um arquivo, rest pose, sem animação.
+#   EXPORT_OT_hytale_fbx_anim -- em lote: um .fbx por Action marcada,
+#   com a animação já assada (bake) nos bones originais.
+#
+# Esqueleto exportado: reaproveita o mesmo conjunto de bones "originais"
+# que o .blockyanim usa (resolve_exportable_bone_names, mesma Export
+# Bone Collection) -- em vez de duplicar a Armature pra deletar bones de
+# controle, liga bone.use_deform=True só nesses e False no resto
+# (temporary_deform_flags), com use_armature_deform_only=True pro
+# exportador nativo (mesmo mecanismo que rigs do Rigify usam).
+#
+# Limitação conhecida: se o exporter precisou desambiguar um nome de
+# bone duplicado no mesmo .blockymodel (BONE_ORIGINAL_NAME_PROP), o
+# .blockyanim escreve o nome original no arquivo, mas o FBX sai com o
+# nome do Blender (com o sufixo .dupNN) -- renomear temporariamente
+# quebraria o data path dos f-curves durante o bake_anim. Só personagens
+# com essa colisão específica saem com sufixo; renomeie manualmente
+# depois no FBX se importar pro seu uso.
+
+
+def _fbx_shared_props(lang):
+    return {
+        "include_meshes": BoolProperty(
+            name="Include Reference Meshes",
+            description=tr("exporter.prop.fbx_include_meshes", lang),
+            default=True,
+        ),
+        "include_attachments": BoolProperty(
+            name="Include Mesh Attachments",
+            description=tr("exporter.prop.fbx_include_attachments", lang),
+            default=True,
+        ),
+        "match_game_units": BoolProperty(
+            name="Scale to Game Units",
+            description=tr("exporter.prop.fbx_match_game_units", lang),
+            default=False,
+        ),
+        "unit_scale": FloatProperty(
+            name="Blender Units per Game Unit",
+            description=tr("exporter.prop.fbx_unit_scale", lang),
+            default=UNIT_SCALE_DEFAULT,
+            min=0.0001,
+            max=10.0,
+        ),
+        "apply_transform": BoolProperty(
+            name="Apply Object Transform",
+            description=tr("exporter.prop.fbx_apply_transform", lang),
+            default=False,
+        ),
+        "add_leaf_bones": BoolProperty(
+            name="Add Leaf Bones",
+            description=tr("exporter.prop.fbx_add_leaf_bones", lang),
+            default=False,
+        ),
+        "embed_textures": BoolProperty(
+            name="Embed Textures",
+            description=tr("exporter.prop.fbx_embed_textures", lang),
+            default=False,
+        ),
+    }
+
+
+def _draw_fbx_shared(self, layout):
+    """draw() comum às duas caixas 'Meshes'/'Rig & Format' -- chamado
+    pelos dois operadores FBX abaixo. Textos de label ficam hardcoded em
+    inglês, mesmo padrão já usado no resto deste arquivo (draw() de
+    EXPORT_OT_hytale_blockyanim) -- só description= de property passa por
+    tr()/@localized_props."""
+    mesh_box = layout.box()
+    mesh_box.label(text="Meshes", icon="MESH_DATA")
+    mesh_box.prop(self, "include_meshes")
+    sub = mesh_box.column()
+    sub.enabled = self.include_meshes
+    sub.prop(self, "include_attachments")
+    sub.prop(self, "embed_textures")
+
+    rig_box = layout.box()
+    rig_box.label(text="Rig & Format", icon="ARMATURE_DATA")
+    rig_box.prop(self, "match_game_units")
+    scale_sub = rig_box.column()
+    scale_sub.enabled = self.match_game_units
+    scale_sub.prop(self, "unit_scale")
+    rig_box.prop(self, "apply_transform")
+    rig_box.prop(self, "add_leaf_bones")
+
+
+def run_hytale_fbx_export(operator, context, obj, filepath, exportable_names, action=None):
+    """Núcleo compartilhado pelos dois operadores FBX abaixo -- prepara a
+    seleção/deform flags do Hytale e chama o exportador FBX nativo do
+    Blender UMA vez, escrevendo em `filepath`. Se `action` não for None,
+    ela é ativada no Armature e bake_anim é ligado (modo Animation); sem
+    `action`, exporta só o Rest Pose, sem nenhum bake (modo Model).
+
+    `exportable_names` é resolvido UMA VEZ pelo chamador (não aqui dentro)
+    -- v0.15.1: antes cada chamada resolvia de novo via
+    resolve_exportable_bone_names(), o que fazia o aviso de "Bone
+    Collection não encontrada" (self.report) repetir uma vez POR ACTION
+    no modo batch (EXPORT_OT_hytale_fbx_anim), poluindo a lista de
+    relatórios do Blender sem necessidade -- a Bone Collection não muda
+    entre Actions da mesma Armature.
+
+    Devolve True/False (sucesso) -- reporta erros via operator.report."""
+    # FBX não é sempre garantido estar ativo (io_scene_fbx é um addon
+    # embutido, mas o usuário pode ter desligado) -- sem esta checagem, a
+    # chamada abaixo levantaria um AttributeError cru (bpy.ops.export_
+    # scene não teria o atributo 'fbx'), sem nenhuma mensagem amigável.
+    if not hasattr(bpy.ops.export_scene, "fbx"):
+        operator.report(
+            {"ERROR"},
+            "Blender's built-in FBX exporter (io_scene_fbx) isn't enabled -- turn it on in "
+            "Edit > Preferences > Add-ons and try again.",
+        )
+        return False
+
+    meshes = gather_character_meshes(obj, operator.include_attachments) if operator.include_meshes else set()
+
+    original_action = obj.animation_data.action if obj.animation_data else None
+    if action is not None:
+        if obj.animation_data is None:
+            obj.animation_data_create()
+        obj.animation_data.action = action
+
+    original_selection = list(context.selected_objects)
+    original_active = context.view_layer.objects.active
+
+    # NÃO usa bpy.ops.object.select_all() aqui -- esse operador pode
+    # exigir um contexto de 3D Viewport pra fazer poll (dependendo de
+    # onde o botão foi clicado, ex.: dentro do painel de Object
+    # Properties/N-Panel, sem um VIEW_3D em foco, a chamada pode falhar
+    # com "context is incorrect"). Deselecionar objeto por objeto (mesmo
+    # jeito que o 'finally' abaixo já faz pra restaurar) evita depender
+    # de poll nenhum.
+    for scene_obj in bpy.data.objects:
+        scene_obj.select_set(False)
+    obj.select_set(True)
+    for mesh_obj in meshes:
+        mesh_obj.select_set(True)
+    context.view_layer.objects.active = obj
+
+    global_scale = (1.0 / armature_unit_scale(obj, operator.unit_scale)) if operator.match_game_units else 1.0
+
+    try:
+        with temporary_deform_flags(obj.data, exportable_names):
+            bpy.ops.export_scene.fbx(
+                filepath=filepath,
+                check_existing=False,
+                use_selection=True,
+                object_types={"ARMATURE", "MESH"},
+                use_armature_deform_only=True,
+                add_leaf_bones=operator.add_leaf_bones,
+                primary_bone_axis="Y",
+                secondary_bone_axis="X",
+                global_scale=global_scale,
+                apply_unit_scale=True,
+                bake_space_transform=operator.apply_transform,
+                mesh_smooth_type="FACE",
+                use_mesh_modifiers=True,
+                use_triangles=False,
+                use_custom_props=False,
+                bake_anim=action is not None,
+                bake_anim_use_all_actions=False,
+                bake_anim_use_nla_strips=False,
+                bake_anim_force_startend_keying=True,
+                bake_anim_step=1.0,
+                path_mode="COPY" if operator.embed_textures else "AUTO",
+                embed_textures=operator.embed_textures,
+            )
+    finally:
+        for scene_obj in bpy.data.objects:
+            scene_obj.select_set(False)
+        for scene_obj in original_selection:
+            scene_obj.select_set(True)
+        context.view_layer.objects.active = original_active
+        if action is not None and obj.animation_data is not None:
+            obj.animation_data.action = original_action
+
+    return True
+
+
+def _fbx_model_props(lang):
+    return {
+        "filepath": StringProperty(subtype="FILE_PATH"),
+        **_fbx_shared_props(lang),
+    }
+
+
+@localized_props(_fbx_model_props)
+class EXPORT_OT_hytale_fbx_model(Operator):
+    """Export the selected/active Armature's rest pose (bind pose) -- and, optionally, its reference meshes -- to a single .fbx file. No animation is included; use 'Hytale Animations (.fbx)' for that"""
+
+    bl_idname = "export_scene.hytale_fbx_model"
+    bl_label = "Export Hytale Model (.fbx)"
+    description = tooltip("exporter.tooltip.fbx_model")
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        return is_active_armature(context)
+
+    def invoke(self, context, event):
+        return _invoke_model_export_dialog(self, context, ".fbx")
+
+    def draw(self, context):
+        _draw_fbx_shared(self, self.layout)
+
+    def execute(self, context):
+        obj = _require_active_armature(self, context)
+        if obj is None:
+            return {"CANCELLED"}
+        if not self.filepath:
+            self.report({"ERROR"}, "No output file selected.")
+            return {"CANCELLED"}
+
+        filepath = self.filepath
+        if not filepath.lower().endswith(".fbx"):
+            filepath += ".fbx"
+
+        export_settings = get_export_settings(obj)
+        exportable_names = resolve_exportable_bone_names(self, obj, export_settings)
+        if exportable_names is None:
+            return {"CANCELLED"}
+
+        ok = run_hytale_fbx_export(self, context, obj, filepath, exportable_names, action=None)
+        if not ok:
+            return {"CANCELLED"}
+
+        self.report({"INFO"}, f"Exported '{os.path.basename(filepath)}'.")
+        return {"FINISHED"}
+
+
+def _fbx_anim_props(lang):
+    return {
+        "directory": StringProperty(subtype="DIR_PATH"),
+        "action_items": CollectionProperty(type=HYTALE_action_export_item),
+        "action_items_index": IntProperty(),
+        **_fbx_shared_props(lang),
+    }
+
+
+@localized_props(_fbx_anim_props)
+class EXPORT_OT_hytale_fbx_anim(Operator):
+    """Batch-export one or more Actions of the selected/active Armature to .fbx -- one file per Action (rig + baked animation, and optionally the reference meshes), into a chosen folder"""
+
+    bl_idname = "export_scene.hytale_fbx_anim"
+    bl_label = "Export Hytale Animations (.fbx)"
+    description = tooltip("exporter.tooltip.fbx_anim")
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        return is_active_armature(context)
+
+    def invoke(self, context, event):
+        return _invoke_action_export_dialog(self, context)
+
+    def draw(self, context):
+        layout = self.layout
+
+        _draw_actions_export_box(self, layout)
+
+        _draw_fbx_shared(self, layout)
+
+    def execute(self, context):
+        obj = _require_active_armature(self, context)
+        if obj is None:
+            return {"CANCELLED"}
+
+        selected_items = [it for it in self.action_items if it.export]
+        if not selected_items:
+            self.report({"ERROR"}, "No Action selected -- check at least one in the list.")
+            return {"CANCELLED"}
+
+        if not self.directory:
+            self.report({"ERROR"}, "No output folder selected.")
+            return {"CANCELLED"}
+        os.makedirs(self.directory, exist_ok=True)
+
+        export_settings = get_export_settings(obj)
+        exportable_names = resolve_exportable_bone_names(self, obj, export_settings)
+        if exportable_names is None:
+            return {"CANCELLED"}
+
+        exported_files = []
+        for item in selected_items:
+            action = bpy.data.actions.get(item.action_name)
+            if action is None:
+                self.report({"WARNING"}, f"Action '{item.action_name}' not found anymore, skipping.")
+                continue
+
+            filename = sanitize_filename(action.name) + ".fbx"
+            filepath = os.path.join(self.directory, filename)
+            ok = run_hytale_fbx_export(self, context, obj, filepath, exportable_names, action=action)
+            if not ok:
+                return {"CANCELLED"}
+            exported_files.append(filename)
+
+        if not exported_files:
+            self.report({"ERROR"}, "Nothing was exported.")
+            return {"CANCELLED"}
+
+        self.report(
+            {"INFO"},
+            f"Exported {len(exported_files)} file(s) to '{self.directory}': " + ", ".join(exported_files),
+        )
+        return {"FINISHED"}
+
+
+def menu_func_export(self, context):
+    self.layout.operator(EXPORT_OT_hytale_blockyanim.bl_idname, text="Hytale Animations (.blockyanim)")
+    self.layout.operator(EXPORT_OT_hytale_blockymodel.bl_idname, text="Hytale Model (.blockymodel)")
+    self.layout.operator(EXPORT_OT_hytale_fbx_model.bl_idname, text="Hytale Model (.fbx)")
+    self.layout.operator(EXPORT_OT_hytale_fbx_anim.bl_idname, text="Hytale Animations (.fbx)")
+
+
+classes = (
+    HYTALE_export_settings,
+    HYTALE_texture_picker_export_item,
+    HYTALE_UL_texture_picker_exports,
+    EXPORT_OT_texture_picker_export_add,
+    EXPORT_OT_texture_picker_export_remove,
+    HYTALE_action_export_item,
+    HYTALE_UL_action_export_list,
+    HYTALE_OT_select_all_actions,
+    EXPORT_OT_hytale_blockyanim,
+    EXPORT_OT_hytale_blockymodel,
+    EXPORT_OT_hytale_fbx_model,
+    EXPORT_OT_hytale_fbx_anim,
+)
+
+
+def _redo_armature_property_assignments():
+    """HYTALE_export_settings e HYTALE_texture_picker_export_item usam
+    @localized_props, mas também são alvo de um type= usado fora do
+    ciclo normal de register_class -- as duas linhas abaixo, que
+    atribuem PointerProperty/CollectionProperty direto em Armature. Só
+    re-registrar as PropertyGroups em si pode não bastar pra essa
+    atribuição externa continuar apontando pro RNA struct certo depois
+    de uma troca de idioma -- por isso esta função é chamada tanto no
+    register() normal quanto de novo, via register_refresh_hook, no fim
+    de todo refresh_localized_properties(). Reatribuir sem 'del' antes é
+    seguro -- é como o Blender espera que um addon atualize uma property
+    dinâmica já existente."""
+    Armature.hytale_export_settings = PointerProperty(type=HYTALE_export_settings)
+    Armature.hytale_texture_picker_exports = CollectionProperty(type=HYTALE_texture_picker_export_item)
+
+
+def register():
+    for cls in classes:
+        register_localized_class(cls)
+    _redo_armature_property_assignments()
+    Armature.hytale_texture_picker_exports_index = IntProperty(default=0)
+    register_refresh_hook(_redo_armature_property_assignments)
+    bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
+
+
+def unregister():
+    unregister_refresh_hook(_redo_armature_property_assignments)
+    bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
+    del Armature.hytale_texture_picker_exports_index
+    del Armature.hytale_texture_picker_exports
+    del Armature.hytale_export_settings
+    for cls in reversed(classes):
+        unregister_localized_class(cls)
+
+
+if __name__ == "__main__":
+    register()

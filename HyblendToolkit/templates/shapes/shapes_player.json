@@ -1,0 +1,1276 @@
+{
+  "description": "User-saved shape template (60 bone(s)).",
+  "bones": {
+    "R-Arm_Pole_Line": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "widget": "WGT - Player_With_Face - R-Arm_Pole_Line"
+    },
+    "L-Arm_Pole_Line": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "widget": "WGT - Player_With_Face - L-Arm_Pole_Line"
+    },
+    "R-Thigh_Pole_Line": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "widget": "WGT - Player_With_Face - R-Thigh_Pole_Line"
+    },
+    "L-Thigh_Pole_Line": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "widget": "WGT - Player_With_Face - L-Thigh_Pole_Line"
+    },
+    "R-Attachment_CTRL": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        0.30000001192092896,
+        0.30000001192092896,
+        0.30000001192092896
+      ],
+      "widget": "WGT - Player_With_Face - R-Attachment_CTRL"
+    },
+    "L-Attachment_CTRL": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        0.30000001192092896,
+        0.30000001192092896,
+        0.30000001192092896
+      ],
+      "widget": "WGT - Player_With_Face - L-Attachment_CTRL"
+    },
+    "Origin_CTRL": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "widget": "WGT - Player_With_Face - Origin_CTRL"
+    },
+    "root.master_CTRL": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        4.099999904632568,
+        0.3499999940395355,
+        4.0
+      ],
+      "widget": "WGT - Player_With_Face - root.master_CTRL"
+    },
+    "Belly_CTRL": {
+      "translation": [
+        0.0,
+        0.10300000011920929,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        3.259999990463257,
+        1.649999976158142,
+        2.299999952316284
+      ],
+      "widget": "WGT - Player_With_Face - Belly_CTRL"
+    },
+    "Chest_CTRL": {
+      "translation": [
+        0.0,
+        0.17299999296665192,
+        0.04699999839067459
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        3.450000047683716,
+        2.7200000286102295,
+        2.4100000858306885
+      ],
+      "widget": "WGT - Player_With_Face - Chest_CTRL"
+    },
+    "Head_CTRL": {
+      "translation": [
+        0.0,
+        0.3140000104904175,
+        0.03200000151991844
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        3.8499999046325684,
+        3.5999999046325684,
+        3.5999999046325684
+      ],
+      "widget": "WGT - Player_With_Face - Head_CTRL"
+    },
+    "Neck_CTRL": {
+      "translation": [
+        0.0,
+        0.003000000026077032,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        2.0,
+        0.14000000059604645,
+        1.7000000476837158
+      ],
+      "widget": "WGT - Player_With_Face - Neck_CTRL"
+    },
+    "L-Eyelid_CTRL": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        0.15000000596046448,
+        0.10000000149011612
+      ],
+      "widget": "WGT - Player_With_Face - L-Eyelid_CTRL"
+    },
+    "R-Eyelid_CTRL": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        0.15000000596046448,
+        0.10000000149011612
+      ],
+      "widget": "WGT - Player_With_Face - R-Eyelid_CTRL"
+    },
+    "L-Eyelid-Bot_CTRL": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        0.15000000596046448,
+        0.10000000149011612
+      ],
+      "widget": "WGT - Player_With_Face - L-Eyelid-Bot_CTRL"
+    },
+    "R-Eyelid-Bot_CTRL": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        0.15000000596046448,
+        0.10000000149011612
+      ],
+      "widget": "WGT - Player_With_Face - R-Eyelid-Bot_CTRL"
+    },
+    "L-Eyebrow-Attachment_CTRL": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        0.30000001192092896,
+        0.30000001192092896,
+        0.30000001192092896
+      ],
+      "widget": "WGT - Player_With_Face - L-Eyebrow-Attachment_CTRL"
+    },
+    "R-Eyebrow-Attachment_CTRL": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        0.30000001192092896,
+        0.30000001192092896,
+        0.30000001192092896
+      ],
+      "widget": "WGT - Player_With_Face - R-Eyebrow-Attachment_CTRL"
+    },
+    "R-Eye-Attachment_CTRL": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        0.30000001192092896,
+        0.30000001192092896,
+        0.30000001192092896
+      ],
+      "widget": "WGT - Player_With_Face - R-Eye-Attachment_CTRL"
+    },
+    "L-Eye-Attachment_CTRL": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        0.30000001192092896,
+        0.30000001192092896,
+        0.30000001192092896
+      ],
+      "widget": "WGT - Player_With_Face - L-Eye-Attachment_CTRL"
+    },
+    "Mouth-Attachment_CTRL": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        0.30000001192092896,
+        0.30000001192092896,
+        0.30000001192092896
+      ],
+      "widget": "WGT - Player_With_Face - Mouth-Attachment_CTRL"
+    },
+    "Mouth1:Mouth-Attachment_CTRL": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        0.30000001192092896,
+        0.30000001192092896,
+        0.30000001192092896
+      ],
+      "widget": "WGT - Player_With_Face - Mouth1:Mouth-Attachment_CTRL"
+    },
+    "Mouth_CTRL": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "widget": "WGT - Player_With_Face - Mouth_CTRL",
+      "mesh": {
+        "vertices": [
+          [
+            -1.28862,
+            -0.289238,
+            -0.027733
+          ],
+          [
+            -1.28862,
+            -0.289238,
+            0.027732
+          ],
+          [
+            -1.28862,
+            0.036556,
+            -0.027733
+          ],
+          [
+            -1.28862,
+            0.036556,
+            0.027732
+          ],
+          [
+            1.28862,
+            -0.289238,
+            -0.027733
+          ],
+          [
+            1.28862,
+            -0.289238,
+            0.027732
+          ],
+          [
+            1.28862,
+            0.036556,
+            -0.027733
+          ],
+          [
+            1.28862,
+            0.036556,
+            0.027732
+          ]
+        ],
+        "edges": [
+          [
+            0,
+            2
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            3
+          ],
+          [
+            2,
+            3
+          ],
+          [
+            2,
+            6
+          ],
+          [
+            3,
+            7
+          ],
+          [
+            6,
+            7
+          ],
+          [
+            4,
+            6
+          ],
+          [
+            5,
+            7
+          ],
+          [
+            4,
+            5
+          ],
+          [
+            0,
+            4
+          ],
+          [
+            1,
+            5
+          ]
+        ],
+        "faces": []
+      }
+    },
+    "R-Ear-Attachment_CTRL": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        0.30000001192092896,
+        0.30000001192092896,
+        0.30000001192092896
+      ],
+      "widget": "WGT - Player_With_Face - R-Ear-Attachment_CTRL"
+    },
+    "L-Ear-Attachment_CTRL": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        0.30000001192092896,
+        0.30000001192092896,
+        0.30000001192092896
+      ],
+      "widget": "WGT - Player_With_Face - L-Ear-Attachment_CTRL"
+    },
+    "PROPERTIES": {
+      "translation": [
+        0.0,
+        0.05999999865889549,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "widget": "WGT - Player_With_Face - PROPERTIES"
+    },
+    "R-Shoulder_CTRL": {
+      "translation": [
+        0.0,
+        0.013000000268220901,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "widget": "WGT - Player_With_Face - R-Shoulder_CTRL"
+    },
+    "R-Arm_CTRL": {
+      "translation": [
+        -0.017000000923871994,
+        -0.125,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        -1.0,
+        2.49,
+        1.54
+      ],
+      "widget": "WGT - Player_With_Face - R-Arm_CTRL"
+    },
+    "R-Forearm_CTRL": {
+      "translation": [
+        0.0,
+        -0.11699999868869781,
+        0.01600000075995922
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        -1.01,
+        1.84,
+        1.52
+      ],
+      "widget": "WGT - Player_With_Face - R-Forearm_CTRL"
+    },
+    "R-Hand_CTRL": {
+      "translation": [
+        0.0,
+        -0.07800000160932541,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        -1.33,
+        1.52,
+        1.79
+      ],
+      "widget": "WGT - Player_With_Face - R-Hand_CTRL"
+    },
+    "R-Arm_IK": {
+      "translation": [
+        0.0077315401285886765,
+        0.11915517598390579,
+        0.006725742481648922
+      ],
+      "rotation_deg": [
+        3.8398875282647404,
+        -9.411426086613643,
+        1.417212386028636
+      ],
+      "scale": [
+        -0.230654,
+        0.541535,
+        0.340966
+      ],
+      "widget": "WGT - Player_With_Face - R-Arm_IK"
+    },
+    "R-Forearm_IK": {
+      "translation": [
+        0.0,
+        0.12363393604755402,
+        0.004909755662083626
+      ],
+      "rotation_deg": [
+        -3.5555153769356096,
+        -10.911465401942674,
+        1.4946823125856248
+      ],
+      "scale": [
+        -0.259281,
+        0.488645,
+        0.388921
+      ],
+      "widget": "WGT - Player_With_Face - R-Forearm_IK"
+    },
+    "L-Shoulder_CTRL": {
+      "translation": [
+        0.0,
+        0.013000000268220901,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "widget": "WGT - Player_With_Face - L-Shoulder_CTRL"
+    },
+    "L-Arm_CTRL": {
+      "translation": [
+        0.017000000923871994,
+        -0.125,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        2.49,
+        1.54
+      ],
+      "widget": "WGT - Player_With_Face - L-Arm_CTRL"
+    },
+    "L-Forearm_CTRL": {
+      "translation": [
+        0.0,
+        -0.11699999868869781,
+        0.01600000075995922
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.01,
+        1.84,
+        1.52
+      ],
+      "widget": "WGT - Player_With_Face - L-Forearm_CTRL"
+    },
+    "L-Hand_CTRL": {
+      "translation": [
+        0.0,
+        -0.07800000160932541,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.33,
+        1.52,
+        1.79
+      ],
+      "widget": "WGT - Player_With_Face - L-Hand_CTRL"
+    },
+    "L-Arm_IK": {
+      "translation": [
+        -0.0077315401285886765,
+        0.11915517598390579,
+        0.006725742481648922
+      ],
+      "rotation_deg": [
+        3.8398875282647404,
+        9.411426086613643,
+        -1.417212386028636
+      ],
+      "scale": [
+        0.230654,
+        0.541535,
+        0.340966
+      ],
+      "widget": "WGT - Player_With_Face - L-Arm_IK"
+    },
+    "L-Forearm_IK": {
+      "translation": [
+        0.0,
+        0.12363393604755402,
+        0.004909755662083626
+      ],
+      "rotation_deg": [
+        -3.5555153769356096,
+        10.911465401942674,
+        -1.4946823125856248
+      ],
+      "scale": [
+        0.259281,
+        0.488645,
+        0.388921
+      ],
+      "widget": "WGT - Player_With_Face - L-Forearm_IK"
+    },
+    "Back-Attachment_CTRL": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        0.30000001192092896,
+        0.30000001192092896,
+        0.30000001192092896
+      ],
+      "widget": "WGT - Player_With_Face - Back-Attachment_CTRL"
+    },
+    "root.spine_CTRL": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "widget": "WGT - Player_With_Face - root.spine_CTRL",
+      "mesh": {
+        "vertices": [
+          [
+            -0.452631,
+            -0.020205,
+            -0.231338
+          ],
+          [
+            -0.452631,
+            -0.020205,
+            0.415461
+          ],
+          [
+            -0.452631,
+            0.711173,
+            -0.231338
+          ],
+          [
+            -0.452631,
+            0.711173,
+            0.415461
+          ],
+          [
+            0.452631,
+            -0.020205,
+            -0.231338
+          ],
+          [
+            0.452631,
+            -0.020205,
+            0.415461
+          ],
+          [
+            0.452631,
+            0.711173,
+            -0.231338
+          ],
+          [
+            0.452631,
+            0.711173,
+            0.415461
+          ]
+        ],
+        "edges": [
+          [
+            0,
+            2
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            3
+          ],
+          [
+            2,
+            3
+          ],
+          [
+            2,
+            6
+          ],
+          [
+            3,
+            7
+          ],
+          [
+            6,
+            7
+          ],
+          [
+            4,
+            6
+          ],
+          [
+            5,
+            7
+          ],
+          [
+            4,
+            5
+          ],
+          [
+            0,
+            4
+          ],
+          [
+            1,
+            5
+          ]
+        ],
+        "faces": []
+      }
+    },
+    "root.pelvis_CTRL": {
+      "translation": [
+        0.0,
+        0.1080000028014183,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        3.559999942779541,
+        0.75,
+        2.4600000381469727
+      ],
+      "widget": "WGT - Player_With_Face - root.pelvis_CTRL"
+    },
+    "Pelvis_CTRL": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        3.190000057220459,
+        1.4800000190734863,
+        2.2100000381469727
+      ],
+      "widget": "WGT - Player_With_Face - Pelvis_CTRL"
+    },
+    "R-Thigh_CTRL": {
+      "translation": [
+        0.0,
+        -0.1289999932050705,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        -1.24,
+        3.13,
+        1.52
+      ],
+      "widget": "WGT - Player_With_Face - R-Thigh_CTRL"
+    },
+    "R-Calf_CTRL": {
+      "translation": [
+        0.0,
+        -0.16300000250339508,
+        -0.03099999949336052
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        -1.28,
+        2.62,
+        1.51
+      ],
+      "widget": "WGT - Player_With_Face - R-Calf_CTRL"
+    },
+    "R-Foot_CTRL": {
+      "translation": [
+        0.0,
+        -0.04684999957680702,
+        0.09300000220537186
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        -1.7,
+        0.98,
+        2.43
+      ],
+      "widget": "WGT - Player_With_Face - R-Foot_CTRL"
+    },
+    "L-Thigh_CTRL": {
+      "translation": [
+        0.0,
+        -0.1289999932050705,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.24,
+        3.13,
+        1.52
+      ],
+      "widget": "WGT - Player_With_Face - L-Thigh_CTRL"
+    },
+    "L-Calf_CTRL": {
+      "translation": [
+        0.0,
+        -0.16300000250339508,
+        -0.03099999949336052
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.28,
+        2.62,
+        1.51
+      ],
+      "widget": "WGT - Player_With_Face - L-Calf_CTRL"
+    },
+    "L-Foot_CTRL": {
+      "translation": [
+        0.0,
+        -0.04684999957680702,
+        0.09300000220537186
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.7,
+        0.98,
+        2.43
+      ],
+      "widget": "WGT - Player_With_Face - L-Foot_CTRL"
+    },
+    "L-Thigh_IK": {
+      "translation": [
+        0.0,
+        0.19699999690055847,
+        -0.01899999938905239
+      ],
+      "rotation_deg": [
+        -5.400000064891326,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        0.24,
+        0.33,
+        0.29
+      ],
+      "widget": "WGT - Player_With_Face - L-Thigh_IK"
+    },
+    "L-Calf_IK": {
+      "translation": [
+        0.0,
+        0.14800000190734863,
+        0.008999999612569809
+      ],
+      "rotation_deg": [
+        15.000000417413029,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        0.23,
+        0.33,
+        0.27
+      ],
+      "widget": "WGT - Player_With_Face - L-Calf_IK"
+    },
+    "R-Thigh_IK": {
+      "translation": [
+        0.0,
+        0.19699999690055847,
+        -0.01899999938905239
+      ],
+      "rotation_deg": [
+        -5.400000064891326,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        -0.24,
+        0.33,
+        0.29
+      ],
+      "widget": "WGT - Player_With_Face - R-Thigh_IK"
+    },
+    "R-Calf_IK": {
+      "translation": [
+        0.0,
+        0.14800000190734863,
+        0.008999999612569809
+      ],
+      "rotation_deg": [
+        15.000000417413029,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        -0.23,
+        0.33,
+        0.27
+      ],
+      "widget": "WGT - Player_With_Face - R-Calf_IK"
+    },
+    "L-Hand_IK": {
+      "translation": [
+        0.0,
+        0.07800000160932541,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        0.89,
+        1.01,
+        1.19
+      ],
+      "widget": "WGT - Player_With_Face - L-Hand_IK"
+    },
+    "L-Arm_Pole_CTRL": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "widget": "WGT - Player_With_Face - L-Arm_Pole_CTRL"
+    },
+    "R-Hand_IK": {
+      "translation": [
+        0.0,
+        0.07800000160932541,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        -0.89,
+        1.01,
+        1.19
+      ],
+      "widget": "WGT - Player_With_Face - R-Hand_IK"
+    },
+    "R-Arm_Pole_CTRL": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "widget": "WGT - Player_With_Face - R-Arm_Pole_CTRL"
+    },
+    "L-Foot_IK": {
+      "translation": [
+        0.0,
+        0.04684999957680702,
+        0.09300000220537186
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.7,
+        0.98,
+        2.43
+      ],
+      "widget": "WGT - Player_With_Face - L-Foot_IK"
+    },
+    "L-Thigh_Pole_CTRL": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "widget": "WGT - Player_With_Face - L-Thigh_Pole_CTRL"
+    },
+    "R-Foot_IK": {
+      "translation": [
+        0.0,
+        0.04684999957680702,
+        0.09300000220537186
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        -1.7,
+        0.98,
+        2.43
+      ],
+      "widget": "WGT - Player_With_Face - R-Foot_IK"
+    },
+    "R-Thigh_Pole_CTRL": {
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "widget": "WGT - Player_With_Face - R-Thigh_Pole_CTRL"
+    }
+  },
+  "template_name": "Player"
+}
