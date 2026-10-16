@@ -1,0 +1,168 @@
+name: Atualizar videos.json
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"      # 4x por dia (UTC), fora da hora cheia
+  workflow_dispatch:            # botão "Run workflow"
+
+permissions:
+  contents: write               # pra fazer o commit do videos.json
+
+concurrency:
+  group: update-videos
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Buscar a playlist e gerar o videos.json
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+        run: |
+          python3 - <<'PY'
+          """Gera o videos.json (raiz do repositório) com os vídeos da playlist do Hyblend, pela YouTube Data API v3.
+          Roda na GitHub Action "Atualizar videos.json". Chave da API = segredo YOUTUBE_API_KEY (nunca no addon).
+          Títulos/descrições em cada idioma do addon vêm das traduções cadastradas no YouTube; duração e data, da API.
+          Só vídeos públicos ou não listados. API falhou -> sai com erro e NÃO mexe no arquivo (o addon segue com o anterior).
+          """
+
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          PLAYLIST_ID = "PLB4ckvIQ5dQ8"
+          OUTPUT = "videos.json"
+          API = "https://www.googleapis.com/youtube/v3/"
+          MAX_VIDEOS = 50                       # o addon também lê no máximo 50
+
+
+          def addon_language(code):
+              """Código de idioma do YouTube ("pt-BR", "en-US", "pt"...) -> o do addon ("PT_BR", "EN") ou None.
+              Idioma novo no addon = uma linha aqui."""
+              code = (code or "").lower()
+              if code.startswith("pt"):
+                  return "PT_BR"
+              if code.startswith("en"):
+                  return "EN"
+              return None
+
+
+          def call(endpoint, **params):
+              params["key"] = os.environ["YOUTUBE_API_KEY"]
+              url = API + endpoint + "?" + urllib.parse.urlencode(params)
+              try:
+                  with urllib.request.urlopen(url, timeout=30) as response:
+                      return json.loads(response.read().decode("utf-8"))
+              except urllib.error.HTTPError as error:       # mostra o motivo do Google (chave errada, API desligada...)
+                  detail = error.read().decode("utf-8", "replace")[:500]
+                  sys.exit("YouTube API %s em %s: %s" % (error.code, endpoint, detail))
+
+
+          def playlist_ids():
+              """ids dos vídeos na ordem da playlist."""
+              ids, token = [], None
+              while len(ids) < MAX_VIDEOS:
+                  params = {"part": "contentDetails", "playlistId": PLAYLIST_ID, "maxResults": 50}
+                  if token:
+                      params["pageToken"] = token
+                  data = call("playlistItems", **params)
+                  ids += [item["contentDetails"]["videoId"] for item in data.get("items", [])
+                          if item.get("contentDetails", {}).get("videoId")]
+                  token = data.get("nextPageToken")
+                  if not token:
+                      break
+              return ids[:MAX_VIDEOS]
+
+
+          def duration(iso):
+              """"PT1M1S" -> "1:01"; "PT1H2M3S" -> "1:02:03"; zero ou estranho -> ""."""
+              match = re.fullmatch(r"P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", iso or "")
+              if not match or not any(match.groups()):
+                  return ""
+              days, hours, minutes, seconds = (int(g or 0) for g in match.groups())
+              if not (days or hours or minutes or seconds):     # "P0D" = ao vivo/estreia agendada: sem duração
+                  return ""
+              hours += days * 24
+              return "%d:%02d:%02d" % (hours, minutes, seconds) if hours else "%d:%02d" % (minutes, seconds)
+
+
+          def first_paragraph(text):
+              return (text or "").strip().split("\n\n")[0].strip()[:400]
+
+
+          def localized(snippet, localizations, field, clean=lambda t: t.strip()):
+              """{"EN": ..., "PT_BR": ...} com o texto principal (no idioma do vídeo) + as traduções do YouTube;
+              sem idioma reconhecido -> o texto puro (vale pra todos)."""
+              texts = {}
+              for code, values in (localizations or {}).items():
+                  lang = addon_language(code)
+                  value = clean(values.get(field, ""))
+                  if lang and value:
+                      texts[lang] = value
+              main = clean(snippet.get(field, ""))
+              lang = addon_language(snippet.get("defaultLanguage") or snippet.get("defaultAudioLanguage"))
+              if lang and main:
+                  texts[lang] = main                        # o principal vence a tradução do mesmo idioma
+              if not texts:
+                  return main
+              if not lang and main:
+                  texts.setdefault("EN", main)              # idioma do vídeo não definido no YouTube: vira o fallback
+              return texts
+
+
+          def build(ids):
+              videos = {}
+              for start in range(0, len(ids), 50):
+                  data = call("videos", part="snippet,contentDetails,localizations,status", id=",".join(ids[start:start + 50]))
+                  for item in data.get("items", []):
+                      if item.get("status", {}).get("privacyStatus") not in ("public", "unlisted"):
+                          continue
+                      snippet = item.get("snippet", {})
+                      entry = {"id": item["id"],
+                               "title": localized(snippet, item.get("localizations"), "title"),
+                               "description": localized(snippet, item.get("localizations"), "description", first_paragraph),
+                               "duration": duration(item.get("contentDetails", {}).get("duration")),
+                               "published": (snippet.get("publishedAt") or "")[:10]}
+                      videos[item["id"]] = {k: v for k, v in entry.items() if v}
+              return [videos[i] for i in ids if i in videos and videos[i].get("title")]
+
+
+          def main():
+              if not os.environ.get("YOUTUBE_API_KEY"):
+                  sys.exit("Falta o segredo YOUTUBE_API_KEY (Settings > Secrets and variables > Actions).")
+              videos = build(playlist_ids())
+              data = {"_comment": "Gerado pela Action 'Atualizar videos.json' a partir da playlist do YouTube. "
+                                  "Não edite à mão: mude no YouTube (título, traduções, playlist).",
+                      "videos": videos}
+              text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+              old = open(OUTPUT, encoding="utf-8").read() if os.path.isfile(OUTPUT) else ""
+              if text == old:
+                  print("Nada mudou (%d vídeos)." % len(videos))
+                  return
+              with open(OUTPUT, "w", encoding="utf-8") as out:
+                  out.write(text)
+              print("videos.json atualizado: %d vídeos." % len(videos))
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Salvar (commit) se mudou
+        run: |
+          if [ -z "$(git status --porcelain -- videos.json)" ]; then
+            echo "videos.json igual: nada pra salvar."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add videos.json
+          git commit -m "Atualiza videos.json (playlist do YouTube)"
+          git push
