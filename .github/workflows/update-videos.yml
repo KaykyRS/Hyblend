@@ -2,7 +2,7 @@ name: Atualizar videos.json
 
 on:
   schedule:
-    - cron: "23 */6 * * *"      # 4x por dia (UTC), fora da hora cheia
+    - cron: "23 * * * *"        # de hora em hora (no minuto 23, fora da hora cheia)
   workflow_dispatch:            # botão "Run workflow"
 
 permissions:
