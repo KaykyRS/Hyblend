@@ -1,0 +1,18 @@
+{
+  "_comment": "Gerado pela Action 'Atualizar videos.json' a partir da playlist do YouTube. Não edite à mão: mude no YouTube (título, traduções, playlist).",
+  "videos": [
+    {
+      "id": "zHz_ntv7hc8",
+      "title": {
+        "PT_BR": "Hyblend - Como instalar o addon Hyblend no Blender",
+        "EN": "Hyblend - How to install the Hyblend addon in Blender"
+      },
+      "description": {
+        "PT_BR": "# Links para o addon está fixado nos comentários!",
+        "EN": "# Links to the addon are pinned in the comments!"
+      },
+      "duration": "1:01",
+      "published": "2026-09-15"
+    }
+  ]
+}
