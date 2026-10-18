@@ -4,10 +4,39 @@
   "data": [
     {
       "schema_version": "1.0.0",
+      "id": "hyblend_anim",
+      "name": "Hyblend Anim",
+      "tagline": "Rig, animate and export Hytale models (needs Hyblend Toolkit)",
+      "version": "0.1.0",
+      "type": "add-on",
+      "maintainer": "Trupe Forge",
+      "license": [
+        "SPDX:AGPL-3.0-or-later"
+      ],
+      "blender_version_min": "4.5.0",
+      "blender_version_max": "5.2.10",
+      "website": "https://github.com/KaykyRS/Hyblend",
+      "copyright": [
+        "2026 Trupe Forge"
+      ],
+      "permissions": {
+        "files": "Imports/exports chosen files; saves templates in Documents"
+      },
+      "tags": [
+        "Import-Export",
+        "Animation",
+        "Rigging"
+      ],
+      "archive_url": "./hyblend_anim-0.1.0.zip",
+      "archive_size": 388893,
+      "archive_hash": "sha256:0bb68e114c96095b97e5e7746ee3ccf621c4ee71d3d24b8ff142e9fb969a5eeb"
+    },
+    {
+      "schema_version": "1.0.0",
       "id": "hyblend_character_creator",
       "name": "Hyblend Character Creator",
       "tagline": "[UNDER DEVELOPMENT] Customize Hytale characters in Blender",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "type": "add-on",
       "maintainer": "Trupe Forge",
       "license": [
@@ -26,16 +55,16 @@
         "Import-Export",
         "Rigging"
       ],
-      "archive_url": "./hyblend_character_creator-0.1.0.zip",
-      "archive_size": 470217,
-      "archive_hash": "sha256:b1bb91302149c6e14302dea00c938b2b09131509cfae27d8173daa2eb8805a13"
+      "archive_url": "./hyblend_character_creator-0.1.1.zip",
+      "archive_size": 129079,
+      "archive_hash": "sha256:49b15471866167427a00f4988048ebadde24b6f87ef47c2f94c918d64bc8d62c"
     },
     {
       "schema_version": "1.0.0",
       "id": "hyblend_prefabs",
       "name": "Hyblend Prefabs",
       "tagline": "Import full Hytale Prefabs (world structures) into Blender",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "type": "add-on",
       "maintainer": "Trupe Forge",
       "license": [
@@ -53,16 +82,16 @@
       "tags": [
         "Import-Export"
       ],
-      "archive_url": "./hyblend_prefabs-0.1.0.zip",
-      "archive_size": 694138,
-      "archive_hash": "sha256:332aebdadc8e82fa1c73e10dec3c7592d327fea7749fc1671d33c2190b23804b"
+      "archive_url": "./hyblend_prefabs-0.1.1.zip",
+      "archive_size": 96087,
+      "archive_hash": "sha256:89a57ea519a1ef5c9caa9c867777223b72fcf5d832943df32dbbce8fa4c370da"
     },
     {
       "schema_version": "1.0.0",
       "id": "hyblend_toolkit",
       "name": "Hyblend Toolkit",
-      "tagline": "Import Hytale .blockymodel rigs, export .blockyanim",
-      "version": "0.9.5",
+      "tagline": "Core of the Hyblend add-ons for Hytale (required by all)",
+      "version": "0.9.6",
       "type": "add-on",
       "maintainer": "Trupe Forge",
       "license": [
@@ -76,16 +105,16 @@
       ],
       "permissions": {
         "files": "Reads Hytale folder and chosen files; saves in Documents/Hyblend",
-        "network": "Downloads Hyblend release notes from GitHub"
+        "network": "Hyblend add-ons, release notes, video list (GitHub, YouTube)"
       },
       "tags": [
         "Import-Export",
         "Animation",
-        "Rigging"
+        "User Interface"
       ],
-      "archive_url": "./hyblend_toolkit-0.9.5.zip",
-      "archive_size": 1251538,
-      "archive_hash": "sha256:5ebfe9bcfc38f0d57f58207bed9e4aa7792f808d0ded6ffcd665787501c17f29"
+      "archive_url": "./hyblend_toolkit-0.9.6.zip",
+      "archive_size": 886393,
+      "archive_hash": "sha256:12ef674b7e968c6ac4b1470c6c6da6e0c87e3bf246a047cfadd0c3ba906a0ac8"
     }
   ]
 }
