@@ -2,17 +2,17 @@
   "_comment": "Gerado pela Action 'Atualizar videos.json' a partir da playlist do YouTube. Não edite à mão: mude no YouTube (título, traduções, playlist).",
   "videos": [
     {
-      "id": "zHz_ntv7hc8",
+      "id": "8Y2py3FT62Q",
       "title": {
-        "PT_BR": "Hyblend - Como instalar o addon Hyblend no Blender",
-        "EN": "Hyblend - How to install the Hyblend addon in Blender"
+        "PT_BR": "Hyblend - Como instalar no Blender",
+        "EN": "Hyblend - How to install in Blender"
       },
       "description": {
-        "PT_BR": "# Links para o addon está fixado nos comentários!",
-        "EN": "# Links to the addon are pinned in the comments!"
+        "PT_BR": "Nesse vídeo irei mostrar como instalar o addon Hyblend no seu blender.\nJá fiz um vídeo anterior a esse, mas o Hyblend atualizou e agora adicionou uma nova forma de instalar e atualizar, deixando mais fácil todo o processo...",
+        "EN": "In this video I'm going to show you how to install the Hyblend addon in your Blender.\nI already made a video before this one, but Hyblend got updated and now has a new way to install and update it, making the whole process easier..."
       },
-      "duration": "1:01",
-      "published": "2026-09-15"
+      "duration": "1:50",
+      "published": "2026-10-22"
     }
   ]
 }
